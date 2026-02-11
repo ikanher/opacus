@@ -15,8 +15,10 @@
 from __future__ import annotations
 
 import logging
+import math
+from collections import deque
 from collections import defaultdict
-from typing import Callable, List, Optional, Union
+from typing import Any, Callable, Deque, List, Mapping, Optional, Sequence, Union
 
 import torch
 from opacus.optimizers.utils import params
@@ -27,6 +29,7 @@ from torch.optim import Optimizer
 
 logger = logging.getLogger(__name__)
 logger.disabled = True
+MIN_C0 = 1e-12
 
 
 def _mark_as_processed(obj: Union[torch.Tensor, List[torch.Tensor]]):
@@ -169,6 +172,222 @@ def _generate_noise(
         )
 
 
+class NoiseMechanism:
+    """
+    Strategy interface for gradient-noise addition.
+
+    M1 introduces this extension seam while preserving Gaussian behavior as default.
+    """
+
+    def add_noise(self, optimizer: "DPOptimizer") -> None:
+        raise NotImplementedError
+
+    def state_dict(self) -> Mapping[str, Any]:
+        return {}
+
+    def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        del state_dict
+
+
+class GaussianNoiseMechanism(NoiseMechanism):
+    """
+    Default iid Gaussian mechanism matching historical DPOptimizer behavior.
+    """
+
+    def add_noise(self, optimizer: "DPOptimizer") -> None:
+        max_grad_norm = 1 if optimizer.normalize_clipping else optimizer.max_grad_norm
+
+        for p in optimizer.params:
+            _check_processed_flag(p.summed_grad)
+
+            noise = _generate_noise(
+                std=optimizer.noise_multiplier * max_grad_norm,
+                reference=p.summed_grad,
+                generator=optimizer.generator,
+                secure_mode=optimizer.secure_mode,
+            )
+            p.grad = (p.summed_grad + noise).view_as(p)
+
+            _mark_as_processed(p.summed_grad)
+
+
+class CorrelatedNoiseMechanism(NoiseMechanism):
+    """
+    Correlated-noise mechanism with lower-triangular Toeplitz solve.
+
+    Given Toeplitz coefficients ``coeffs`` and iid Gaussian ``z``, this mechanism
+    computes ``u`` from ``C u = z`` via forward substitution and injects ``u``.
+    """
+
+    def __init__(self, *, coeffs: Sequence[float], z_std: float):
+        if not math.isfinite(z_std) or z_std < 0.0:
+            raise ValueError("z_std must be finite and >= 0")
+
+        if len(coeffs) == 0:
+            raise ValueError("coeffs must be non-empty")
+
+        self.coeffs = tuple(float(c) for c in coeffs)
+        if not all(math.isfinite(c) for c in self.coeffs):
+            raise ValueError("all coefficients must be finite")
+
+        if self.coeffs[0] <= MIN_C0:
+            raise ValueError(f"coeffs[0] must be > {MIN_C0:g}")
+
+        self.z_std = float(z_std)
+        self._history: Deque[torch.Tensor] = deque(
+            maxlen=max(0, len(self.coeffs) - 1)
+        )
+        self.last_flat_z: Optional[torch.Tensor] = None
+        self.last_flat_u: Optional[torch.Tensor] = None
+        self.steps_with_noise: int = 0
+
+    @property
+    def bandwidth(self) -> int:
+        return len(self.coeffs)
+
+    @property
+    def c0(self) -> float:
+        return self.coeffs[0]
+
+    @property
+    def state_depth(self) -> int:
+        return len(self._history)
+
+    @property
+    def max_state_depth(self) -> int:
+        return max(0, self.bandwidth - 1)
+
+    def reset_state(self) -> None:
+        self._history = deque(maxlen=self.max_state_depth)
+        self.last_flat_z = None
+        self.last_flat_u = None
+        self.steps_with_noise = 0
+
+    def _pre_scale_noise_std(self, optimizer: "DPOptimizer") -> float:
+        if optimizer.loss_reduction == "sum":
+            return self.z_std
+
+        assert optimizer.expected_batch_size is not None
+
+        return (
+            self.z_std
+            * float(optimizer.expected_batch_size)
+            * float(optimizer.accumulated_iterations)
+        )
+
+    def _flatten_generated_z(
+        self, optimizer: "DPOptimizer", std: float
+    ) -> tuple[List[tuple[torch.Tensor, torch.Size, int]], torch.Tensor]:
+        specs: List[tuple[torch.Tensor, torch.Size, int]] = []
+        chunks: List[torch.Tensor] = []
+
+        for p in optimizer.params:
+            assert p.summed_grad is not None
+            _check_processed_flag(p.summed_grad)
+
+            noise = _generate_noise(
+                std=std,
+                reference=p.summed_grad,
+                generator=optimizer.generator,
+                secure_mode=optimizer.secure_mode,
+            )
+            specs.append((p, p.shape, p.numel()))
+            chunks.append(noise.reshape(-1))
+
+        if not chunks:
+            return specs, torch.zeros((0,), dtype=torch.float32)
+
+        return specs, torch.cat(chunks, dim=0)
+
+    def _flatten_summed_grads(
+        self, specs: List[tuple[torch.Tensor, torch.Size, int]]
+    ) -> torch.Tensor:
+        chunks: List[torch.Tensor] = []
+        for p, _, _ in specs:
+            assert p.summed_grad is not None
+            chunks.append(p.summed_grad.reshape(-1))
+
+        if not chunks:
+            return torch.zeros((0,), dtype=torch.float32)
+
+        return torch.cat(chunks, dim=0)
+
+    def _solve_correlated_noise(self, z_flat: torch.Tensor) -> torch.Tensor:
+        rhs = z_flat
+        max_lag = min(len(self._history), self.bandwidth - 1)
+        for lag in range(1, max_lag + 1):
+            rhs = rhs - self.coeffs[lag] * self._history[lag - 1]
+
+        u_flat = rhs / self.c0
+        if self._history.maxlen:
+            self._history.appendleft(u_flat.detach().clone())
+
+        return u_flat
+
+    def _assign_noised_grads(
+        self,
+        specs: List[tuple[torch.Tensor, torch.Size, int]],
+        *,
+        summed_flat: torch.Tensor,
+        u_flat: torch.Tensor,
+    ) -> None:
+        offset = 0
+
+        for p, shape, numel in specs:
+            next_offset = offset + numel
+            summed_chunk = summed_flat[offset:next_offset].reshape(shape)
+            noise_chunk = u_flat[offset:next_offset].reshape(shape)
+            p.grad = (summed_chunk + noise_chunk).view_as(p)
+
+            _mark_as_processed(p.summed_grad)
+
+            offset = next_offset
+
+    def add_noise(self, optimizer: "DPOptimizer") -> None:
+        std = self._pre_scale_noise_std(optimizer)
+        specs, z_flat = self._flatten_generated_z(optimizer, std=std)
+
+        if not specs:
+            return
+
+        summed_flat = self._flatten_summed_grads(specs)
+        u_flat = self._solve_correlated_noise(z_flat)
+
+        self._assign_noised_grads(specs, summed_flat=summed_flat, u_flat=u_flat)
+
+        self.last_flat_z = z_flat.detach().clone()
+        self.last_flat_u = u_flat.detach().clone()
+        self.steps_with_noise += 1
+
+    def state_dict(self) -> Mapping[str, Any]:
+        return {
+            "coeffs": self.coeffs,
+            "z_std": self.z_std,
+            "history": [h.detach().clone() for h in self._history],
+            "steps_with_noise": self.steps_with_noise,
+        }
+
+    def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        coeffs = tuple(float(c) for c in state_dict.get("coeffs", self.coeffs))
+        z_std = float(state_dict.get("z_std", self.z_std))
+        history = state_dict.get("history", [])
+        steps_with_noise = int(state_dict.get("steps_with_noise", 0))
+
+        if coeffs != self.coeffs:
+            raise ValueError("cannot load state with mismatched Toeplitz coefficients")
+
+        if z_std != self.z_std:
+            raise ValueError("cannot load state with mismatched z_std")
+
+        self._history = deque(maxlen=self.max_state_depth)
+        for h in history:
+            self._history.append(torch.as_tensor(h).detach().clone())
+
+        self.steps_with_noise = steps_with_noise
+        self.last_flat_z = None
+        self.last_flat_u = None
+
+
 class DPOptimizer(Optimizer):
     """
     ``torch.optim.Optimizer`` wrapper that adds additional functionality to clip per
@@ -208,6 +427,7 @@ class DPOptimizer(Optimizer):
         generator=None,
         secure_mode: bool = False,
         normalize_clipping: bool = False,
+        noise_mechanism: Optional[NoiseMechanism] = None,
         **kwargs,
     ):
         """
@@ -249,6 +469,7 @@ class DPOptimizer(Optimizer):
         self.generator = generator
         self.secure_mode = secure_mode
         self.normalize_clipping = normalize_clipping
+        self.noise_mechanism = noise_mechanism or GaussianNoiseMechanism()
         self._step_skip_queue = []
         self._is_last_step_skipped = False
 
@@ -487,21 +708,7 @@ class DPOptimizer(Optimizer):
         """
         Adds noise to clipped gradients. Stores clipped and noised result in ``p.grad``
         """
-
-        max_grad_norm = 1 if self.normalize_clipping else self.max_grad_norm
-
-        for p in self.params:
-            _check_processed_flag(p.summed_grad)
-
-            noise = _generate_noise(
-                std=self.noise_multiplier * max_grad_norm,
-                reference=p.summed_grad,
-                generator=self.generator,
-                secure_mode=self.secure_mode,
-            )
-            p.grad = (p.summed_grad + noise).view_as(p)
-
-            _mark_as_processed(p.summed_grad)
+        self.noise_mechanism.add_noise(self)
 
     def scale_grad(self):
         """
@@ -586,7 +793,33 @@ class DPOptimizer(Optimizer):
         return self.original_optimizer.__repr__()
 
     def state_dict(self):
-        return self.original_optimizer.state_dict()
+        state = dict(self.original_optimizer.state_dict())
+        state["_dp_noise_mechanism_name"] = type(self.noise_mechanism).__name__
+        state["_dp_noise_mechanism_state"] = dict(self.noise_mechanism.state_dict())
+        if self.generator is not None and hasattr(self.generator, "get_state"):
+            state["_dp_noise_generator_state"] = self.generator.get_state()
+        return state
 
     def load_state_dict(self, state_dict) -> None:
-        self.original_optimizer.load_state_dict(state_dict)
+        mechanism_state = state_dict.get("_dp_noise_mechanism_state")
+        generator_state = state_dict.get("_dp_noise_generator_state")
+        optimizer_state = {
+            k: v
+            for k, v in state_dict.items()
+            if not k.startswith("_dp_noise_mechanism_")
+            and k != "_dp_noise_generator_state"
+            and not k.startswith("_dp_distributed_")
+        }
+        self.original_optimizer.load_state_dict(optimizer_state)
+        if isinstance(self.noise_mechanism, CorrelatedNoiseMechanism) and mechanism_state is None:
+            raise ValueError(
+                "missing bsr noise mechanism state in optimizer checkpoint"
+            )
+        if mechanism_state is not None:
+            self.noise_mechanism.load_state_dict(mechanism_state)
+        if (
+            generator_state is not None
+            and self.generator is not None
+            and hasattr(self.generator, "set_state")
+        ):
+            self.generator.set_state(generator_state)

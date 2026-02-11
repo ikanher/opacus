@@ -14,12 +14,14 @@
 # limitations under the License.
 
 import unittest
+import math
 
 import hypothesis.strategies as st
 from hypothesis import given, settings
 from opacus.accountants import (
     GaussianAccountant,
     IAccountant,
+    BSRAccountant,
     PRVAccountant,
     RDPAccountant,
     create_accountant,
@@ -64,6 +66,9 @@ class AccountantRegistryTest(unittest.TestCase):
     def test_create_accountant_not_registered(self) -> None:
         with self.assertRaises(ValueError):
             create_accountant("not_registered")
+
+    def test_create_bsr_accountant(self) -> None:
+        self.assertIsInstance(create_accountant("bsr"), BSRAccountant)
 
     def test_register_existing_accountant(self):
         try:
@@ -232,6 +237,55 @@ class AccountingTest(unittest.TestCase):
         )
 
         self.assertAlmostEqual(noise_multiplier, 1.3232421875)
+
+    def test_get_noise_multiplier_bsr_epochs(self) -> None:
+        delta = 1e-5
+        sample_rate = 0.04
+        epsilon = 0.5
+        epochs = 1
+        calls = []
+
+        def epsilon_fn(
+            *,
+            noise_multiplier: float,
+            target_delta: float,
+            sample_rate: float,
+            steps: int,
+            mechanism: str,
+            **kwargs,
+        ) -> float:
+            calls.append((noise_multiplier, target_delta, sample_rate, steps, mechanism))
+            return 1.0 / noise_multiplier
+
+        noise_multiplier = get_noise_multiplier(
+            target_epsilon=epsilon,
+            target_delta=delta,
+            sample_rate=sample_rate,
+            epochs=epochs,
+            accountant="bsr",
+            epsilon_fn=epsilon_fn,
+        )
+
+        self.assertLess(abs(noise_multiplier - 2.0), 0.1)
+        self.assertTrue(len(calls) > 0)
+        self.assertEqual(calls[-1][-1], "bsr")
+
+    def test_bsr_accountant_default_calibration_without_epsilon_fn(self) -> None:
+        noise_multiplier = get_noise_multiplier(
+            target_epsilon=1.0,
+            target_delta=1e-5,
+            sample_rate=0.1,
+            steps=1,
+            accountant="bsr",
+            bsr_calibration_denominator=8.0,
+        )
+        expected = (
+            1.0
+            * 8.0
+            * math.sqrt(2.0 * math.log(1.25 / 1e-5))
+            / 1.0
+        )
+        self.assertLess(abs(noise_multiplier - expected), 0.5)
 
     def test_accountant_state_dict(self) -> None:
         noise_multiplier = 1.5

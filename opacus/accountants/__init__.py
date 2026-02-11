@@ -14,6 +14,7 @@
 
 from .accountant import IAccountant
 from .gdp import GaussianAccountant
+from .bsr import BSRAccountant
 from .prv import PRVAccountant
 from .rdp import RDPAccountant
 from .registry import create_accountant, register_accountant
@@ -24,6 +25,7 @@ __all__ = [
     "GaussianAccountant",
     "RDPAccountant",
     "PRVAccountant",
+    "BSRAccountant",
     "register_accountant",
     "create_accountant",
 ]

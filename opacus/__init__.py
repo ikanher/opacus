@@ -15,6 +15,7 @@
 
 from . import utils
 from .grad_sample import GradSampleModule, GradSampleModuleFastGradientClipping
+from .mechanism_contracts import NoiseMechanismConfig, SamplingSemantics
 from .privacy_engine import PrivacyEngine
 from .version import __version__
 
@@ -23,6 +24,8 @@ __all__ = [
     "PrivacyEngine",
     "GradSampleModule",
     "GradSampleModuleFastGradientClipping",
+    "NoiseMechanismConfig",
+    "SamplingSemantics",
     "utils",
     "__version__",
 ]

@@ -20,7 +20,12 @@ from .ddpoptimizer_fast_gradient_clipping import (
     DistributedDPOptimizerFastGradientClipping,
 )
 from .fsdpoptimizer_fast_gradient_clipping import FSDPOptimizerFastGradientClipping
-from .optimizer import DPOptimizer
+from .optimizer import (
+    CorrelatedNoiseMechanism,
+    DPOptimizer,
+    GaussianNoiseMechanism,
+    NoiseMechanism,
+)
 from .optimizer_fast_gradient_clipping import DPOptimizerFastGradientClipping
 from .perlayeroptimizer import DPPerLayerOptimizer
 
@@ -35,6 +40,9 @@ __all__ = [
     "FSDPOptimizerFastGradientClipping",
     "DPPerLayerOptimizer",
     "SimpleDistributedPerLayerOptimizer",
+    "NoiseMechanism",
+    "GaussianNoiseMechanism",
+    "CorrelatedNoiseMechanism",
 ]
 
 

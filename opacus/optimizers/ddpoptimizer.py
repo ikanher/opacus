@@ -19,7 +19,7 @@ from typing import Callable, Optional
 import torch
 from torch.optim import Optimizer
 
-from .optimizer import DPOptimizer
+from .optimizer import CorrelatedNoiseMechanism, DPOptimizer
 
 
 class DistributedDPOptimizer(DPOptimizer):
@@ -62,6 +62,24 @@ class DistributedDPOptimizer(DPOptimizer):
         else:
             for p in self.params:
                 p.grad = p.summed_grad.view_as(p)
+
+    def state_dict(self):
+        state = dict(super().state_dict())
+        state["_dp_distributed_saved_rank"] = int(self.rank)
+        state["_dp_distributed_world_size"] = int(self.world_size)
+
+        return state
+
+    def load_state_dict(self, state_dict) -> None:
+        if isinstance(self.noise_mechanism, CorrelatedNoiseMechanism):
+            saved_rank = state_dict.get("_dp_distributed_saved_rank")
+
+            if saved_rank is not None and int(saved_rank) != 0:
+                raise ValueError(
+                    "distributed bsr checkpoint must be saved on rank 0"
+                )
+
+        super().load_state_dict(state_dict)
 
     def reduce_gradients(self):
         for p in self.params:

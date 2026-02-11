@@ -12,14 +12,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import os
 import warnings
+import copy
 from itertools import chain
 from typing import IO, Any, BinaryIO, Dict, List, Optional, Tuple, Union
 
 import torch
+from opacus.mechanism_contracts import NoiseMechanismConfig, SamplingSemantics
 from opacus.accountants import create_accountant
 from opacus.accountants.utils import get_noise_multiplier
+from opacus.accountants.analysis.bsr import calibrate_bsr_z_std
 from opacus.data_loader import DPDataLoader, switch_generator
 from opacus.distributed import DifferentiallyPrivateDistributedDataParallel as DPDDP
 from opacus.grad_sample import (
@@ -28,7 +32,7 @@ from opacus.grad_sample import (
     get_gsm_class,
     wrap_model,
 )
-from opacus.optimizers import DPOptimizer, get_optimizer_class
+from opacus.optimizers import CorrelatedNoiseMechanism, DPOptimizer, get_optimizer_class
 from opacus.schedulers import _GradClipScheduler, _NoiseScheduler
 from opacus.utils.fast_gradient_clipping_utils import DPLossFastGradientClipping
 from opacus.validators.module_validator import ModuleValidator
@@ -78,8 +82,11 @@ class PrivacyEngine:
                 See :meth:`~opacus.optimizers.optimizer._generate_noise` for details.
                 When set to ``True`` requires ``torchcsprng`` to be installed
         """
-        self.accountant = create_accountant(mechanism=accountant)
+        self.default_accountant = create_accountant(mechanism=accountant)
+        self.accountant = self.default_accountant
         self.secure_mode = secure_mode
+        self.noise_mechanism_config = NoiseMechanismConfig()
+        self.sampling_semantics = SamplingSemantics(sampling_mode="poisson")
         self.secure_rng = None
         self.dataset = None  # only used to detect switching to a different dataset
         if self.secure_mode:
@@ -99,6 +106,33 @@ class PrivacyEngine:
                 "for much faster training performance, but remember to turn it on and retrain "
                 "one last time before production with ``secure_mode`` turned on."
             )
+
+    @staticmethod
+    def _accountant_for_mechanism(*, mechanism: str, default_accountant):
+        if mechanism == "bsr":
+            return create_accountant(mechanism="bsr")
+        return default_accountant
+
+    @staticmethod
+    def _build_sampling_semantics(
+        *,
+        poisson_sampling: bool,
+        sample_rate: float,
+        expected_batch_size: int,
+        distributed: bool,
+        explicit_sampling_semantics: Optional[SamplingSemantics],
+    ) -> SamplingSemantics:
+        if explicit_sampling_semantics is not None:
+            return explicit_sampling_semantics
+
+        return SamplingSemantics(
+            sampling_mode="poisson" if poisson_sampling else "fixed_batch",
+            privacy_metadata={
+                "sample_rate": sample_rate,
+                "expected_batch_size": int(expected_batch_size),
+                "distributed": distributed,
+            },
+        )
 
     def _prepare_optimizer(
         self,
@@ -141,6 +175,77 @@ class PrivacyEngine:
             normalize_clipping=normalize_clipping,
             **kwargs,
         )
+
+    @staticmethod
+    def _validate_distributed_bsr_support(
+        *,
+        clipping: str,
+        grad_sample_mode: str,
+        is_fsdp: bool,
+    ) -> None:
+        if is_fsdp:
+            raise ValueError(
+                "bsr noise mechanism is not yet supported with FSDP; "
+                "supported distributed mode is DDP/DPDDP with flat clipping"
+            )
+
+        if clipping != "flat":
+            raise ValueError(
+                "bsr noise mechanism supports only distributed flat clipping; "
+                f"got clipping={clipping!r}"
+            )
+
+        if grad_sample_mode not in ("hooks", "ew"):
+            raise ValueError(
+                "bsr noise mechanism supports distributed grad_sample_mode "
+                "in {'hooks', 'ew'} only; "
+                f"got grad_sample_mode={grad_sample_mode!r}"
+            )
+
+    @staticmethod
+    def _build_noise_mechanism_from_config(config: NoiseMechanismConfig):
+        if config.mechanism == "gaussian":
+            return None
+
+        state = config.mechanism_state
+        coeffs = state.get("coeffs")
+        if coeffs is None:
+            raise ValueError(
+                "bsr mechanism requires `mechanism_state['coeffs']`"
+            )
+
+        if not isinstance(coeffs, (list, tuple)):
+            raise ValueError("`mechanism_state['coeffs']` must be a list or tuple")
+
+        z_std = state.get("z_std")
+        if z_std is None:
+            raise ValueError(
+                "bsr mechanism requires `mechanism_state['z_std']`"
+            )
+
+        return CorrelatedNoiseMechanism(coeffs=coeffs, z_std=float(z_std))
+
+    @staticmethod
+    def _bsr_calibration_denominator(
+        *,
+        loss_reduction: str,
+        sampling_semantics: Optional[SamplingSemantics],
+        data_loader: DataLoader,
+    ) -> float:
+        if loss_reduction == "sum":
+            return 1.0
+
+        if (
+            sampling_semantics is not None
+            and "expected_batch_size" in sampling_semantics.privacy_metadata
+        ):
+            return float(sampling_semantics.privacy_metadata["expected_batch_size"])
+
+        if data_loader.batch_size is None:
+            raise ValueError(
+                "bsr calibration requires expected batch size under loss_reduction='mean'"
+            )
+        return float(data_loader.batch_size)
 
     def _prepare_data_loader(
         self,
@@ -317,6 +422,8 @@ class PrivacyEngine:
         grad_sample_mode: str = "hooks",
         normalize_clipping: bool = False,
         total_steps: int = None,
+        noise_mechanism_config: Optional[NoiseMechanismConfig] = None,
+        sampling_semantics: Optional[SamplingSemantics] = None,
         **kwargs,
     ) -> Union[
         Tuple[GradSampleModule, DPOptimizer, DataLoader],
@@ -377,7 +484,6 @@ class PrivacyEngine:
             total_steps: Instead of stepping through once the dataloader for once expected epoch,
             we will step through it `total_steps` times. This will set the sample rate to
             batch_size/data_size. The parameter total_steps is any positive integer.
-
         Returns:
             Tuple of  (model, optimizer, data_loader) or (model, optimizer, criterion, data_loader).
 
@@ -394,6 +500,26 @@ class PrivacyEngine:
         if noise_generator and self.secure_mode:
             raise ValueError("Passing seed is prohibited in secure mode")
 
+        mechanism_config = noise_mechanism_config or NoiseMechanismConfig()
+        if mechanism_config.mechanism == "bsr" and poisson_sampling:
+            raise ValueError(
+                "bsr mechanism requires fixed-batch semantics; "
+                "set poisson_sampling=False"
+            )
+
+        if noise_mechanism_config is not None and "noise_mechanism" in kwargs:
+            raise ValueError(
+                "pass either noise_mechanism_config or noise_mechanism, not both"
+            )
+
+        configured_noise_mechanism = self._build_noise_mechanism_from_config(
+            mechanism_config
+        )
+        active_accountant = self._accountant_for_mechanism(
+            mechanism=mechanism_config.mechanism,
+            default_accountant=self.default_accountant,
+        )
+
         # compare module parameter with optimizer parameters
         model_parameters = set(module.parameters())
         for p in chain.from_iterable(
@@ -404,7 +530,21 @@ class PrivacyEngine:
                     "Module parameters are different than optimizer Parameters"
                 )
 
-        distributed = isinstance(module, (DPDDP, DDP, FSDPModule))
+        is_dpddp = isinstance(module, DPDDP)
+        is_ddp = isinstance(module, DDP)
+        is_fsdp = isinstance(module, FSDPModule)
+        distributed = is_dpddp or is_ddp or is_fsdp
+        requested_noise_mechanism = (
+            configured_noise_mechanism
+            if configured_noise_mechanism is not None
+            else kwargs.get("noise_mechanism")
+        )
+        if distributed and isinstance(requested_noise_mechanism, CorrelatedNoiseMechanism):
+            self._validate_distributed_bsr_support(
+                clipping=clipping,
+                grad_sample_mode=grad_sample_mode,
+                is_fsdp=is_fsdp,
+            )
 
         module = self._prepare_model(
             module,
@@ -445,6 +585,10 @@ class PrivacyEngine:
             world_size = torch.distributed.get_world_size()
             expected_batch_size /= world_size
 
+        optimizer_prepare_kwargs = dict(kwargs)
+        if configured_noise_mechanism is not None:
+            optimizer_prepare_kwargs["noise_mechanism"] = configured_noise_mechanism
+
         optimizer = self._prepare_optimizer(
             optimizer=optimizer,
             noise_multiplier=noise_multiplier,
@@ -456,11 +600,24 @@ class PrivacyEngine:
             clipping=clipping,
             grad_sample_mode=grad_sample_mode,
             normalize_clipping=normalize_clipping,
-            **kwargs,
+            **optimizer_prepare_kwargs,
         )
+        semantics = self._build_sampling_semantics(
+            poisson_sampling=poisson_sampling,
+            sample_rate=sample_rate,
+            expected_batch_size=expected_batch_size,
+            distributed=distributed,
+            explicit_sampling_semantics=sampling_semantics,
+        )
+        self.noise_mechanism_config = mechanism_config
+        self.sampling_semantics = semantics
+        self.accountant = active_accountant
+        setattr(optimizer, "accounting_mode", mechanism_config.accounting_mode)
+        setattr(optimizer, "noise_mechanism_config", mechanism_config)
+        setattr(optimizer, "sampling_semantics", semantics)
 
         optimizer.attach_step_hook(
-            self.accountant.get_optimizer_hook_fn(sample_rate=sample_rate)
+            active_accountant.get_optimizer_hook_fn(sample_rate=sample_rate)
         )
         if "ghost" in grad_sample_mode:
             criterion = self._prepare_criterion(
@@ -494,6 +651,9 @@ class PrivacyEngine:
         grad_sample_mode: str = "hooks",
         normalize_clipping: bool = False,
         total_steps: int = None,
+        noise_mechanism_config: Optional[NoiseMechanismConfig] = None,
+        sampling_semantics: Optional[SamplingSemantics] = None,
+        epsilon_fn=None,
         **kwargs,
     ) -> Union[
         Tuple[GradSampleModule, DPOptimizer, DataLoader],
@@ -543,6 +703,9 @@ class PrivacyEngine:
             total_steps: Instead of stepping through once the dataloader for once expected epoch,
             we will step through it `total_steps` times. This will set the sample rate to
             batch_size/data_size. The parameter total_steps is any positive integer.
+            epsilon_fn: Callback used by the ``bsr`` accountant path to compute epsilon given
+                ``noise_multiplier``, ``target_delta``, ``sample_rate``, ``steps``,
+                and ``mechanism``.
 
         Returns:
             Tuple of (model, optimizer, data_loader) or (model, optimizer, criterion, data_loader).
@@ -557,6 +720,40 @@ class PrivacyEngine:
                 equivalent to the original data loader, possibly with updated
                 sampling mechanism. Points to the same dataset object.
         """
+        mechanism_config = noise_mechanism_config or NoiseMechanismConfig()
+
+        active_accountant = self._accountant_for_mechanism(
+            mechanism=mechanism_config.mechanism,
+            default_accountant=self.default_accountant,
+        )
+
+        if mechanism_config.mechanism == "bsr" and poisson_sampling:
+            raise ValueError(
+                "bsr mechanism requires fixed-batch semantics; "
+                "set poisson_sampling=False"
+            )
+
+        local_sampling_semantics = sampling_semantics
+        if mechanism_config.mechanism == "bsr" and local_sampling_semantics is None:
+            if total_steps:
+                local_sample_rate = data_loader.batch_size / len(data_loader.dataset)
+            else:
+                local_sample_rate = 1 / len(data_loader)
+            local_sampling_semantics = self._build_sampling_semantics(
+                poisson_sampling=poisson_sampling,
+                sample_rate=local_sample_rate,
+                expected_batch_size=data_loader.batch_size,
+                distributed=False,
+                explicit_sampling_semantics=None,
+            )
+
+        bsr_denominator = None
+        if mechanism_config.mechanism == "bsr":
+            bsr_denominator = self._bsr_calibration_denominator(
+                loss_reduction=loss_reduction,
+                sampling_semantics=local_sampling_semantics,
+                data_loader=data_loader,
+            )
 
         if total_steps:
             if not poisson_sampling:
@@ -578,7 +775,11 @@ class PrivacyEngine:
                 target_delta=target_delta,
                 sample_rate=sample_rate,
                 steps=total_steps,
-                accountant=self.accountant.mechanism(),
+                accountant=active_accountant.mechanism(),
+                epsilon_fn=epsilon_fn,
+                mechanism_state=mechanism_config.mechanism_state,
+                sampling_semantics=local_sampling_semantics,
+                bsr_calibration_denominator=bsr_denominator,
                 **kwargs,
             )
         else:
@@ -589,11 +790,32 @@ class PrivacyEngine:
                 target_delta=target_delta,
                 sample_rate=sample_rate,
                 epochs=epochs,
-                accountant=self.accountant.mechanism(),
+                accountant=active_accountant.mechanism(),
+                epsilon_fn=epsilon_fn,
+                mechanism_state=mechanism_config.mechanism_state,
+                sampling_semantics=local_sampling_semantics,
+                bsr_calibration_denominator=bsr_denominator,
                 **kwargs,
             )
 
-        if len(self.accountant) > 0:
+        if mechanism_config.mechanism == "bsr":
+            if isinstance(max_grad_norm, list):
+                raise ValueError(
+                    "bsr calibration requires scalar max_grad_norm under flat clipping"
+                )
+            state = copy.deepcopy(mechanism_config.mechanism_state)
+            state["z_std"] = calibrate_bsr_z_std(
+                noise_multiplier_ref=float(noise_multiplier),
+                max_grad_norm=float(max_grad_norm),
+                denominator=float(bsr_denominator),
+            )
+            mechanism_config = NoiseMechanismConfig(
+                mechanism=mechanism_config.mechanism,
+                accounting_mode=mechanism_config.accounting_mode,
+                mechanism_state=state,
+            )
+
+        if len(active_accountant) > 0:
             warnings.warn(
                 "You're calling make_private_with_epsilon with non-zero privacy budget "
                 "already spent. Returned noise_multiplier assumes zero starting point, "
@@ -614,9 +836,11 @@ class PrivacyEngine:
             clipping=clipping,
             normalize_clipping=normalize_clipping,
             total_steps=total_steps,
+            noise_mechanism_config=mechanism_config,
+            sampling_semantics=local_sampling_semantics,
         )
 
-    def get_epsilon(self, delta):
+    def get_epsilon(self, delta, **kwargs):
         """
         Computes the (epsilon, delta) privacy budget spent so far.
 
@@ -626,7 +850,12 @@ class PrivacyEngine:
         Returns:
             Privacy budget (epsilon) expended so far.
         """
-        return self.accountant.get_epsilon(delta)
+        if self.accountant.mechanism() == "bsr":
+            kwargs.setdefault(
+                "mechanism_state", self.noise_mechanism_config.mechanism_state
+            )
+            kwargs.setdefault("sampling_semantics", self.sampling_semantics)
+        return self.accountant.get_epsilon(delta, **kwargs)
 
     def save_checkpoint(
         self,
@@ -653,6 +882,21 @@ class PrivacyEngine:
             torch_save_kwargs: dict of kwargs to pass to ``torch.save()``
 
         """
+        if optimizer is not None:
+            mech = getattr(optimizer, "noise_mechanism", None)
+            rank = getattr(optimizer, "rank", None)
+            world_size = getattr(optimizer, "world_size", None)
+            if (
+                isinstance(mech, CorrelatedNoiseMechanism)
+                and rank is not None
+                and world_size is not None
+                and int(world_size) > 1
+                and int(rank) != 0
+            ):
+                raise ValueError(
+                    "distributed bsr checkpoint save is supported only on rank 0"
+                )
+
         checkpoint_dict = checkpoint_dict or {}
         checkpoint_dict["module_state_dict"] = module.state_dict(
             **(module_state_dict_kwargs or {})
