@@ -15,9 +15,11 @@
 
 import unittest
 import math
+import itertools
 
 import hypothesis.strategies as st
 from hypothesis import given, settings
+from opacus import SamplingSemantics
 from opacus.accountants import (
     GaussianAccountant,
     IAccountant,
@@ -28,7 +30,52 @@ from opacus.accountants import (
     register_accountant,
     registry,
 )
+from opacus.accountants.analysis.bsr import (
+    bsr_cyclic_poisson_epsilon_upper_bound,
+    bsr_fixed_batch_epsilon_upper_bound,
+    compute_bsr_mf_sensitivity_from_coeffs,
+)
 from opacus.accountants.utils import get_noise_multiplier
+
+
+def _materialize_lower_triangular_from_coeffs(coeffs: list[float], n: int) -> list[list[float]]:
+    c = [[0.0 for _ in range(n)] for _ in range(n)]
+    for i in range(n):
+        for lag, v in enumerate(coeffs):
+            j = i - lag
+            if j < 0:
+                break
+            c[i][j] = float(v)
+    return c
+
+
+def _participation_bruteforce_sensitivity(coeffs: list[float], n: int, k: int, b: int) -> float:
+    c = _materialize_lower_triangular_from_coeffs(coeffs, n)
+    best_sq = 0.0
+    indices = list(range(n))
+    for r in range(0, k + 1):
+        for subset in itertools.combinations(indices, r):
+            if any(subset[t + 1] - subset[t] < b for t in range(len(subset) - 1)):
+                continue
+            sq = 0.0
+            for i in range(n):
+                row_sum = 0.0
+                for j in subset:
+                    row_sum += c[i][j]
+                sq += row_sum * row_sum
+            best_sq = max(best_sq, sq)
+    return math.sqrt(best_sq)
+
+
+def _participation_sensitivity_for_set(coeffs: list[float], n: int, subset: tuple[int, ...]) -> float:
+    c = _materialize_lower_triangular_from_coeffs(coeffs, n)
+    sq = 0.0
+    for i in range(n):
+        row_sum = 0.0
+        for j in subset:
+            row_sum += c[i][j]
+        sq += row_sum * row_sum
+    return math.sqrt(sq)
 
 
 class AccountantRegistryTest(unittest.TestCase):
@@ -96,6 +143,146 @@ class AccountantRegistryTest(unittest.TestCase):
 
 
 class AccountingTest(unittest.TestCase):
+    def test_bsr_mf_sensitivity_matches_bruteforce_small_cases(self) -> None:
+        cases = [
+            ([1.0], 4, 1, 1),
+            ([1.0, 0.5], 5, 2, 1),
+            ([1.0, 0.7, 0.2], 6, 2, 2),
+            ([1.0, 0.8, 0.4, 0.1], 7, 3, 2),
+        ]
+        for coeffs, n, k, b in cases:
+            expected = _participation_bruteforce_sensitivity(coeffs, n, k, b)
+            actual = compute_bsr_mf_sensitivity_from_coeffs(
+                coeffs=coeffs,
+                steps=n,
+                max_participations=k,
+                min_separation=b,
+            )
+            self.assertAlmostEqual(actual, expected, places=10)
+
+    def test_bsr_mf_sensitivity_identity_formula(self) -> None:
+        # For coeffs=[1], b=1 under this Toeplitz convention:
+        # sensitivity^2 = min(n, k)
+        n = 6
+        k = 3
+        expected_sq = min(n, k)
+        actual = compute_bsr_mf_sensitivity_from_coeffs(
+            coeffs=[1.0],
+            steps=n,
+            max_participations=k,
+            min_separation=1,
+        )
+        self.assertAlmostEqual(actual * actual, float(expected_sq), places=10)
+
+    def test_bsr_mf_sensitivity_rejects_bad_input(self) -> None:
+        with self.assertRaisesRegex(ValueError, "coeffs must be non-empty"):
+            compute_bsr_mf_sensitivity_from_coeffs(
+                coeffs=[],
+                steps=4,
+                max_participations=1,
+                min_separation=1,
+            )
+        with self.assertRaisesRegex(ValueError, "must be finite"):
+            compute_bsr_mf_sensitivity_from_coeffs(
+                coeffs=[1.0, float("nan")],
+                steps=4,
+                max_participations=1,
+                min_separation=1,
+            )
+        with self.assertRaisesRegex(ValueError, "max_participations must be >= 1"):
+            compute_bsr_mf_sensitivity_from_coeffs(
+                coeffs=[1.0],
+                steps=4,
+                max_participations=0,
+                min_separation=1,
+            )
+        with self.assertRaisesRegex(ValueError, "min_separation must be >= 1"):
+            compute_bsr_mf_sensitivity_from_coeffs(
+                coeffs=[1.0],
+                steps=4,
+                max_participations=1,
+                min_separation=0,
+            )
+        with self.assertRaisesRegex(
+            ValueError, "requires nonnegative decreasing coefficients"
+        ):
+            compute_bsr_mf_sensitivity_from_coeffs(
+                coeffs=[1.0, 1.2],
+                steps=4,
+                max_participations=1,
+                min_separation=1,
+            )
+
+    def test_bsr_mf_sensitivity_coeff_domain_tolerance_edges(self) -> None:
+        # Tiny numerical drift within tolerance should be accepted.
+        near_monotone = [1.0, 1.0 + 5e-13, 0.7, 0.4]
+        near_nonnegative = [1.0, 0.5, -5e-13]
+        for coeffs in (near_monotone, near_nonnegative):
+            got = compute_bsr_mf_sensitivity_from_coeffs(
+                coeffs=coeffs,
+                steps=6,
+                max_participations=2,
+                min_separation=2,
+            )
+            self.assertGreater(got, 0.0)
+
+        # Meaningful violations must still be rejected.
+        with self.assertRaisesRegex(
+            ValueError, "requires nonnegative decreasing coefficients"
+        ):
+            compute_bsr_mf_sensitivity_from_coeffs(
+                coeffs=[1.0, 1.0 + 5e-11, 0.7],
+                steps=6,
+                max_participations=2,
+                min_separation=2,
+            )
+
+        with self.assertRaisesRegex(
+            ValueError, "requires nonnegative decreasing coefficients"
+        ):
+            compute_bsr_mf_sensitivity_from_coeffs(
+                coeffs=[1.0, 0.5, -5e-11],
+                steps=6,
+                max_participations=2,
+                min_separation=2,
+            )
+
+    def test_bsr_mf_sensitivity_fixed_epoch_max_participations_invariant(self) -> None:
+        # Matches JAX MF intent: when k exceeds true max for (n, min_sep),
+        # sensitivity should be unchanged.
+        for n, epochs in [(2, 1), (2, 2), (10, 1), (10, 5), (10, 10)]:
+            min_sep = n // epochs
+            coeffs = [1.0 - 0.05 * i for i in range(min(n, 8))]
+            base = compute_bsr_mf_sensitivity_from_coeffs(
+                coeffs=coeffs,
+                steps=n,
+                max_participations=epochs,
+                min_separation=min_sep,
+            )
+            larger_k = compute_bsr_mf_sensitivity_from_coeffs(
+                coeffs=coeffs,
+                steps=n,
+                max_participations=epochs + 10,
+                min_separation=min_sep,
+            )
+            self.assertAlmostEqual(base, larger_k, places=10)
+
+    def test_bsr_mf_sensitivity_matches_fixed_epoch_pattern(self) -> None:
+        # For nonnegative decreasing Toeplitz coefficients, the fixed-epoch
+        # pattern (0, b, 2b, ...) attains the min-sep sensitivity.
+        for n, epochs in [(8, 4), (10, 2), (10, 5), (12, 3)]:
+            min_sep = n // epochs
+            coeffs = [1.0 - 0.05 * i for i in range(min(n, 8))]
+            fixed_epoch_set = tuple(t * min_sep for t in range(epochs))
+            expected = _participation_sensitivity_for_set(coeffs, n, fixed_epoch_set)
+            actual = compute_bsr_mf_sensitivity_from_coeffs(
+                coeffs=coeffs,
+                steps=n,
+                max_participations=epochs,
+                min_separation=min_sep,
+            )
+            self.assertAlmostEqual(actual, expected, places=10)
+
     def test_rdp_accountant(self) -> None:
         noise_multiplier = 1.5
         sample_rate = 0.04
@@ -271,21 +458,195 @@ class AccountingTest(unittest.TestCase):
         self.assertEqual(calls[-1][-1], "bsr")
 
     def test_bsr_accountant_default_calibration_without_epsilon_fn(self) -> None:
+        target_epsilon = 1.0
+        target_delta = 1e-5
         noise_multiplier = get_noise_multiplier(
-            target_epsilon=1.0,
-            target_delta=1e-5,
+            target_epsilon=target_epsilon,
+            target_delta=target_delta,
             sample_rate=0.1,
             steps=1,
             accountant="bsr",
-            bsr_calibration_denominator=8.0,
+            bsr_mf_sensitivity=1.0,
         )
-        expected = (
-            1.0
-            * 8.0
-            * math.sqrt(2.0 * math.log(1.25 / 1e-5))
-            / 1.0
+        actual_epsilon = bsr_fixed_batch_epsilon_upper_bound(
+            noise_multiplier=noise_multiplier,
+            target_delta=target_delta,
+            mf_sensitivity=1.0,
         )
-        self.assertLess(abs(noise_multiplier - expected), 0.5)
+        self.assertLessEqual(actual_epsilon, target_epsilon)
+
+    def test_bsr_accountant_mf_sensitivity_controls_default_rdp_bound(self) -> None:
+        lower_sens_noise = get_noise_multiplier(
+            target_epsilon=1.0,
+            target_delta=1e-5,
+            sample_rate=0.1,
+            steps=20,
+            accountant="bsr",
+            bsr_mf_sensitivity=1.0,
+        )
+        higher_sens_noise = get_noise_multiplier(
+            target_epsilon=1.0,
+            target_delta=1e-5,
+            sample_rate=0.1,
+            steps=20,
+            accountant="bsr",
+            bsr_mf_sensitivity=2.0,
+        )
+        self.assertGreater(higher_sens_noise, lower_sens_noise)
+
+    def test_bsr_accountant_default_requires_mf_sensitivity_inputs(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires MF sensitivity or enough data"):
+            get_noise_multiplier(
+                target_epsilon=1.0,
+                target_delta=1e-5,
+                sample_rate=0.1,
+                steps=1,
+                accountant="bsr",
+            )
+
+    def test_bsr_fixed_batch_noise_multiplier_invariant_to_sample_rate(self) -> None:
+        noise_a = get_noise_multiplier(
+            target_epsilon=1.0,
+            target_delta=1e-5,
+            sample_rate=0.05,
+            steps=50,
+            accountant="bsr",
+            bsr_mf_sensitivity=1.0,
+        )
+        noise_b = get_noise_multiplier(
+            target_epsilon=1.0,
+            target_delta=1e-5,
+            sample_rate=0.20,
+            steps=50,
+            accountant="bsr",
+            bsr_mf_sensitivity=1.0,
+        )
+        self.assertLess(abs(noise_a - noise_b), 1e-6)
+
+    def test_bsr_accountant_branches_fixed_batch_vs_cyclic_poisson(self) -> None:
+        delta = 1e-5
+        accountant = BSRAccountant()
+        accountant.history = [(1.0, 0.01, 100)]
+
+        fixed_eps = accountant.get_epsilon(
+            delta=delta,
+            mechanism_state={"mf_sensitivity": 1.0},
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="fixed_batch",
+                privacy_metadata={},
+            ),
+        )
+        cyclic_eps = accountant.get_epsilon(
+            delta=delta,
+            mechanism_state={"mf_sensitivity": 1.0},
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="cyclic_poisson",
+                privacy_metadata={"bands": 10},
+            ),
+        )
+
+        self.assertNotAlmostEqual(fixed_eps, cyclic_eps, places=6)
+
+    def test_bsr_cyclic_poisson_no_amplification_boundary_matches_gaussian(self) -> None:
+        # No amplification boundary from JAX tests:
+        # bands == dataset_size / batch_size  => q = bands * sample_rate = 1.
+        # With steps == bands, cyclic composition is a single non-subsampled Gaussian step.
+        nm = 1.7
+        delta = 1e-6
+        steps = 10
+        sample_rate = 0.1
+        bands = 10
+
+        cyclic_eps = bsr_cyclic_poisson_epsilon_upper_bound(
+            noise_multiplier=nm,
+            target_delta=delta,
+            steps=steps,
+            sample_rate=sample_rate,
+            bands=bands,
+        )
+        fixed_eps = bsr_fixed_batch_epsilon_upper_bound(
+            noise_multiplier=nm,
+            target_delta=delta,
+            mf_sensitivity=1.0,
+        )
+        self.assertAlmostEqual(cyclic_eps, fixed_eps, places=10)
+
+    def test_bsr_cyclic_poisson_no_amplification_boundary_calibration_matches_gaussian(
+        self,
+    ) -> None:
+        target_epsilon = 1.0
+        target_delta = 1e-5
+        steps = 10
+        sample_rate = 0.1
+        bands = 10
+
+        cyclic_noise = get_noise_multiplier(
+            target_epsilon=target_epsilon,
+            target_delta=target_delta,
+            sample_rate=sample_rate,
+            steps=steps,
+            accountant="bsr",
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="cyclic_poisson",
+                privacy_metadata={"bands": bands},
+            ),
+        )
+        fixed_noise = get_noise_multiplier(
+            target_epsilon=target_epsilon,
+            target_delta=target_delta,
+            sample_rate=sample_rate,
+            steps=steps,
+            accountant="bsr",
+            bsr_mf_sensitivity=1.0,
+        )
+        self.assertAlmostEqual(cyclic_noise, fixed_noise, places=8)
+
+    def test_bsr_fixed_batch_epsilon_golden_small_case(self) -> None:
+        eps = bsr_fixed_batch_epsilon_upper_bound(
+            noise_multiplier=1.25,
+            target_delta=1e-5,
+            mf_sensitivity=1.4,
+            rdp_orders=[1.5, 2, 3, 4, 8, 16, 32],
+        )
+        self.assertAlmostEqual(eps, 5.596661628831665, places=12)
+
+    def test_bsr_cyclic_poisson_epsilon_golden_small_case(self) -> None:
+        eps = bsr_cyclic_poisson_epsilon_upper_bound(
+            noise_multiplier=1.1,
+            target_delta=1e-5,
+            steps=120,
+            sample_rate=0.02,
+            bands=10,
+            rdp_orders=[1.5, 2, 3, 4, 8, 16, 32],
+        )
+        self.assertAlmostEqual(eps, 5.218712005463466, places=12)
+
+    def test_bsr_cyclic_poisson_default_calibration_without_epsilon_fn(self) -> None:
+        target_epsilon = 1.0
+        target_delta = 1e-5
+        steps = 100
+        sample_rate = 0.01
+        sampling_semantics = SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 10},
+        )
+
+        noise_multiplier = get_noise_multiplier(
+            target_epsilon=target_epsilon,
+            target_delta=target_delta,
+            sample_rate=sample_rate,
+            steps=steps,
+            accountant="bsr",
+            sampling_semantics=sampling_semantics,
+        )
+
+        accountant = BSRAccountant()
+        accountant.history = [(noise_multiplier, sample_rate, steps)]
+        actual_epsilon = accountant.get_epsilon(
+            delta=target_delta,
+            sampling_semantics=sampling_semantics,
+        )
+        self.assertLessEqual(actual_epsilon, target_epsilon)
 
     def test_accountant_state_dict(self) -> None:
         noise_multiplier = 1.5
