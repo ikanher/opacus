@@ -648,6 +648,54 @@ class AccountingTest(unittest.TestCase):
         )
         self.assertLessEqual(actual_epsilon, target_epsilon)
 
+    def test_bsr_iterations_number_override_changes_fixed_batch_epsilon(self) -> None:
+        accountant = BSRAccountant()
+        accountant.history = [(1.0, 0.01, 200)]
+
+        mechanism_state = {
+            "coeffs": [1.0, 0.5],
+            "max_participations": 50,
+            "min_separation": 1,
+        }
+        sampling_semantics = SamplingSemantics(
+            sampling_mode="fixed_batch",
+            privacy_metadata={},
+        )
+
+        eps_default = accountant.get_epsilon(
+            delta=1e-5,
+            mechanism_state=mechanism_state,
+            sampling_semantics=sampling_semantics,
+        )
+        eps_override = accountant.get_epsilon(
+            delta=1e-5,
+            mechanism_state=mechanism_state,
+            sampling_semantics=sampling_semantics,
+            bsr_iterations_number=20,
+        )
+
+        self.assertNotAlmostEqual(eps_default, eps_override, places=10)
+
+    def test_get_noise_multiplier_accepts_bsr_iterations_number_override(self) -> None:
+        noise = get_noise_multiplier(
+            target_epsilon=1.0,
+            target_delta=1e-5,
+            sample_rate=0.05,
+            steps=100,
+            accountant="bsr",
+            mechanism_state={
+                "coeffs": [1.0, 0.5, 0.25],
+                "max_participations": 20,
+                "min_separation": 2,
+            },
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="fixed_batch",
+                privacy_metadata={},
+            ),
+            bsr_iterations_number=40,
+        )
+        self.assertGreater(noise, 0.0)
+
     def test_accountant_state_dict(self) -> None:
         noise_multiplier = 1.5
         sample_rate = 0.04

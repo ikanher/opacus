@@ -287,6 +287,19 @@ class PrivacyEngine:
                 mechanism_state.get("min_separation", metadata.get("bands")),
             ),
         )
+        sensitivity_steps = kwargs.get(
+            "bsr_iterations_number",
+            metadata.get("iterations_number", mechanism_state.get("iterations_number")),
+        )
+
+        # XXX: Should this really default to steps??
+        if sensitivity_steps is None:
+            sensitivity_steps = steps
+
+        sensitivity_steps = int(sensitivity_steps)
+        if sensitivity_steps < 1:
+            raise ValueError("bsr_iterations_number must be >= 1")
+
         if coeffs is None or max_participations is None or min_separation is None:
             raise ValueError(
                 "fixed-batch bsr accounting requires MF sensitivity or "
@@ -298,7 +311,7 @@ class PrivacyEngine:
         return float(
             compute_bsr_mf_sensitivity_from_coeffs(
                 coeffs=coeffs,
-                steps=int(steps),
+                steps=sensitivity_steps,
                 max_participations=int(max_participations),
                 min_separation=int(min_separation),
             )

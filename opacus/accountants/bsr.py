@@ -128,6 +128,17 @@ class BSRAccountant(IAccountant):
                         state.get("min_separation", metadata.get("bands")),
                     ),
                 )
+                sensitivity_steps = kwargs.get(
+                    "bsr_iterations_number",
+                    metadata.get("iterations_number", state.get("iterations_number")),
+                )
+
+                if sensitivity_steps is None:
+                    sensitivity_steps = total_steps
+
+                sensitivity_steps = int(sensitivity_steps)
+                if sensitivity_steps < 1:
+                    raise ValueError("bsr_iterations_number must be >= 1")
                 if (
                     coeffs is None
                     or max_participations is None
@@ -141,7 +152,7 @@ class BSRAccountant(IAccountant):
 
                 mf_sensitivity = compute_bsr_mf_sensitivity_from_coeffs(
                     coeffs=coeffs,
-                    steps=int(total_steps),
+                    steps=sensitivity_steps,
                     max_participations=int(max_participations),
                     min_separation=int(min_separation),
                 )
