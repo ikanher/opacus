@@ -21,6 +21,8 @@ import torch
 import torch.nn.functional as F
 from opacus import NoiseMechanismConfig, PrivacyEngine
 from opacus.optimizers import CorrelatedNoiseMechanism, DistributedDPOptimizer
+from opacus.mechanism_contracts import SamplingSemantics
+from opacus.utils.uniform_sampler import DistributedCyclicPoissonSampler
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -177,6 +179,39 @@ def test_distributed_bsr_supported_for_flat_hooks(monkeypatch) -> None:
 
     assert isinstance(dp_optimizer, DistributedDPOptimizer)
     assert isinstance(dp_optimizer.noise_mechanism, CorrelatedNoiseMechanism)
+
+
+def test_distributed_bsr_supports_cyclic_poisson_sampling(monkeypatch) -> None:
+    monkeypatch.setattr(pe_mod, "DDP", nn.Linear)
+    _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
+
+    pe = PrivacyEngine()
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+
+    _, dp_optimizer, private_loader = pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        noise_multiplier=0.0,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping="flat",
+        grad_sample_mode="hooks",
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 2},
+        ),
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"coeffs": [1.0, 0.2], "z_std": 0.01},
+        ),
+    )
+
+    assert isinstance(dp_optimizer, DistributedDPOptimizer)
+    assert isinstance(dp_optimizer.noise_mechanism, CorrelatedNoiseMechanism)
+    assert isinstance(private_loader.batch_sampler, DistributedCyclicPoissonSampler)
 
 
 def test_distributed_bsr_rejects_non_flat_clipping(monkeypatch) -> None:

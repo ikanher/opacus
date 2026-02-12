@@ -24,7 +24,7 @@ AccountingModeName = Literal[
     "standard_step_accountant",
     "bsr_accountant",
 ]
-SamplingModeName = Literal["poisson", "fixed_batch"]
+SamplingModeName = Literal["poisson", "fixed_batch", "cyclic_poisson"]
 
 
 class MechanismStateSerializable(Protocol):

@@ -175,3 +175,161 @@ class DistributedUniformWithReplacementSampler(Sampler):
             epoch (int): Epoch number.
         """
         self.epoch = epoch
+
+
+class CyclicPoissonSampler(Sampler[List[int]]):
+    r"""
+    Cyclic partitioned fixed-size sampler.
+
+    Implements the Banded-MF cyclic sampling pattern:
+    - partition dataset indices into ``bands`` disjoint subsets of equal size
+      (extra tail indices are discarded);
+    - at step ``t`` sample a uniform-size ``batch_size`` subset from partition
+      ``t % bands``.
+
+    Reference:
+    "(Amplified) Banded Matrix Factorization: A unified approach to private
+    training" (Choquette-Choo et al., 2023)
+    """
+
+    def __init__(
+        self,
+        *,
+        num_samples: int,
+        batch_size: int,
+        bands: int,
+        generator=None,
+        steps: int = None,
+    ):
+        self.num_samples = int(num_samples)
+        self.batch_size = int(batch_size)
+        self.bands = int(bands)
+        self.generator = generator
+
+        if self.num_samples <= 0:
+            raise ValueError(
+                f"num_samples should be positive, got {self.num_samples}"
+            )
+
+        if self.batch_size <= 0:
+            raise ValueError(
+                f"batch_size should be positive, got {self.batch_size}"
+            )
+
+        if self.bands <= 0:
+            raise ValueError(f"bands should be positive, got {self.bands}")
+
+        self.partition_size = self.num_samples // self.bands
+        if self.partition_size <= 0:
+            raise ValueError(
+                "bands is too large for dataset size: partition_size is zero"
+            )
+
+        if self.batch_size > self.partition_size:
+            raise ValueError(
+                "batch_size must be <= partition size in cyclic_poisson sampler"
+            )
+
+        self.usable_size = self.partition_size * self.bands
+        self.steps = int(steps) if steps is not None else int(self.num_samples / self.batch_size)
+
+        if self.steps <= 0:
+            raise ValueError(f"steps should be positive, got {self.steps}")
+
+        self._partitions = [
+            list(range(j * self.partition_size, (j + 1) * self.partition_size))
+            for j in range(self.bands)
+        ]
+
+    def __len__(self):
+        return self.steps
+
+    def __iter__(self):
+        for step in range(self.steps):
+            partition = self._partitions[step % self.bands]
+            perm = torch.randperm(self.partition_size, generator=self.generator)
+            selected = perm[: self.batch_size].tolist()
+
+            yield [partition[i] for i in selected]
+
+
+class DistributedCyclicPoissonSampler(Sampler[List[int]]):
+    r"""
+    Distributed cyclic partitioned fixed-size sampler.
+
+    At each step, every rank samples from the same active cyclic partition,
+    but only from its local shard of that partition (sharded by rank).
+    """
+
+    def __init__(
+        self,
+        *,
+        total_size: int,
+        batch_size: int,
+        bands: int,
+        generator=None,
+        steps: int = None,
+    ):
+        self.total_size = int(total_size)
+        self.batch_size = int(batch_size)
+        self.bands = int(bands)
+        self.generator = generator
+        self.num_replicas = torch.distributed.get_world_size()
+        self.rank = torch.distributed.get_rank()
+
+        if self.total_size <= 0:
+            raise ValueError(f"total_size should be positive, got {self.total_size}")
+
+        if self.batch_size <= 0:
+            raise ValueError(f"batch_size should be positive, got {self.batch_size}")
+
+        if self.bands <= 0:
+            raise ValueError(f"bands should be positive, got {self.bands}")
+
+        if self.num_replicas <= 0:
+            raise ValueError(
+                f"num_replicas should be positive, got {self.num_replicas}"
+            )
+
+        if self.rank < 0 or self.rank >= self.num_replicas:
+            raise ValueError(
+                f"invalid rank {self.rank} for world size {self.num_replicas}"
+            )
+
+        self.partition_size = self.total_size // self.bands
+        if self.partition_size <= 0:
+            raise ValueError(
+                "bands is too large for dataset size: partition_size is zero"
+            )
+
+        self._global_partitions = [
+            list(range(j * self.partition_size, (j + 1) * self.partition_size))
+            for j in range(self.bands)
+        ]
+
+        self._local_partitions = [
+            part[self.rank :: self.num_replicas] for part in self._global_partitions
+        ]
+
+        min_local = min(len(part) for part in self._local_partitions)
+        if self.batch_size > min_local:
+            raise ValueError(
+                "batch_size must be <= local shard size for every cyclic partition"
+            )
+
+        self.steps = (
+            int(steps) if steps is not None else int(self.total_size / self.batch_size)
+        )
+        if self.steps <= 0:
+            raise ValueError(f"steps should be positive, got {self.steps}")
+
+    def __len__(self):
+        return self.steps
+
+    def __iter__(self):
+        for step in range(self.steps):
+            local_partition = self._local_partitions[step % self.bands]
+            perm = torch.randperm(len(local_partition), generator=self.generator)
+            selected = perm[: self.batch_size].tolist()
+
+            yield [local_partition[i] for i in selected]

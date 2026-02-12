@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
 from opacus.optimizers import CorrelatedNoiseMechanism, GaussianNoiseMechanism
+from opacus.utils.uniform_sampler import CyclicPoissonSampler
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -101,6 +102,47 @@ def test_sampling_semantics_default_poisson() -> None:
     semantics = dp_optimizer.sampling_semantics
     assert semantics.sampling_mode == "poisson"
     assert semantics.privacy_metadata["expected_batch_size"] == 8
+
+
+def test_sampling_semantics_cyclic_poisson_switches_sampler_for_bsr() -> None:
+    model = nn.Linear(4, 3)
+    private_model, dp_optimizer, private_loader = _make_private(
+        model,
+        poisson_sampling=False,
+        noise_seed=101,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 2},
+        ),
+    )
+    assert private_model is not None
+    assert dp_optimizer is not None
+    assert isinstance(private_loader.batch_sampler, CyclicPoissonSampler)
+    assert dp_optimizer.sampling_semantics.sampling_mode == "cyclic_poisson"
+
+
+def test_sampling_semantics_cyclic_poisson_requires_bands_metadata() -> None:
+    model = nn.Linear(4, 3)
+    with pytest.raises(ValueError, match="requires privacy_metadata\\['bands'\\]"):
+        _make_private(
+            model,
+            poisson_sampling=False,
+            noise_seed=102,
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bsr",
+                accounting_mode="bsr_accountant",
+                mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+            ),
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="cyclic_poisson",
+                privacy_metadata={},
+            ),
+        )
 
 
 def test_bsr_mechanism_requires_fixed_batch() -> None:

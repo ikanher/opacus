@@ -36,6 +36,10 @@ from opacus.optimizers import CorrelatedNoiseMechanism, DPOptimizer, get_optimiz
 from opacus.schedulers import _GradClipScheduler, _NoiseScheduler
 from opacus.utils.fast_gradient_clipping_utils import DPLossFastGradientClipping
 from opacus.validators.module_validator import ModuleValidator
+from opacus.utils.uniform_sampler import (
+    CyclicPoissonSampler,
+    DistributedCyclicPoissonSampler,
+)
 from torch import nn, optim
 from torch.distributed._composable.fsdp import FSDPModule
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -253,6 +257,7 @@ class PrivacyEngine:
         *,
         poisson_sampling: bool,
         distributed: bool,
+        sampling_semantics: Optional[SamplingSemantics] = None,
         total_steps: int = None,
     ) -> DataLoader:
         if self.dataset is None:
@@ -265,6 +270,60 @@ class PrivacyEngine:
                 f"new PrivacyEngine if you're using different dataset. "
                 f"You can ignore this warning if two datasets above "
                 f"represent the same logical dataset"
+            )
+
+        if sampling_semantics is not None and sampling_semantics.sampling_mode == "cyclic_poisson":
+            bands = sampling_semantics.privacy_metadata.get("bands")
+            if bands is None:
+                raise ValueError(
+                    "cyclic_poisson sampling requires privacy_metadata['bands']"
+                )
+
+            if isinstance(data_loader.dataset, torch.utils.data.IterableDataset):
+                raise ValueError("cyclic_poisson sampling is not supported for IterableDataset")
+
+            if data_loader.batch_size is None:
+                raise ValueError("cyclic_poisson sampling requires data_loader.batch_size")
+
+            if distributed:
+                world_size = torch.distributed.get_world_size()
+                local_batch_size = int(data_loader.batch_size / world_size)
+
+                if local_batch_size <= 0:
+                    raise ValueError(
+                        "cyclic_poisson distributed sampling requires "
+                        "batch_size >= world_size"
+                    )
+
+                sampler = DistributedCyclicPoissonSampler(
+                    total_size=len(data_loader.dataset),
+                    batch_size=local_batch_size,
+                    bands=int(bands),
+                    generator=self.secure_rng if self.secure_mode else data_loader.generator,
+                    steps=total_steps if total_steps is not None else len(data_loader),
+                )
+
+            else:
+                sampler = CyclicPoissonSampler(
+                    num_samples=len(data_loader.dataset),
+                    batch_size=int(data_loader.batch_size),
+                    bands=int(bands),
+                    generator=self.secure_rng if self.secure_mode else data_loader.generator,
+                    steps=total_steps if total_steps is not None else len(data_loader),
+                )
+
+            return DataLoader(
+                dataset=data_loader.dataset,
+                batch_sampler=sampler,
+                num_workers=data_loader.num_workers,
+                collate_fn=data_loader.collate_fn,
+                pin_memory=data_loader.pin_memory,
+                timeout=data_loader.timeout,
+                worker_init_fn=data_loader.worker_init_fn,
+                multiprocessing_context=data_loader.multiprocessing_context,
+                generator=self.secure_rng if self.secure_mode else data_loader.generator,
+                prefetch_factor=data_loader.prefetch_factor,
+                persistent_workers=data_loader.persistent_workers,
             )
 
         if poisson_sampling:
@@ -506,6 +565,12 @@ class PrivacyEngine:
                 "bsr mechanism requires fixed-batch semantics; "
                 "set poisson_sampling=False"
             )
+        if (
+            sampling_semantics is not None
+            and sampling_semantics.sampling_mode == "cyclic_poisson"
+            and mechanism_config.mechanism != "bsr"
+        ):
+            raise ValueError("cyclic_poisson sampling is supported only for mechanism='bsr'")
 
         if noise_mechanism_config is not None and "noise_mechanism" in kwargs:
             raise ValueError(
@@ -563,6 +628,7 @@ class PrivacyEngine:
             data_loader,
             distributed=distributed,
             poisson_sampling=poisson_sampling,
+            sampling_semantics=sampling_semantics,
             total_steps=total_steps,
         )
 
