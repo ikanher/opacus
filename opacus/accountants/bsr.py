@@ -14,7 +14,11 @@
 
 from __future__ import annotations
 
-from opacus.accountants.analysis.bsr import bsr_fixed_batch_epsilon_upper_bound
+from opacus.accountants.analysis.bsr import (
+    bsr_cyclic_poisson_epsilon_upper_bound,
+    compute_bsr_mf_sensitivity_from_coeffs,
+    bsr_fixed_batch_epsilon_upper_bound,
+)
 
 from .accountant import IAccountant
 
@@ -48,7 +52,6 @@ class BSRAccountant(IAccountant):
         else:
             self.history.append((noise_multiplier, sample_rate, 1))
 
-    # FIXME: This is not a godo upper bound.
     def get_epsilon(
         self,
         delta: float,
@@ -80,18 +83,74 @@ class BSRAccountant(IAccountant):
                 if sampling_semantics is not None
                 else {}
             )
-
-            denominator = kwargs.get(
-                "bsr_calibration_denominator",
-                metadata.get("expected_batch_size", 1.0),
+            sampling_mode = (
+                sampling_semantics.sampling_mode
+                if sampling_semantics is not None
+                else "fixed_batch"
             )
+
+            if sampling_mode == "cyclic_poisson":
+                bands = metadata.get("bands", None)
+                if bands is None:
+                    raise ValueError(
+                        "cyclic_poisson sampling requires privacy_metadata['bands']"
+                    )
+
+                return float(
+                    bsr_cyclic_poisson_epsilon_upper_bound(
+                        noise_multiplier=float(noise_multiplier),
+                        target_delta=float(delta),
+                        steps=int(total_steps),
+                        sample_rate=float(sample_rate),
+                        bands=int(bands),
+                    )
+                )
+
+            state = mechanism_state if isinstance(mechanism_state, dict) else {}
+            mf_sensitivity = kwargs.get(
+                "bsr_mf_sensitivity",
+                metadata.get("mf_sensitivity", state.get("mf_sensitivity")),
+            )
+
+            if mf_sensitivity is None:
+                coeffs = state.get("coeffs")
+                max_participations = kwargs.get(
+                    "bsr_max_participations",
+                    metadata.get(
+                        "max_participations",
+                        state.get("max_participations"),
+                    ),
+                )
+                min_separation = kwargs.get(
+                    "bsr_min_separation",
+                    metadata.get(
+                        "min_separation",
+                        state.get("min_separation", metadata.get("bands")),
+                    ),
+                )
+                if (
+                    coeffs is None
+                    or max_participations is None
+                    or min_separation is None
+                ):
+                    raise ValueError(
+                        "fixed-batch bsr accounting requires MF sensitivity or "
+                        "enough data to derive it: "
+                        "`coeffs`, `max_participations`, `min_separation`"
+                    )
+
+                mf_sensitivity = compute_bsr_mf_sensitivity_from_coeffs(
+                    coeffs=coeffs,
+                    steps=int(total_steps),
+                    max_participations=int(max_participations),
+                    min_separation=int(min_separation),
+                )
 
             return float(
                 bsr_fixed_batch_epsilon_upper_bound(
                     noise_multiplier=float(noise_multiplier),
                     target_delta=float(delta),
-                    steps=int(total_steps),
-                    denominator=float(denominator),
+                    mf_sensitivity=float(mf_sensitivity),
                 )
             )
 

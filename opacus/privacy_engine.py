@@ -23,7 +23,10 @@ import torch
 from opacus.mechanism_contracts import NoiseMechanismConfig, SamplingSemantics
 from opacus.accountants import create_accountant
 from opacus.accountants.utils import get_noise_multiplier
-from opacus.accountants.analysis.bsr import calibrate_bsr_z_std
+from opacus.accountants.analysis.bsr import (
+    calibrate_bsr_z_std,
+    compute_bsr_mf_sensitivity_from_coeffs,
+)
 from opacus.data_loader import DPDataLoader, switch_generator
 from opacus.distributed import DifferentiallyPrivateDistributedDataParallel as DPDDP
 from opacus.grad_sample import (
@@ -250,6 +253,56 @@ class PrivacyEngine:
                 "bsr calibration requires expected batch size under loss_reduction='mean'"
             )
         return float(data_loader.batch_size)
+
+    @staticmethod
+    def _resolve_bsr_mf_sensitivity_for_fixed_batch(
+        *,
+        mechanism_state: Dict[str, Any],
+        sampling_semantics: Optional[SamplingSemantics],
+        steps: int,
+        kwargs: Dict[str, Any],
+    ) -> float:
+        metadata = (
+            sampling_semantics.privacy_metadata
+            if sampling_semantics is not None
+            else {}
+        )
+
+        mf_sensitivity = kwargs.get(
+            "bsr_mf_sensitivity",
+            metadata.get("mf_sensitivity", mechanism_state.get("mf_sensitivity")),
+        )
+        if mf_sensitivity is not None:
+            return float(mf_sensitivity)
+
+        coeffs = mechanism_state.get("coeffs")
+        max_participations = kwargs.get(
+            "bsr_max_participations",
+            metadata.get("max_participations", mechanism_state.get("max_participations")),
+        )
+        min_separation = kwargs.get(
+            "bsr_min_separation",
+            metadata.get(
+                "min_separation",
+                mechanism_state.get("min_separation", metadata.get("bands")),
+            ),
+        )
+        if coeffs is None or max_participations is None or min_separation is None:
+            raise ValueError(
+                "fixed-batch bsr accounting requires MF sensitivity or "
+                "enough metadata to derive it: "
+                "`mechanism_state['coeffs']`, "
+                "`max_participations`, `min_separation`"
+            )
+
+        return float(
+            compute_bsr_mf_sensitivity_from_coeffs(
+                coeffs=coeffs,
+                steps=int(steps),
+                max_participations=int(max_participations),
+                min_separation=int(min_separation),
+            )
+        )
 
     def _prepare_data_loader(
         self,
@@ -820,6 +873,7 @@ class PrivacyEngine:
                 sampling_semantics=local_sampling_semantics,
                 data_loader=data_loader,
             )
+        bsr_mf_sensitivity = None
 
         if total_steps:
             if not poisson_sampling:
@@ -835,7 +889,21 @@ class PrivacyEngine:
             # we are given the number of optimizer steps instead of epochs,
             # so we can just use sample rate q = B/N
             sample_rate = data_loader.batch_size / len(data_loader.dataset)
+            if (
+                mechanism_config.mechanism == "bsr"
+                and epsilon_fn is None
+                and local_sampling_semantics is not None
+                and local_sampling_semantics.sampling_mode == "fixed_batch"
+            ):
+                bsr_mf_sensitivity = self._resolve_bsr_mf_sensitivity_for_fixed_batch(
+                    mechanism_state=mechanism_config.mechanism_state,
+                    sampling_semantics=local_sampling_semantics,
+                    steps=int(total_steps),
+                    kwargs=kwargs,
+                )
 
+            nm_kwargs = dict(kwargs)
+            nm_kwargs.pop("bsr_mf_sensitivity", None)
             noise_multiplier = get_noise_multiplier(
                 target_epsilon=target_epsilon,
                 target_delta=target_delta,
@@ -845,12 +913,27 @@ class PrivacyEngine:
                 epsilon_fn=epsilon_fn,
                 mechanism_state=mechanism_config.mechanism_state,
                 sampling_semantics=local_sampling_semantics,
-                bsr_calibration_denominator=bsr_denominator,
-                **kwargs,
+                bsr_mf_sensitivity=bsr_mf_sensitivity,
+                **nm_kwargs,
             )
         else:
             sample_rate = 1 / len(data_loader)
+            if (
+                mechanism_config.mechanism == "bsr"
+                and epsilon_fn is None
+                and local_sampling_semantics is not None
+                and local_sampling_semantics.sampling_mode == "fixed_batch"
+            ):
+                implied_steps = int(epochs / sample_rate)
+                bsr_mf_sensitivity = self._resolve_bsr_mf_sensitivity_for_fixed_batch(
+                    mechanism_state=mechanism_config.mechanism_state,
+                    sampling_semantics=local_sampling_semantics,
+                    steps=implied_steps,
+                    kwargs=kwargs,
+                )
 
+            nm_kwargs = dict(kwargs)
+            nm_kwargs.pop("bsr_mf_sensitivity", None)
             noise_multiplier = get_noise_multiplier(
                 target_epsilon=target_epsilon,
                 target_delta=target_delta,
@@ -860,8 +943,8 @@ class PrivacyEngine:
                 epsilon_fn=epsilon_fn,
                 mechanism_state=mechanism_config.mechanism_state,
                 sampling_semantics=local_sampling_semantics,
-                bsr_calibration_denominator=bsr_denominator,
-                **kwargs,
+                bsr_mf_sensitivity=bsr_mf_sensitivity,
+                **nm_kwargs,
             )
 
         if mechanism_config.mechanism == "bsr":
