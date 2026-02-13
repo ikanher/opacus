@@ -18,6 +18,8 @@ from typing import Any, List, Optional, Sequence, Tuple, Type, Union
 
 import torch
 from opacus.utils.uniform_sampler import (
+    BallsInBinsSampler,
+    BMinSepSampler,
     CyclicPoissonSampler,
     DistributedCyclicPoissonSampler,
     DistributedUniformWithReplacementSampler,
@@ -284,6 +286,8 @@ def _is_supported_batch_sampler(sampler: Sampler):
         isinstance(sampler, BatchSampler)
         or isinstance(sampler, UniformWithReplacementSampler)
         or isinstance(sampler, DistributedUniformWithReplacementSampler)
+        or isinstance(sampler, BMinSepSampler)
+        or isinstance(sampler, BallsInBinsSampler)
         or isinstance(sampler, CyclicPoissonSampler)
         or isinstance(sampler, DistributedCyclicPoissonSampler)
     )

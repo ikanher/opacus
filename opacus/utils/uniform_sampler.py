@@ -177,6 +177,170 @@ class DistributedUniformWithReplacementSampler(Sampler):
         self.epoch = epoch
 
 
+class BMinSepSampler(Sampler[List[int]]):
+    r"""
+    Non-distributed b-min-separation sampler.
+
+    Each example tracks a cooldown counter:
+    - counter == 0: example is eligible and participates with probability `sample_rate`;
+    - counter > 0: example is in cooldown and cannot participate.
+
+    When an eligible example participates, its cooldown is reset to
+    `min_separation - 1`. Cooldown decrements by one at each step.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_samples: int,
+        sample_rate: float,
+        min_separation: int,
+        generator=None,
+        steps: int = None,
+    ):
+        self.num_samples = int(num_samples)
+        self.sample_rate = float(sample_rate)
+        self.min_separation = int(min_separation)
+        self.generator = generator
+
+        if self.num_samples <= 0:
+            raise ValueError(f"num_samples should be positive, got {self.num_samples}")
+
+        if self.sample_rate <= 0.0 or self.sample_rate > 1.0:
+            raise ValueError(f"sample_rate should be in (0, 1], got {self.sample_rate}")
+
+        if self.min_separation <= 0:
+            raise ValueError(
+                f"min_separation should be positive, got {self.min_separation}"
+            )
+
+        self.steps = int(steps) if steps is not None else int(1 / self.sample_rate)
+        if self.steps <= 0:
+            raise ValueError(f"steps should be positive, got {self.steps}")
+
+    def __len__(self):
+        return self.steps
+
+    def __iter__(self):
+        cooldown = torch.zeros(self.num_samples, dtype=torch.int64)
+
+        for _ in range(self.steps):
+            eligible = cooldown == 0
+            draws = (
+                torch.rand(self.num_samples, generator=self.generator)
+                < self.sample_rate
+            )
+            selected_mask = eligible & draws
+            indices = selected_mask.nonzero(as_tuple=False).reshape(-1).tolist()
+            yield indices
+
+            cooldown = torch.where(cooldown > 0, cooldown - 1, cooldown)
+            if self.min_separation > 1:
+                cooldown[selected_mask] = self.min_separation - 1
+
+
+class WarmStartBMinSepSampler(BMinSepSampler):
+    r"""
+    b-min-separation sampler with per-example cooldowns initialized from
+    the stationary distribution of the cooldown Markov chain.
+    """
+
+    def _sample_initial_cooldown(self) -> torch.Tensor:
+        if self.min_separation == 1:
+            return torch.zeros(self.num_samples, dtype=torch.int64)
+
+        p = self.sample_rate
+        b = self.min_separation
+        pi0 = 1.0 / (1.0 + p * (b - 1))
+        r = p * pi0
+        draws = torch.rand(self.num_samples, generator=self.generator)
+
+        cooldown = torch.zeros(self.num_samples, dtype=torch.int64)
+        # State 0 has mass pi0, states 1..b-1 each have mass r.
+        thresholds = [pi0 + k * r for k in range(1, b)]
+        lower = pi0
+        for state, upper in enumerate(thresholds, start=1):
+            state_mask = (draws >= lower) & (draws < upper)
+            cooldown[state_mask] = state
+            lower = upper
+
+        # Guard against floating-point edge effects at 1.0.
+        cooldown[draws >= 1.0 - 1e-12] = b - 1
+        return cooldown
+
+    def __iter__(self):
+        cooldown = self._sample_initial_cooldown()
+
+        for _ in range(self.steps):
+            eligible = cooldown == 0
+            draws = (
+                torch.rand(self.num_samples, generator=self.generator)
+                < self.sample_rate
+            )
+            selected_mask = eligible & draws
+            indices = selected_mask.nonzero(as_tuple=False).reshape(-1).tolist()
+            yield indices
+
+            cooldown = torch.where(cooldown > 0, cooldown - 1, cooldown)
+            if self.min_separation > 1:
+                cooldown[selected_mask] = self.min_separation - 1
+
+
+class BallsInBinsSampler(WarmStartBMinSepSampler):
+    r"""
+    Balls-in-bins sampler as a warm-start b-min-separation specialization.
+
+    Uses `min_separation=bands` and chooses a Bernoulli participation rate
+    that matches the requested expected batch size under stationarity.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_samples: int,
+        batch_size: int,
+        bands: int,
+        generator=None,
+        steps: int = None,
+    ):
+        num_samples = int(num_samples)
+        batch_size = int(batch_size)
+        bands = int(bands)
+
+        if num_samples <= 0:
+            raise ValueError(f"num_samples should be positive, got {num_samples}")
+        if batch_size <= 0:
+            raise ValueError(f"batch_size should be positive, got {batch_size}")
+        if bands <= 0:
+            raise ValueError(f"bands should be positive, got {bands}")
+        if batch_size > num_samples:
+            raise ValueError("batch_size must be <= num_samples")
+
+        q = float(batch_size) / float(num_samples)
+        denom = 1.0 - q * float(bands - 1)
+        if denom <= 0.0:
+            raise ValueError(
+                "invalid (batch_size, num_samples, bands): "
+                "cannot derive stationary Bernoulli rate"
+            )
+        sample_rate = q / denom
+        if sample_rate <= 0.0 or sample_rate > 1.0:
+            raise ValueError(
+                "derived sample_rate must be in (0, 1]; "
+                f"got {sample_rate}"
+            )
+
+        self.batch_size = batch_size
+        self.bands = bands
+        super().__init__(
+            num_samples=num_samples,
+            sample_rate=sample_rate,
+            min_separation=bands,
+            generator=generator,
+            steps=steps,
+        )
+
+
 class CyclicPoissonSampler(Sampler[List[int]]):
     r"""
     Cyclic partitioned fixed-size sampler.

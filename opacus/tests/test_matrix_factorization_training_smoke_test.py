@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-from opacus import NoiseMechanismConfig, PrivacyEngine
+from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -106,3 +106,74 @@ def test_bsr_dp_training_smoke_loop() -> None:
         ) / max(kwargs["noise_multiplier"], 1e-9),
     )
     assert eps > 0.0
+
+
+def _run_bnb_training_smoke(*, sampling_semantics: SamplingSemantics) -> None:
+    model = nn.Sequential(
+        nn.Linear(4, 16),
+        nn.ReLU(),
+        nn.Linear(16, 3),
+    )
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    loader = _build_loader()
+    pe = PrivacyEngine()
+
+    noise_multiplier = 0.6
+    max_grad_norm = 1.0
+    batch_size = loader.batch_size
+    assert batch_size is not None
+
+    private_model, dp_optimizer, private_loader = pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=loader,
+        noise_multiplier=noise_multiplier,
+        max_grad_norm=max_grad_norm,
+        poisson_sampling=False,
+        noise_generator=torch.Generator().manual_seed(17),
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bnb",
+            accounting_mode="bnb_accountant",
+            mechanism_state={
+                "coeffs": [1.0, 0.2],
+                "z_std": noise_multiplier * max_grad_norm / float(batch_size),
+            },
+        ),
+        sampling_semantics=sampling_semantics,
+    )
+
+    initial = [p.detach().clone() for p in private_model.parameters() if p.requires_grad]
+
+    seen_losses = []
+    for _epoch in range(1):
+        for xb, yb in private_loader:
+            dp_optimizer.zero_grad()
+            logits = private_model(xb)
+            loss = F.cross_entropy(logits, yb)
+            assert torch.isfinite(loss)
+            loss.backward()
+            dp_optimizer.step()
+            seen_losses.append(float(loss.detach()))
+
+    assert seen_losses
+    final = [p.detach() for p in private_model.parameters() if p.requires_grad]
+    total_change = sum((f - i).abs().sum().item() for i, f in zip(initial, final))
+    assert total_change > 0.0
+
+
+def test_bnb_b_min_sep_training_smoke_loop() -> None:
+    _run_bnb_training_smoke(
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="b_min_sep",
+            privacy_metadata={"b": 2, "p": 0.2},
+        )
+    )
+
+
+def test_bnb_balls_in_bins_training_smoke_loop() -> None:
+    _run_bnb_training_smoke(
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bands": 2},
+        )
+    )

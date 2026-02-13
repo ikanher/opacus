@@ -27,6 +27,16 @@ from opacus.accountants.analysis.bsr import (
     calibrate_bsr_z_std,
     compute_bsr_mf_sensitivity_from_coeffs,
 )
+from opacus.accountants.analysis.bnb import (
+    BNBCalibrationStatus,
+    describe_bnb_calibration_report,
+    make_bnb_calibration_report,
+    parse_bnb_calibration_report,
+    sample_balls_in_bins_llr,
+    select_evr_candidate_ladder_two_sided,
+    select_evr_candidate_ladder,
+    validate_bnb_c_matrix_contract,
+)
 from opacus.data_loader import DPDataLoader, switch_generator
 from opacus.distributed import DifferentiallyPrivateDistributedDataParallel as DPDDP
 from opacus.grad_sample import (
@@ -40,6 +50,8 @@ from opacus.schedulers import _GradClipScheduler, _NoiseScheduler
 from opacus.utils.fast_gradient_clipping_utils import DPLossFastGradientClipping
 from opacus.validators.module_validator import ModuleValidator
 from opacus.utils.uniform_sampler import (
+    BallsInBinsSampler,
+    BMinSepSampler,
     CyclicPoissonSampler,
     DistributedCyclicPoissonSampler,
 )
@@ -116,8 +128,8 @@ class PrivacyEngine:
 
     @staticmethod
     def _accountant_for_mechanism(*, mechanism: str, default_accountant):
-        if mechanism == "bsr":
-            return create_accountant(mechanism="bsr")
+        if mechanism in ("bsr", "bnb"):
+            return create_accountant(mechanism=mechanism)
         return default_accountant
 
     @staticmethod
@@ -215,10 +227,11 @@ class PrivacyEngine:
             return None
 
         state = config.mechanism_state
+        mechanism_name = config.mechanism
         coeffs = state.get("coeffs")
         if coeffs is None:
             raise ValueError(
-                "bsr mechanism requires `mechanism_state['coeffs']`"
+                f"{mechanism_name} mechanism requires `mechanism_state['coeffs']`"
             )
 
         if not isinstance(coeffs, (list, tuple)):
@@ -227,7 +240,7 @@ class PrivacyEngine:
         z_std = state.get("z_std")
         if z_std is None:
             raise ValueError(
-                "bsr mechanism requires `mechanism_state['z_std']`"
+                f"{mechanism_name} mechanism requires `mechanism_state['z_std']`"
             )
 
         return CorrelatedNoiseMechanism(coeffs=coeffs, z_std=float(z_std))
@@ -317,6 +330,81 @@ class PrivacyEngine:
             )
         )
 
+    @staticmethod
+    def _resolve_bnb_balls_in_bins_inputs(
+        *,
+        mechanism_state: Dict[str, Any],
+        sampling_semantics: Optional[SamplingSemantics],
+        kwargs: Dict[str, Any],
+    ) -> tuple[Any, int, Dict[str, Any]]:
+        state = mechanism_state if isinstance(mechanism_state, dict) else {}
+        metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
+        c_matrix = kwargs.get("bnb_c_matrix", state.get("c_matrix"))
+        bands = kwargs.get("bnb_bands", metadata.get("bands", state.get("bands")))
+        c_matrix_contract = kwargs.get(
+            "bnb_c_matrix_contract",
+            state.get("c_matrix_contract"),
+        )
+
+        if c_matrix is None or bands is None or c_matrix_contract is None:
+            raise ValueError(
+                "bnb non-callback calibration requires balls_in_bins inputs: "
+                "`c_matrix`, `bands`, and `c_matrix_contract`"
+            )
+
+        return c_matrix, int(bands), c_matrix_contract
+
+    @staticmethod
+    def _validate_bnb_accounting_runtime_consistency(
+        *,
+        mechanism_state: Dict[str, Any],
+        sampling_semantics: Optional[SamplingSemantics],
+        c_matrix: Any,
+        bands: int,
+        c_matrix_contract: Dict[str, Any],
+    ) -> None:
+        state = mechanism_state if isinstance(mechanism_state, dict) else {}
+        coeffs = state.get("coeffs")
+        if coeffs is None or not isinstance(coeffs, (list, tuple)) or len(coeffs) == 0:
+            raise ValueError(
+                "bnb mechanism_state consistency check requires non-empty `coeffs`"
+            )
+        if int(bands) != len(coeffs):
+            raise ValueError(
+                "bnb consistency check failed: `bands` must match len(coeffs); "
+                f"got bands={int(bands)} and len(coeffs)={len(coeffs)}"
+            )
+
+        metadata = (
+            sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
+        )
+        metadata_bands = metadata.get("bands")
+        if metadata_bands is not None and int(metadata_bands) != int(bands):
+            raise ValueError(
+                "bnb consistency check failed: sampling_semantics privacy_metadata['bands'] "
+                f"({int(metadata_bands)}) != accounting bands ({int(bands)})"
+            )
+
+        if not torch.is_tensor(c_matrix):
+            raise ValueError(
+                "bnb consistency check requires `c_matrix` to be a torch.Tensor"
+            )
+        if c_matrix.ndim != 2:
+            raise ValueError("bnb consistency check requires `c_matrix` with shape [d, m]")
+        d, _m = c_matrix.shape
+        if d < int(bands):
+            raise ValueError(
+                "bnb consistency check failed: c_matrix must have at least `bands` rows; "
+                f"got rows={d}, bands={int(bands)}"
+            )
+
+        validate_bnb_c_matrix_contract(
+            c_matrix=c_matrix,
+            coeffs=coeffs,
+            bands=int(bands),
+            c_matrix_contract=c_matrix_contract,
+        )
+
     def _prepare_data_loader(
         self,
         data_loader: DataLoader,
@@ -378,6 +466,74 @@ class PrivacyEngine:
                     steps=total_steps if total_steps is not None else len(data_loader),
                 )
 
+            return DataLoader(
+                dataset=data_loader.dataset,
+                batch_sampler=sampler,
+                num_workers=data_loader.num_workers,
+                collate_fn=data_loader.collate_fn,
+                pin_memory=data_loader.pin_memory,
+                timeout=data_loader.timeout,
+                worker_init_fn=data_loader.worker_init_fn,
+                multiprocessing_context=data_loader.multiprocessing_context,
+                generator=self.secure_rng if self.secure_mode else data_loader.generator,
+                prefetch_factor=data_loader.prefetch_factor,
+                persistent_workers=data_loader.persistent_workers,
+            )
+
+        if sampling_semantics is not None and sampling_semantics.sampling_mode == "b_min_sep":
+            b = sampling_semantics.privacy_metadata.get("b")
+            p = sampling_semantics.privacy_metadata.get("p")
+            if b is None or p is None:
+                raise ValueError(
+                    "b_min_sep sampling requires privacy_metadata['b'] and "
+                    "privacy_metadata['p']"
+                )
+            if distributed:
+                raise ValueError("b_min_sep sampling is not supported in distributed mode")
+            if isinstance(data_loader.dataset, torch.utils.data.IterableDataset):
+                raise ValueError("b_min_sep sampling is not supported for IterableDataset")
+
+            sampler = BMinSepSampler(
+                num_samples=len(data_loader.dataset),
+                sample_rate=float(p),
+                min_separation=int(b),
+                generator=self.secure_rng if self.secure_mode else data_loader.generator,
+                steps=total_steps if total_steps is not None else len(data_loader),
+            )
+            return DataLoader(
+                dataset=data_loader.dataset,
+                batch_sampler=sampler,
+                num_workers=data_loader.num_workers,
+                collate_fn=data_loader.collate_fn,
+                pin_memory=data_loader.pin_memory,
+                timeout=data_loader.timeout,
+                worker_init_fn=data_loader.worker_init_fn,
+                multiprocessing_context=data_loader.multiprocessing_context,
+                generator=self.secure_rng if self.secure_mode else data_loader.generator,
+                prefetch_factor=data_loader.prefetch_factor,
+                persistent_workers=data_loader.persistent_workers,
+            )
+
+        if sampling_semantics is not None and sampling_semantics.sampling_mode == "balls_in_bins":
+            bands = sampling_semantics.privacy_metadata.get("bands")
+            if bands is None:
+                raise ValueError(
+                    "balls_in_bins sampling requires privacy_metadata['bands']"
+                )
+            if distributed:
+                raise ValueError("balls_in_bins sampling is not supported in distributed mode")
+            if isinstance(data_loader.dataset, torch.utils.data.IterableDataset):
+                raise ValueError("balls_in_bins sampling is not supported for IterableDataset")
+            if data_loader.batch_size is None:
+                raise ValueError("balls_in_bins sampling requires data_loader.batch_size")
+
+            sampler = BallsInBinsSampler(
+                num_samples=len(data_loader.dataset),
+                batch_size=int(data_loader.batch_size),
+                bands=int(bands),
+                generator=self.secure_rng if self.secure_mode else data_loader.generator,
+                steps=total_steps if total_steps is not None else len(data_loader),
+            )
             return DataLoader(
                 dataset=data_loader.dataset,
                 batch_sampler=sampler,
@@ -631,6 +787,24 @@ class PrivacyEngine:
                 "bsr mechanism requires fixed-batch semantics; "
                 "set poisson_sampling=False"
             )
+        if mechanism_config.mechanism == "bnb" and poisson_sampling:
+            raise ValueError(
+                "bnb mechanism requires explicit non-Poisson sampling semantics; "
+                "set poisson_sampling=False and provide sampling_semantics"
+            )
+        if mechanism_config.mechanism == "bnb" and sampling_semantics is None:
+            raise ValueError(
+                "bnb mechanism requires explicit sampling_semantics "
+                "in {'b_min_sep', 'balls_in_bins'}"
+            )
+        if (
+            sampling_semantics is not None
+            and sampling_semantics.sampling_mode in ("b_min_sep", "balls_in_bins")
+            and mechanism_config.mechanism != "bnb"
+        ):
+            raise ValueError(
+                "b_min_sep and balls_in_bins sampling are supported only for mechanism='bnb'"
+            )
         if (
             sampling_semantics is not None
             and sampling_semantics.sampling_mode == "cyclic_poisson"
@@ -835,7 +1009,7 @@ class PrivacyEngine:
             total_steps: Instead of stepping through once the dataloader for once expected epoch,
             we will step through it `total_steps` times. This will set the sample rate to
             batch_size/data_size. The parameter total_steps is any positive integer.
-            epsilon_fn: Callback used by the ``bsr`` accountant path to compute epsilon given
+            epsilon_fn: Callback used by the ``bsr``/``bnb`` accountant path to compute epsilon given
                 ``noise_multiplier``, ``target_delta``, ``sample_rate``, ``steps``,
                 and ``mechanism``.
 
@@ -864,6 +1038,24 @@ class PrivacyEngine:
                 "bsr mechanism requires fixed-batch semantics; "
                 "set poisson_sampling=False"
             )
+        if mechanism_config.mechanism == "bnb" and poisson_sampling:
+            raise ValueError(
+                "bnb mechanism requires explicit non-Poisson sampling semantics; "
+                "set poisson_sampling=False and provide sampling_semantics"
+            )
+        if mechanism_config.mechanism == "bnb" and sampling_semantics is None:
+            raise ValueError(
+                "bnb mechanism requires explicit sampling_semantics "
+                "in {'b_min_sep', 'balls_in_bins'}"
+            )
+        if (
+            sampling_semantics is not None
+            and sampling_semantics.sampling_mode in ("b_min_sep", "balls_in_bins")
+            and mechanism_config.mechanism != "bnb"
+        ):
+            raise ValueError(
+                "b_min_sep and balls_in_bins sampling are supported only for mechanism='bnb'"
+            )
 
         local_sampling_semantics = sampling_semantics
         if mechanism_config.mechanism == "bsr" and local_sampling_semantics is None:
@@ -879,14 +1071,39 @@ class PrivacyEngine:
                 explicit_sampling_semantics=None,
             )
 
-        bsr_denominator = None
-        if mechanism_config.mechanism == "bsr":
-            bsr_denominator = self._bsr_calibration_denominator(
+        correlated_denominator = None
+        if mechanism_config.mechanism in ("bsr", "bnb"):
+            correlated_denominator = self._bsr_calibration_denominator(
                 loss_reduction=loss_reduction,
                 sampling_semantics=local_sampling_semantics,
                 data_loader=data_loader,
             )
         bsr_mf_sensitivity = None
+        bnb_c_matrix = None
+        bnb_bands = None
+        bnb_c_matrix_contract = None
+
+        if mechanism_config.mechanism == "bnb" and epsilon_fn is None:
+            if (
+                local_sampling_semantics is None
+                or local_sampling_semantics.sampling_mode != "balls_in_bins"
+            ):
+                raise ValueError(
+                    "bnb non-callback calibration currently requires "
+                    "sampling_mode='balls_in_bins'"
+                )
+            bnb_c_matrix, bnb_bands, bnb_c_matrix_contract = self._resolve_bnb_balls_in_bins_inputs(
+                mechanism_state=mechanism_config.mechanism_state,
+                sampling_semantics=local_sampling_semantics,
+                kwargs=kwargs,
+            )
+            self._validate_bnb_accounting_runtime_consistency(
+                mechanism_state=mechanism_config.mechanism_state,
+                sampling_semantics=local_sampling_semantics,
+                c_matrix=bnb_c_matrix,
+                bands=int(bnb_bands),
+                c_matrix_contract=bnb_c_matrix_contract,
+            )
 
         if total_steps:
             if not poisson_sampling:
@@ -960,17 +1177,138 @@ class PrivacyEngine:
                 **nm_kwargs,
             )
 
-        if mechanism_config.mechanism == "bsr":
+        bnb_calibration_report = None
+        if (
+            mechanism_config.mechanism == "bnb"
+            and epsilon_fn is None
+            and bnb_c_matrix is not None
+            and bnb_bands is not None
+        ):
+            num_samples = int(kwargs.get("bnb_num_samples", 100_000))
+            seed = int(kwargs.get("bnb_seed", 0))
+            reduce_dimensionality = bool(kwargs.get("bnb_reduce_dimensionality", False))
+            confidence_alpha_total = float(kwargs.get("bnb_confidence_alpha", 1e-6))
+            num_checks = int(kwargs.get("bnb_evr_num_checks", 3))
+            candidate_sigmas = kwargs.get("bnb_candidate_sigmas")
+            if candidate_sigmas is not None:
+                sigma_candidates = [float(s) for s in candidate_sigmas]
+            elif bool(kwargs.get("bnb_evr_use_candidate_ladder", True)):
+                multipliers = kwargs.get(
+                    "bnb_candidate_multipliers",
+                    (1.0, 1.1, 1.25, 1.5, 2.0),
+                )
+                sigma_candidates = sorted(
+                    {
+                        max(1e-12, float(noise_multiplier) * float(m))
+                        for m in multipliers
+                        if float(m) > 0.0
+                    }
+                )
+            else:
+                sigma_candidates = [float(noise_multiplier)]
+            if len(sigma_candidates) == 0:
+                raise ValueError("bnb candidate sigma ladder must contain positive values")
+            if any(
+                float(sigma_candidates[i]) >= float(sigma_candidates[i + 1])
+                for i in range(len(sigma_candidates) - 1)
+            ):
+                raise ValueError("candidate_sigmas must be strictly increasing")
+            calibrated_sigma = float(noise_multiplier)
+            if any(float(s) < calibrated_sigma for s in sigma_candidates):
+                raise ValueError(
+                    "bnb candidate sigma ladder must not include values below the "
+                    "accountant-calibrated sigma"
+                )
+
+            def _llr_samples_seq_for_sigma_forward(sigma: float):
+                return [
+                    sample_balls_in_bins_llr(
+                        c_matrix=bnb_c_matrix,
+                        bands=int(bnb_bands),
+                        sigma=float(sigma),
+                        num_samples=num_samples,
+                        seed=seed + i,
+                        reduce_dimensionality=reduce_dimensionality,
+                    )
+                    for i in range(num_checks)
+                ]
+
+            def _llr_samples_seq_for_sigma_reverse(sigma: float):
+                # Reverse direction uses independent sample streams via seed offset.
+                return [
+                    -sample_balls_in_bins_llr(
+                        c_matrix=bnb_c_matrix,
+                        bands=int(bnb_bands),
+                        sigma=float(sigma),
+                        num_samples=num_samples,
+                        seed=seed + num_checks + i,
+                        reduce_dimensionality=reduce_dimensionality,
+                    )
+                    for i in range(num_checks)
+                ]
+
+            (
+                selected_sigma,
+                verification,
+                evr_pass_count,
+                evr_per_check_alpha,
+            ) = (
+                select_evr_candidate_ladder_two_sided(
+                    candidate_sigmas=sigma_candidates,
+                    llr_samples_seq_fn_forward=_llr_samples_seq_for_sigma_forward,
+                    llr_samples_seq_fn_reverse=_llr_samples_seq_for_sigma_reverse,
+                    epsilon=float(target_epsilon),
+                    target_delta=float(target_delta),
+                    total_confidence_alpha=confidence_alpha_total,
+                )
+                if bool(kwargs.get("bnb_verify_both_directions", True))
+                else select_evr_candidate_ladder(
+                    candidate_sigmas=sigma_candidates,
+                    llr_samples_seq_fn=_llr_samples_seq_for_sigma_forward,
+                    epsilon=float(target_epsilon),
+                    target_delta=float(target_delta),
+                    total_confidence_alpha=confidence_alpha_total,
+                )
+            )
+            total_checks_reported = (
+                int(2 * num_checks)
+                if bool(kwargs.get("bnb_verify_both_directions", True))
+                else int(num_checks)
+            )
+            noise_multiplier = float(selected_sigma)
+            if bool(kwargs.get("bnb_require_evr_pass", True)) and not verification.accepted:
+                raise ValueError(
+                    "bnb verification guard failed for calibrated noise multiplier; "
+                    "increase noise, sample budget, or loosen targets"
+                )
+            bnb_calibration_report = make_bnb_calibration_report(
+                target_epsilon=float(target_epsilon),
+                target_delta=float(target_delta),
+                noise_multiplier=float(noise_multiplier),
+                num_samples=int(num_samples),
+                seed=int(seed),
+                bands=int(bnb_bands),
+                verification=verification,
+                evr_confidence_alpha_total=float(confidence_alpha_total),
+                evr_num_checks=int(total_checks_reported),
+                evr_per_check_alpha=float(evr_per_check_alpha),
+                evr_pass_count=int(evr_pass_count),
+            ).to_dict()
+
+        if mechanism_config.mechanism in ("bsr", "bnb"):
             if isinstance(max_grad_norm, list):
                 raise ValueError(
-                    "bsr calibration requires scalar max_grad_norm under flat clipping"
+                    f"{mechanism_config.mechanism} calibration requires scalar "
+                    "max_grad_norm under flat clipping"
                 )
             state = copy.deepcopy(mechanism_config.mechanism_state)
             state["z_std"] = calibrate_bsr_z_std(
                 noise_multiplier_ref=float(noise_multiplier),
                 max_grad_norm=float(max_grad_norm),
-                denominator=float(bsr_denominator),
+                denominator=float(correlated_denominator),
             )
+            if bnb_calibration_report is not None:
+                state["_bnb_calibration_report"] = bnb_calibration_report
             mechanism_config = NoiseMechanismConfig(
                 mechanism=mechanism_config.mechanism,
                 accounting_mode=mechanism_config.accounting_mode,
@@ -1012,12 +1350,50 @@ class PrivacyEngine:
         Returns:
             Privacy budget (epsilon) expended so far.
         """
-        if self.accountant.mechanism() == "bsr":
+        if self.accountant.mechanism() in ("bsr", "bnb"):
             kwargs.setdefault(
                 "mechanism_state", self.noise_mechanism_config.mechanism_state
             )
             kwargs.setdefault("sampling_semantics", self.sampling_semantics)
         return self.accountant.get_epsilon(delta, **kwargs)
+
+    def get_bnb_calibration_report(self):
+        """
+        Returns parsed BNB calibration report from mechanism_state, if present.
+        """
+        state = self.noise_mechanism_config.mechanism_state
+        if not isinstance(state, dict):
+            return None
+        payload = state.get("_bnb_calibration_report")
+        if payload is None:
+            return None
+        return parse_bnb_calibration_report(payload)
+
+    def get_bnb_calibration_summary(self) -> str | None:
+        """
+        Returns compact BNB calibration summary, if report exists.
+        """
+        report = self.get_bnb_calibration_report()
+        if report is None:
+            return None
+        return describe_bnb_calibration_report(report)
+
+    def get_bnb_calibration_status(self) -> BNBCalibrationStatus | None:
+        """
+        Returns structured BNB calibration diagnostics, if report exists.
+        """
+        report = self.get_bnb_calibration_report()
+        if report is None:
+            return None
+        return BNBCalibrationStatus(
+            mechanism=self.noise_mechanism_config.mechanism,
+            accounting_mode=self.noise_mechanism_config.accounting_mode,
+            sampling_mode=self.sampling_semantics.sampling_mode
+            if self.sampling_semantics is not None
+            else None,
+            report=report,
+            summary=describe_bnb_calibration_report(report),
+        )
 
     def save_checkpoint(
         self,
@@ -1066,6 +1442,15 @@ class PrivacyEngine:
         checkpoint_dict["privacy_accountant_state_dict"] = self.accountant.state_dict()
         if optimizer is not None:
             checkpoint_dict["optimizer_state_dict"] = optimizer.state_dict()
+        checkpoint_dict["noise_mechanism_config"] = {
+            "mechanism": self.noise_mechanism_config.mechanism,
+            "accounting_mode": self.noise_mechanism_config.accounting_mode,
+            "mechanism_state": copy.deepcopy(self.noise_mechanism_config.mechanism_state),
+        }
+        checkpoint_dict["sampling_semantics"] = {
+            "sampling_mode": self.sampling_semantics.sampling_mode,
+            "privacy_metadata": copy.deepcopy(self.sampling_semantics.privacy_metadata),
+        }
         if noise_scheduler is not None:
             checkpoint_dict["noise_scheduler_state_dict"] = noise_scheduler.state_dict()
         if grad_clip_scheduler is not None:
@@ -1091,6 +1476,36 @@ class PrivacyEngine:
             checkpoint["module_state_dict"], **(module_load_dict_kwargs or {})
         )
         self.accountant.load_state_dict(checkpoint["privacy_accountant_state_dict"])
+        mechanism_cfg_payload = checkpoint.get("noise_mechanism_config")
+        if isinstance(mechanism_cfg_payload, dict):
+            mechanism_state = copy.deepcopy(mechanism_cfg_payload.get("mechanism_state", {}))
+            if (
+                mechanism_cfg_payload.get("mechanism") == "bnb"
+                and isinstance(mechanism_state, dict)
+                and "_bnb_calibration_report" in mechanism_state
+            ):
+                parsed = parse_bnb_calibration_report(
+                    mechanism_state["_bnb_calibration_report"]
+                )
+                mechanism_state["_bnb_calibration_report"] = parsed.to_dict()
+                checkpoint["bnb_calibration_summary"] = describe_bnb_calibration_report(
+                    parsed
+                )
+            self.noise_mechanism_config = NoiseMechanismConfig(
+                mechanism=mechanism_cfg_payload.get("mechanism", "gaussian"),
+                accounting_mode=mechanism_cfg_payload.get(
+                    "accounting_mode", "standard_step_accountant"
+                ),
+                mechanism_state=mechanism_state,
+            )
+        sampling_payload = checkpoint.get("sampling_semantics")
+        if isinstance(sampling_payload, dict):
+            self.sampling_semantics = SamplingSemantics(
+                sampling_mode=sampling_payload.get("sampling_mode", "poisson"),
+                privacy_metadata=copy.deepcopy(
+                    sampling_payload.get("privacy_metadata", {})
+                ),
+            )
 
         optimizer_state_dict = checkpoint.pop("optimizer_state_dict", {})
         if optimizer is not None and len(optimizer_state_dict) > 0:

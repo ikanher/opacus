@@ -19,7 +19,7 @@ import io
 import pytest
 import torch
 import torch.nn.functional as F
-from opacus import NoiseMechanismConfig, PrivacyEngine
+from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
 from opacus.optimizers import CorrelatedNoiseMechanism
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -125,3 +125,72 @@ def test_missing_bsr_mechanism_state_fails_loudly() -> None:
     _, opt2, _, _ = _make_private(model2, noise_seed=201, mechanism_state=mech_state)
     with pytest.raises(ValueError, match="missing bsr noise mechanism state"):
         opt2.load_state_dict(state)
+
+
+def test_checkpoint_load_preserves_bnb_report_and_sampling_metadata() -> None:
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    pe = PrivacyEngine()
+    private_model, dp_optimizer, _loader_, _ = _make_private(
+        model,
+        noise_seed=300,
+        mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+    )
+
+    # Inject a v2 BNB report into saved mechanism config payload.
+    checkpoint_dict: dict = {}
+    with io.BytesIO() as bio:
+        pe.noise_mechanism_config = NoiseMechanismConfig(
+            mechanism="bnb",
+            accounting_mode="bnb_accountant",
+            mechanism_state={
+                "coeffs": [1.0],
+                "z_std": 0.01,
+                "_bnb_calibration_report": {
+                    "version": 2,
+                    "target_epsilon": 1.0,
+                    "target_delta": 1e-5,
+                    "noise_multiplier": 2.0,
+                    "num_samples": 1000,
+                    "seed": 7,
+                    "bands": 2,
+                    "delta_estimate_at_target_epsilon": 0.1,
+                    "delta_upper_confidence_bound": 0.11,
+                    "confidence_alpha": 1e-4,
+                    "verification_passed": True,
+                    "evr_confidence_alpha_total": 1e-4,
+                    "evr_num_checks": 1,
+                    "evr_per_check_alpha": 1e-4,
+                    "evr_pass_count": 1,
+                    "verification_contract": "evr_union_bound_alpha_split_v1",
+                    "evr_composed_delta_upper_bound": 1e-5 + 1e-4 * (1 - 1e-5),
+                },
+            },
+        )
+        pe.sampling_semantics = SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bands": 2},
+        )
+        pe.save_checkpoint(
+            path=bio,
+            module=private_model,
+            optimizer=dp_optimizer,
+            checkpoint_dict=checkpoint_dict,
+        )
+        bio.seek(0)
+        loaded = pe.load_checkpoint(path=bio, module=private_model, optimizer=dp_optimizer)
+
+    report = pe.noise_mechanism_config.mechanism_state["_bnb_calibration_report"]
+    assert report["version"] == 2
+    assert report["evr_num_checks"] == 1
+    assert "bnb_calibration_summary" in loaded
+    assert pe.sampling_semantics.sampling_mode == "balls_in_bins"
+    parsed = pe.get_bnb_calibration_report()
+    assert parsed is not None
+    summary = pe.get_bnb_calibration_summary()
+    assert isinstance(summary, str)
+    assert "BNB calibration v2" in summary
+    status = pe.get_bnb_calibration_status()
+    assert status is not None
+    assert status.report.version == 2
+    assert status.sampling_mode == "balls_in_bins"

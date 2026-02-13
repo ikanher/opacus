@@ -19,12 +19,19 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Literal, Mapping, Protocol
 
 
-NoiseMechanismName = Literal["gaussian", "bsr"]
+NoiseMechanismName = Literal["gaussian", "bsr", "bnb"]
 AccountingModeName = Literal[
     "standard_step_accountant",
     "bsr_accountant",
+    "bnb_accountant",
 ]
-SamplingModeName = Literal["poisson", "fixed_batch", "cyclic_poisson"]
+SamplingModeName = Literal[
+    "poisson",
+    "fixed_batch",
+    "cyclic_poisson",
+    "b_min_sep",
+    "balls_in_bins",
+]
 
 
 class MechanismStateSerializable(Protocol):
@@ -46,6 +53,19 @@ class SamplingSemantics:
     sampling_mode: SamplingModeName
     privacy_metadata: Dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if self.sampling_mode not in (
+            "poisson",
+            "fixed_batch",
+            "cyclic_poisson",
+            "b_min_sep",
+            "balls_in_bins",
+        ):
+            raise ValueError(
+                "sampling_mode must be one of "
+                "{'poisson', 'fixed_batch', 'cyclic_poisson', 'b_min_sep', 'balls_in_bins'}"
+            )
+
 
 @dataclass(frozen=True)
 class NoiseMechanismConfig:
@@ -55,16 +75,17 @@ class NoiseMechanismConfig:
 
     def __post_init__(self) -> None:
         mechanism = self.mechanism
-        if mechanism not in ("gaussian", "bsr"):
-            raise ValueError("mechanism must be one of {'gaussian', 'bsr'}")
+        if mechanism not in ("gaussian", "bsr", "bnb"):
+            raise ValueError("mechanism must be one of {'gaussian', 'bsr', 'bnb'}")
 
         if self.accounting_mode not in (
             "standard_step_accountant",
             "bsr_accountant",
+            "bnb_accountant",
         ):
             raise ValueError(
                 "accounting_mode must be one of "
-                "{'standard_step_accountant', 'bsr_accountant'}"
+                "{'standard_step_accountant', 'bsr_accountant', 'bnb_accountant'}"
             )
 
         if (
@@ -73,5 +94,14 @@ class NoiseMechanismConfig:
         ):
             raise ValueError(
                 "bsr mechanism requires bsr_accountant "
+                "for authoritative accounting"
+            )
+
+        if (
+            mechanism == "bnb"
+            and self.accounting_mode != "bnb_accountant"
+        ):
+            raise ValueError(
+                "bnb mechanism requires bnb_accountant "
                 "for authoritative accounting"
             )
