@@ -86,7 +86,7 @@ class BSRAccountant(IAccountant):
             sampling_mode = (
                 sampling_semantics.sampling_mode
                 if sampling_semantics is not None
-                else "fixed_batch"
+                else "torch_sampler"
             )
 
             if sampling_mode == "cyclic_poisson":

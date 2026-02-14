@@ -27,10 +27,9 @@ AccountingModeName = Literal[
 ]
 SamplingModeName = Literal[
     "poisson",
-    "fixed_batch",
+    "torch_sampler",
     "cyclic_poisson",
     "b_min_sep",
-    "balls_in_bins",
 ]
 
 
@@ -56,14 +55,13 @@ class SamplingSemantics:
     def __post_init__(self) -> None:
         if self.sampling_mode not in (
             "poisson",
-            "fixed_batch",
+            "torch_sampler",
             "cyclic_poisson",
             "b_min_sep",
-            "balls_in_bins",
         ):
             raise ValueError(
                 "sampling_mode must be one of "
-                "{'poisson', 'fixed_batch', 'cyclic_poisson', 'b_min_sep', 'balls_in_bins'}"
+                "{'poisson', 'torch_sampler', 'cyclic_poisson', 'b_min_sep'}"
             )
 
 

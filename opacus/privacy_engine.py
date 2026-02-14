@@ -32,7 +32,7 @@ from opacus.accountants.analysis.bnb import (
     describe_bnb_calibration_report,
     make_bnb_calibration_report,
     parse_bnb_calibration_report,
-    sample_balls_in_bins_llr,
+    sample_b_min_sep_llr,
     select_evr_candidate_ladder_two_sided,
     select_evr_candidate_ladder,
     validate_bnb_c_matrix_contract,
@@ -50,9 +50,9 @@ from opacus.schedulers import _GradClipScheduler, _NoiseScheduler
 from opacus.utils.fast_gradient_clipping_utils import DPLossFastGradientClipping
 from opacus.validators.module_validator import ModuleValidator
 from opacus.utils.uniform_sampler import (
-    BallsInBinsSampler,
     BMinSepSampler,
     CyclicPoissonSampler,
+    DistributedBMinSepSampler,
     DistributedCyclicPoissonSampler,
 )
 from torch import nn, optim
@@ -130,6 +130,7 @@ class PrivacyEngine:
     def _accountant_for_mechanism(*, mechanism: str, default_accountant):
         if mechanism in ("bsr", "bnb"):
             return create_accountant(mechanism=mechanism)
+
         return default_accountant
 
     @staticmethod
@@ -145,7 +146,7 @@ class PrivacyEngine:
             return explicit_sampling_semantics
 
         return SamplingSemantics(
-            sampling_mode="poisson" if poisson_sampling else "fixed_batch",
+            sampling_mode="poisson" if poisson_sampling else "torch_sampler",
             privacy_metadata={
                 "sample_rate": sample_rate,
                 "expected_batch_size": int(expected_batch_size),
@@ -196,27 +197,28 @@ class PrivacyEngine:
         )
 
     @staticmethod
-    def _validate_distributed_bsr_support(
+    def _validate_distributed_correlated_support(
         *,
+        mechanism: str,
         clipping: str,
         grad_sample_mode: str,
         is_fsdp: bool,
     ) -> None:
         if is_fsdp:
             raise ValueError(
-                "bsr noise mechanism is not yet supported with FSDP; "
+                f"{mechanism} noise mechanism is not yet supported with FSDP; "
                 "supported distributed mode is DDP/DPDDP with flat clipping"
             )
 
         if clipping != "flat":
             raise ValueError(
-                "bsr noise mechanism supports only distributed flat clipping; "
+                f"{mechanism} noise mechanism supports only distributed flat clipping; "
                 f"got clipping={clipping!r}"
             )
 
         if grad_sample_mode not in ("hooks", "ew"):
             raise ValueError(
-                "bsr noise mechanism supports distributed grad_sample_mode "
+                f"{mechanism} noise mechanism supports distributed grad_sample_mode "
                 "in {'hooks', 'ew'} only; "
                 f"got grad_sample_mode={grad_sample_mode!r}"
             )
@@ -331,7 +333,7 @@ class PrivacyEngine:
         )
 
     @staticmethod
-    def _resolve_bnb_balls_in_bins_inputs(
+    def _resolve_bnb_b_min_sep_inputs(
         *,
         mechanism_state: Dict[str, Any],
         sampling_semantics: Optional[SamplingSemantics],
@@ -341,6 +343,7 @@ class PrivacyEngine:
         metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
         c_matrix = kwargs.get("bnb_c_matrix", state.get("c_matrix"))
         bands = kwargs.get("bnb_bands", metadata.get("bands", state.get("bands")))
+
         c_matrix_contract = kwargs.get(
             "bnb_c_matrix_contract",
             state.get("c_matrix_contract"),
@@ -348,7 +351,7 @@ class PrivacyEngine:
 
         if c_matrix is None or bands is None or c_matrix_contract is None:
             raise ValueError(
-                "bnb non-callback calibration requires balls_in_bins inputs: "
+                "bnb non-callback calibration requires b_min_sep inputs: "
                 "`c_matrix`, `bands`, and `c_matrix_contract`"
             )
 
@@ -365,10 +368,12 @@ class PrivacyEngine:
     ) -> None:
         state = mechanism_state if isinstance(mechanism_state, dict) else {}
         coeffs = state.get("coeffs")
+
         if coeffs is None or not isinstance(coeffs, (list, tuple)) or len(coeffs) == 0:
             raise ValueError(
                 "bnb mechanism_state consistency check requires non-empty `coeffs`"
             )
+
         if int(bands) != len(coeffs):
             raise ValueError(
                 "bnb consistency check failed: `bands` must match len(coeffs); "
@@ -378,6 +383,7 @@ class PrivacyEngine:
         metadata = (
             sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
         )
+
         metadata_bands = metadata.get("bands")
         if metadata_bands is not None and int(metadata_bands) != int(bands):
             raise ValueError(
@@ -389,8 +395,10 @@ class PrivacyEngine:
             raise ValueError(
                 "bnb consistency check requires `c_matrix` to be a torch.Tensor"
             )
+
         if c_matrix.ndim != 2:
             raise ValueError("bnb consistency check requires `c_matrix` with shape [d, m]")
+
         d, _m = c_matrix.shape
         if d < int(bands):
             raise ValueError(
@@ -404,6 +412,110 @@ class PrivacyEngine:
             bands=int(bands),
             c_matrix_contract=c_matrix_contract,
         )
+
+    def _sampler_generator(self, data_loader: DataLoader):
+        return self.secure_rng if self.secure_mode else data_loader.generator
+
+    def _rebuild_data_loader_with_batch_sampler(
+        self, data_loader: DataLoader, sampler
+    ) -> DataLoader:
+        return DataLoader(
+            dataset=data_loader.dataset,
+            batch_sampler=sampler,
+            num_workers=data_loader.num_workers,
+            collate_fn=data_loader.collate_fn,
+            pin_memory=data_loader.pin_memory,
+            timeout=data_loader.timeout,
+            worker_init_fn=data_loader.worker_init_fn,
+            multiprocessing_context=data_loader.multiprocessing_context,
+            generator=self._sampler_generator(data_loader),
+            prefetch_factor=data_loader.prefetch_factor,
+            persistent_workers=data_loader.persistent_workers,
+        )
+
+    def _build_cyclic_poisson_sampler(
+        self,
+        *,
+        data_loader: DataLoader,
+        distributed: bool,
+        bands: int,
+        total_steps: Optional[int],
+    ):
+        if isinstance(data_loader.dataset, torch.utils.data.IterableDataset):
+            raise ValueError("cyclic_poisson sampling is not supported for IterableDataset")
+        if data_loader.batch_size is None:
+            raise ValueError("cyclic_poisson sampling requires data_loader.batch_size")
+
+        steps = total_steps if total_steps is not None else len(data_loader)
+        generator = self._sampler_generator(data_loader)
+        if distributed:
+            world_size = torch.distributed.get_world_size()
+            local_batch_size = int(data_loader.batch_size / world_size)
+            if local_batch_size <= 0:
+                raise ValueError(
+                    "cyclic_poisson distributed sampling requires "
+                    "batch_size >= world_size"
+                )
+            return DistributedCyclicPoissonSampler(
+                total_size=len(data_loader.dataset),
+                batch_size=local_batch_size,
+                bands=bands,
+                generator=generator,
+                steps=steps,
+            )
+
+        return CyclicPoissonSampler(
+            num_samples=len(data_loader.dataset),
+            batch_size=int(data_loader.batch_size),
+            bands=bands,
+            generator=generator,
+            steps=steps,
+        )
+
+    def _build_b_min_sep_sampler(
+        self,
+        *,
+        data_loader: DataLoader,
+        distributed: bool,
+        b: int,
+        p: float,
+        total_steps: Optional[int],
+    ):
+        if isinstance(data_loader.dataset, torch.utils.data.IterableDataset):
+            raise ValueError("b_min_sep sampling is not supported for IterableDataset")
+
+        steps = total_steps if total_steps is not None else len(data_loader)
+        generator = self._sampler_generator(data_loader)
+        if distributed:
+            return DistributedBMinSepSampler(
+                total_size=len(data_loader.dataset),
+                sample_rate=p,
+                min_separation=b,
+                generator=generator,
+                steps=steps,
+            )
+
+        return BMinSepSampler(
+            num_samples=len(data_loader.dataset),
+            sample_rate=p,
+            min_separation=b,
+            generator=generator,
+            steps=steps,
+        )
+
+    @staticmethod
+    def _validate_bnb_sampling_policy(
+        *,
+        sampling_semantics: Optional[SamplingSemantics],
+        mechanism: str,
+    ) -> None:
+        if mechanism != "bnb" or sampling_semantics is None:
+            return
+        mode = sampling_semantics.sampling_mode
+        if mode != "b_min_sep":
+            raise ValueError(
+                "bnb mechanism requires sampling_semantics in {'b_min_sep'}"
+            )
 
     def _prepare_data_loader(
         self,
@@ -433,120 +545,34 @@ class PrivacyEngine:
                     "cyclic_poisson sampling requires privacy_metadata['bands']"
                 )
 
-            if isinstance(data_loader.dataset, torch.utils.data.IterableDataset):
-                raise ValueError("cyclic_poisson sampling is not supported for IterableDataset")
-
-            if data_loader.batch_size is None:
-                raise ValueError("cyclic_poisson sampling requires data_loader.batch_size")
-
-            if distributed:
-                world_size = torch.distributed.get_world_size()
-                local_batch_size = int(data_loader.batch_size / world_size)
-
-                if local_batch_size <= 0:
-                    raise ValueError(
-                        "cyclic_poisson distributed sampling requires "
-                        "batch_size >= world_size"
-                    )
-
-                sampler = DistributedCyclicPoissonSampler(
-                    total_size=len(data_loader.dataset),
-                    batch_size=local_batch_size,
-                    bands=int(bands),
-                    generator=self.secure_rng if self.secure_mode else data_loader.generator,
-                    steps=total_steps if total_steps is not None else len(data_loader),
-                )
-
-            else:
-                sampler = CyclicPoissonSampler(
-                    num_samples=len(data_loader.dataset),
-                    batch_size=int(data_loader.batch_size),
-                    bands=int(bands),
-                    generator=self.secure_rng if self.secure_mode else data_loader.generator,
-                    steps=total_steps if total_steps is not None else len(data_loader),
-                )
-
-            return DataLoader(
-                dataset=data_loader.dataset,
-                batch_sampler=sampler,
-                num_workers=data_loader.num_workers,
-                collate_fn=data_loader.collate_fn,
-                pin_memory=data_loader.pin_memory,
-                timeout=data_loader.timeout,
-                worker_init_fn=data_loader.worker_init_fn,
-                multiprocessing_context=data_loader.multiprocessing_context,
-                generator=self.secure_rng if self.secure_mode else data_loader.generator,
-                prefetch_factor=data_loader.prefetch_factor,
-                persistent_workers=data_loader.persistent_workers,
+            sampler = self._build_cyclic_poisson_sampler(
+                data_loader=data_loader,
+                distributed=distributed,
+                bands=int(bands),
+                total_steps=total_steps,
             )
+
+            return self._rebuild_data_loader_with_batch_sampler(data_loader, sampler)
 
         if sampling_semantics is not None and sampling_semantics.sampling_mode == "b_min_sep":
             b = sampling_semantics.privacy_metadata.get("b")
             p = sampling_semantics.privacy_metadata.get("p")
+
             if b is None or p is None:
                 raise ValueError(
                     "b_min_sep sampling requires privacy_metadata['b'] and "
                     "privacy_metadata['p']"
                 )
-            if distributed:
-                raise ValueError("b_min_sep sampling is not supported in distributed mode")
-            if isinstance(data_loader.dataset, torch.utils.data.IterableDataset):
-                raise ValueError("b_min_sep sampling is not supported for IterableDataset")
 
-            sampler = BMinSepSampler(
-                num_samples=len(data_loader.dataset),
-                sample_rate=float(p),
-                min_separation=int(b),
-                generator=self.secure_rng if self.secure_mode else data_loader.generator,
-                steps=total_steps if total_steps is not None else len(data_loader),
-            )
-            return DataLoader(
-                dataset=data_loader.dataset,
-                batch_sampler=sampler,
-                num_workers=data_loader.num_workers,
-                collate_fn=data_loader.collate_fn,
-                pin_memory=data_loader.pin_memory,
-                timeout=data_loader.timeout,
-                worker_init_fn=data_loader.worker_init_fn,
-                multiprocessing_context=data_loader.multiprocessing_context,
-                generator=self.secure_rng if self.secure_mode else data_loader.generator,
-                prefetch_factor=data_loader.prefetch_factor,
-                persistent_workers=data_loader.persistent_workers,
+            sampler = self._build_b_min_sep_sampler(
+                data_loader=data_loader,
+                distributed=distributed,
+                b=int(b),
+                p=float(p),
+                total_steps=total_steps,
             )
 
-        if sampling_semantics is not None and sampling_semantics.sampling_mode == "balls_in_bins":
-            bands = sampling_semantics.privacy_metadata.get("bands")
-            if bands is None:
-                raise ValueError(
-                    "balls_in_bins sampling requires privacy_metadata['bands']"
-                )
-            if distributed:
-                raise ValueError("balls_in_bins sampling is not supported in distributed mode")
-            if isinstance(data_loader.dataset, torch.utils.data.IterableDataset):
-                raise ValueError("balls_in_bins sampling is not supported for IterableDataset")
-            if data_loader.batch_size is None:
-                raise ValueError("balls_in_bins sampling requires data_loader.batch_size")
-
-            sampler = BallsInBinsSampler(
-                num_samples=len(data_loader.dataset),
-                batch_size=int(data_loader.batch_size),
-                bands=int(bands),
-                generator=self.secure_rng if self.secure_mode else data_loader.generator,
-                steps=total_steps if total_steps is not None else len(data_loader),
-            )
-            return DataLoader(
-                dataset=data_loader.dataset,
-                batch_sampler=sampler,
-                num_workers=data_loader.num_workers,
-                collate_fn=data_loader.collate_fn,
-                pin_memory=data_loader.pin_memory,
-                timeout=data_loader.timeout,
-                worker_init_fn=data_loader.worker_init_fn,
-                multiprocessing_context=data_loader.multiprocessing_context,
-                generator=self.secure_rng if self.secure_mode else data_loader.generator,
-                prefetch_factor=data_loader.prefetch_factor,
-                persistent_workers=data_loader.persistent_workers,
-            )
+            return self._rebuild_data_loader_with_batch_sampler(data_loader, sampler)
 
         if poisson_sampling:
             return DPDataLoader.from_data_loader(
@@ -787,24 +813,33 @@ class PrivacyEngine:
                 "bsr mechanism requires fixed-batch semantics; "
                 "set poisson_sampling=False"
             )
+
         if mechanism_config.mechanism == "bnb" and poisson_sampling:
             raise ValueError(
                 "bnb mechanism requires explicit non-Poisson sampling semantics; "
                 "set poisson_sampling=False and provide sampling_semantics"
             )
+
         if mechanism_config.mechanism == "bnb" and sampling_semantics is None:
             raise ValueError(
                 "bnb mechanism requires explicit sampling_semantics "
-                "in {'b_min_sep', 'balls_in_bins'}"
+                "in {'b_min_sep'}"
             )
+
+        self._validate_bnb_sampling_policy(
+            sampling_semantics=sampling_semantics,
+            mechanism=mechanism_config.mechanism,
+        )
+
         if (
             sampling_semantics is not None
-            and sampling_semantics.sampling_mode in ("b_min_sep", "balls_in_bins")
+            and sampling_semantics.sampling_mode == "b_min_sep"
             and mechanism_config.mechanism != "bnb"
         ):
             raise ValueError(
-                "b_min_sep and balls_in_bins sampling are supported only for mechanism='bnb'"
+                "b_min_sep sampling is supported only for mechanism='bnb'"
             )
+
         if (
             sampling_semantics is not None
             and sampling_semantics.sampling_mode == "cyclic_poisson"
@@ -839,13 +874,16 @@ class PrivacyEngine:
         is_ddp = isinstance(module, DDP)
         is_fsdp = isinstance(module, FSDPModule)
         distributed = is_dpddp or is_ddp or is_fsdp
+
         requested_noise_mechanism = (
             configured_noise_mechanism
             if configured_noise_mechanism is not None
             else kwargs.get("noise_mechanism")
         )
+
         if distributed and isinstance(requested_noise_mechanism, CorrelatedNoiseMechanism):
-            self._validate_distributed_bsr_support(
+            self._validate_distributed_correlated_support(
+                mechanism=mechanism_config.mechanism,
                 clipping=clipping,
                 grad_sample_mode=grad_sample_mode,
                 is_fsdp=is_fsdp,
@@ -858,6 +896,7 @@ class PrivacyEngine:
             loss_reduction=loss_reduction,
             grad_sample_mode=grad_sample_mode,
         )
+
         if poisson_sampling:
             module.forbid_grad_accumulation()
 
@@ -873,14 +912,27 @@ class PrivacyEngine:
         )
 
         if total_steps:
-            if not poisson_sampling:
+            sampling_mode = (
+                sampling_semantics.sampling_mode
+                if sampling_semantics is not None
+                else None
+            )
+            if not poisson_sampling and sampling_mode in (None, "torch_sampler"):
                 raise ValueError(
-                    "Setting total_steps without Poisson sampling not implemented"
+                    "Setting total_steps with non-Poisson sampling requires "
+                    "explicit sampling_semantics in {'cyclic_poisson', 'b_min_sep'}"
                 )
 
-            # if we are stepping through the optimizer for `total_steps` steps,
-            # we can just use sample_rate q = B/N
-            sample_rate = batch_size / len(data_loader.dataset)
+            if not poisson_sampling and sampling_mode == "b_min_sep":
+                p = sampling_semantics.privacy_metadata.get("p")
+                if p is None:
+                    raise ValueError(
+                        "b_min_sep sampling requires privacy_metadata['p']"
+                    )
+                sample_rate = float(p)
+            else:
+                # For Poisson and cyclic_poisson, q follows the batch-size ratio.
+                sample_rate = batch_size / len(data_loader.dataset)
         else:
             sample_rate = 1 / len(data_loader)
 
@@ -908,6 +960,7 @@ class PrivacyEngine:
             normalize_clipping=normalize_clipping,
             **optimizer_prepare_kwargs,
         )
+
         semantics = self._build_sampling_semantics(
             poisson_sampling=poisson_sampling,
             sample_rate=sample_rate,
@@ -915,6 +968,7 @@ class PrivacyEngine:
             distributed=distributed,
             explicit_sampling_semantics=sampling_semantics,
         )
+
         self.noise_mechanism_config = mechanism_config
         self.sampling_semantics = semantics
         self.accountant = active_accountant
@@ -947,7 +1001,7 @@ class PrivacyEngine:
         data_loader: DataLoader,
         target_epsilon: float,
         target_delta: float,
-        epochs: int,
+        epochs: Optional[int] = None,
         max_grad_norm: Union[float, List[float]],
         batch_first: bool = True,
         loss_reduction: str = "mean",
@@ -980,7 +1034,7 @@ class PrivacyEngine:
             target_delta: Target delta to be achieved. Probability of information being leaked.
             epochs: Number of training epochs you intend to perform; noise_multiplier relies on this to calculate
                 an appropriate sigma to ensure privacy budget of (target_epsilon, target_delta) at the end
-                of epochs.
+                of epochs. Must be provided when ``total_steps`` is not set.
             max_grad_norm: The maximum norm of the per-sample gradients. Any gradient with norm
                 higher than this will be clipped to this value.
             batch_first: Flag to indicate if the input tensor to the corresponding module
@@ -1027,6 +1081,10 @@ class PrivacyEngine:
                 sampling mechanism. Points to the same dataset object.
         """
         mechanism_config = noise_mechanism_config or NoiseMechanismConfig()
+        if total_steps is None and epochs is None:
+            raise ValueError(
+                "make_private_with_epsilon requires either `epochs` or `total_steps`"
+            )
 
         active_accountant = self._accountant_for_mechanism(
             mechanism=mechanism_config.mechanism,
@@ -1038,23 +1096,31 @@ class PrivacyEngine:
                 "bsr mechanism requires fixed-batch semantics; "
                 "set poisson_sampling=False"
             )
+
         if mechanism_config.mechanism == "bnb" and poisson_sampling:
             raise ValueError(
                 "bnb mechanism requires explicit non-Poisson sampling semantics; "
                 "set poisson_sampling=False and provide sampling_semantics"
             )
+
         if mechanism_config.mechanism == "bnb" and sampling_semantics is None:
             raise ValueError(
                 "bnb mechanism requires explicit sampling_semantics "
-                "in {'b_min_sep', 'balls_in_bins'}"
+                "in {'b_min_sep'}"
             )
+
+        self._validate_bnb_sampling_policy(
+            sampling_semantics=sampling_semantics,
+            mechanism=mechanism_config.mechanism,
+        )
+
         if (
             sampling_semantics is not None
-            and sampling_semantics.sampling_mode in ("b_min_sep", "balls_in_bins")
+            and sampling_semantics.sampling_mode == "b_min_sep"
             and mechanism_config.mechanism != "bnb"
         ):
             raise ValueError(
-                "b_min_sep and balls_in_bins sampling are supported only for mechanism='bnb'"
+                "b_min_sep sampling is supported only for mechanism='bnb'"
             )
 
         local_sampling_semantics = sampling_semantics
@@ -1063,6 +1129,7 @@ class PrivacyEngine:
                 local_sample_rate = data_loader.batch_size / len(data_loader.dataset)
             else:
                 local_sample_rate = 1 / len(data_loader)
+
             local_sampling_semantics = self._build_sampling_semantics(
                 poisson_sampling=poisson_sampling,
                 sample_rate=local_sample_rate,
@@ -1078,6 +1145,7 @@ class PrivacyEngine:
                 sampling_semantics=local_sampling_semantics,
                 data_loader=data_loader,
             )
+
         bsr_mf_sensitivity = None
         bnb_c_matrix = None
         bnb_bands = None
@@ -1086,17 +1154,19 @@ class PrivacyEngine:
         if mechanism_config.mechanism == "bnb" and epsilon_fn is None:
             if (
                 local_sampling_semantics is None
-                or local_sampling_semantics.sampling_mode != "balls_in_bins"
+                or local_sampling_semantics.sampling_mode != "b_min_sep"
             ):
                 raise ValueError(
                     "bnb non-callback calibration currently requires "
-                    "sampling_mode='balls_in_bins'"
+                    "sampling_mode='b_min_sep'"
                 )
-            bnb_c_matrix, bnb_bands, bnb_c_matrix_contract = self._resolve_bnb_balls_in_bins_inputs(
+
+            bnb_c_matrix, bnb_bands, bnb_c_matrix_contract = self._resolve_bnb_b_min_sep_inputs(
                 mechanism_state=mechanism_config.mechanism_state,
                 sampling_semantics=local_sampling_semantics,
                 kwargs=kwargs,
             )
+
             self._validate_bnb_accounting_runtime_consistency(
                 mechanism_state=mechanism_config.mechanism_state,
                 sampling_semantics=local_sampling_semantics,
@@ -1106,9 +1176,15 @@ class PrivacyEngine:
             )
 
         if total_steps:
-            if not poisson_sampling:
+            sampling_mode = (
+                local_sampling_semantics.sampling_mode
+                if local_sampling_semantics is not None
+                else None
+            )
+            if not poisson_sampling and sampling_mode in (None, "torch_sampler"):
                 raise ValueError(
-                    "Setting total_steps without Poisson sampling not implemented"
+                    "Setting total_steps with non-Poisson sampling requires "
+                    "explicit sampling_semantics in {'cyclic_poisson', 'b_min_sep'}"
                 )
 
             if epochs is not None:
@@ -1116,14 +1192,21 @@ class PrivacyEngine:
                     "make_private_with_epsilon takes as input EITHER a number of steps or a number of epochs"
                 )
 
-            # we are given the number of optimizer steps instead of epochs,
-            # so we can just use sample rate q = B/N
-            sample_rate = data_loader.batch_size / len(data_loader.dataset)
+            if not poisson_sampling and sampling_mode == "b_min_sep":
+                p = local_sampling_semantics.privacy_metadata.get("p")
+                if p is None:
+                    raise ValueError(
+                        "b_min_sep sampling requires privacy_metadata['p']"
+                    )
+                sample_rate = float(p)
+            else:
+                # For Poisson and cyclic_poisson, q follows the batch-size ratio.
+                sample_rate = data_loader.batch_size / len(data_loader.dataset)
             if (
                 mechanism_config.mechanism == "bsr"
                 and epsilon_fn is None
                 and local_sampling_semantics is not None
-                and local_sampling_semantics.sampling_mode == "fixed_batch"
+                and local_sampling_semantics.sampling_mode == "torch_sampler"
             ):
                 bsr_mf_sensitivity = self._resolve_bsr_mf_sensitivity_for_fixed_batch(
                     mechanism_state=mechanism_config.mechanism_state,
@@ -1152,7 +1235,7 @@ class PrivacyEngine:
                 mechanism_config.mechanism == "bsr"
                 and epsilon_fn is None
                 and local_sampling_semantics is not None
-                and local_sampling_semantics.sampling_mode == "fixed_batch"
+                and local_sampling_semantics.sampling_mode == "torch_sampler"
             ):
                 implied_steps = int(epochs / sample_rate)
                 bsr_mf_sensitivity = self._resolve_bsr_mf_sensitivity_for_fixed_batch(
@@ -1190,8 +1273,10 @@ class PrivacyEngine:
             confidence_alpha_total = float(kwargs.get("bnb_confidence_alpha", 1e-6))
             num_checks = int(kwargs.get("bnb_evr_num_checks", 3))
             candidate_sigmas = kwargs.get("bnb_candidate_sigmas")
+
             if candidate_sigmas is not None:
                 sigma_candidates = [float(s) for s in candidate_sigmas]
+
             elif bool(kwargs.get("bnb_evr_use_candidate_ladder", True)):
                 multipliers = kwargs.get(
                     "bnb_candidate_multipliers",
@@ -1206,6 +1291,7 @@ class PrivacyEngine:
                 )
             else:
                 sigma_candidates = [float(noise_multiplier)]
+
             if len(sigma_candidates) == 0:
                 raise ValueError("bnb candidate sigma ladder must contain positive values")
             if any(
@@ -1213,6 +1299,7 @@ class PrivacyEngine:
                 for i in range(len(sigma_candidates) - 1)
             ):
                 raise ValueError("candidate_sigmas must be strictly increasing")
+
             calibrated_sigma = float(noise_multiplier)
             if any(float(s) < calibrated_sigma for s in sigma_candidates):
                 raise ValueError(
@@ -1222,7 +1309,7 @@ class PrivacyEngine:
 
             def _llr_samples_seq_for_sigma_forward(sigma: float):
                 return [
-                    sample_balls_in_bins_llr(
+                    sample_b_min_sep_llr(
                         c_matrix=bnb_c_matrix,
                         bands=int(bnb_bands),
                         sigma=float(sigma),
@@ -1236,7 +1323,7 @@ class PrivacyEngine:
             def _llr_samples_seq_for_sigma_reverse(sigma: float):
                 # Reverse direction uses independent sample streams via seed offset.
                 return [
-                    -sample_balls_in_bins_llr(
+                    -sample_b_min_sep_llr(
                         c_matrix=bnb_c_matrix,
                         bands=int(bnb_bands),
                         sigma=float(sigma),
@@ -1275,12 +1362,14 @@ class PrivacyEngine:
                 if bool(kwargs.get("bnb_verify_both_directions", True))
                 else int(num_checks)
             )
+
             noise_multiplier = float(selected_sigma)
             if bool(kwargs.get("bnb_require_evr_pass", True)) and not verification.accepted:
                 raise ValueError(
                     "bnb verification guard failed for calibrated noise multiplier; "
                     "increase noise, sample budget, or loosen targets"
                 )
+
             bnb_calibration_report = make_bnb_calibration_report(
                 target_epsilon=float(target_epsilon),
                 target_delta=float(target_delta),
@@ -1301,14 +1390,17 @@ class PrivacyEngine:
                     f"{mechanism_config.mechanism} calibration requires scalar "
                     "max_grad_norm under flat clipping"
                 )
+
             state = copy.deepcopy(mechanism_config.mechanism_state)
             state["z_std"] = calibrate_bsr_z_std(
                 noise_multiplier_ref=float(noise_multiplier),
                 max_grad_norm=float(max_grad_norm),
                 denominator=float(correlated_denominator),
             )
+
             if bnb_calibration_report is not None:
                 state["_bnb_calibration_report"] = bnb_calibration_report
+
             mechanism_config = NoiseMechanismConfig(
                 mechanism=mechanism_config.mechanism,
                 accounting_mode=mechanism_config.accounting_mode,
@@ -1364,9 +1456,11 @@ class PrivacyEngine:
         state = self.noise_mechanism_config.mechanism_state
         if not isinstance(state, dict):
             return None
+
         payload = state.get("_bnb_calibration_report")
         if payload is None:
             return None
+
         return parse_bnb_calibration_report(payload)
 
     def get_bnb_calibration_summary(self) -> str | None:
@@ -1376,6 +1470,7 @@ class PrivacyEngine:
         report = self.get_bnb_calibration_report()
         if report is None:
             return None
+
         return describe_bnb_calibration_report(report)
 
     def get_bnb_calibration_status(self) -> BNBCalibrationStatus | None:
@@ -1385,6 +1480,7 @@ class PrivacyEngine:
         report = self.get_bnb_calibration_report()
         if report is None:
             return None
+
         return BNBCalibrationStatus(
             mechanism=self.noise_mechanism_config.mechanism,
             accounting_mode=self.noise_mechanism_config.accounting_mode,
@@ -1432,7 +1528,7 @@ class PrivacyEngine:
                 and int(rank) != 0
             ):
                 raise ValueError(
-                    "distributed bsr checkpoint save is supported only on rank 0"
+                    "distributed correlated-noise checkpoint save is supported only on rank 0"
                 )
 
         checkpoint_dict = checkpoint_dict or {}
@@ -1477,8 +1573,10 @@ class PrivacyEngine:
         )
         self.accountant.load_state_dict(checkpoint["privacy_accountant_state_dict"])
         mechanism_cfg_payload = checkpoint.get("noise_mechanism_config")
+
         if isinstance(mechanism_cfg_payload, dict):
             mechanism_state = copy.deepcopy(mechanism_cfg_payload.get("mechanism_state", {}))
+
             if (
                 mechanism_cfg_payload.get("mechanism") == "bnb"
                 and isinstance(mechanism_state, dict)
@@ -1491,6 +1589,7 @@ class PrivacyEngine:
                 checkpoint["bnb_calibration_summary"] = describe_bnb_calibration_report(
                     parsed
                 )
+
             self.noise_mechanism_config = NoiseMechanismConfig(
                 mechanism=mechanism_cfg_payload.get("mechanism", "gaussian"),
                 accounting_mode=mechanism_cfg_payload.get(
@@ -1498,6 +1597,7 @@ class PrivacyEngine:
                 ),
                 mechanism_state=mechanism_state,
             )
+
         sampling_payload = checkpoint.get("sampling_semantics")
         if isinstance(sampling_payload, dict):
             self.sampling_semantics = SamplingSemantics(

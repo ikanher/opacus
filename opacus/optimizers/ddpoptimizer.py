@@ -76,7 +76,7 @@ class DistributedDPOptimizer(DPOptimizer):
 
             if saved_rank is not None and int(saved_rank) != 0:
                 raise ValueError(
-                    "distributed bsr checkpoint must be saved on rank 0"
+                    "distributed correlated-noise checkpoint must be saved on rank 0"
                 )
 
         super().load_state_dict(state_dict)

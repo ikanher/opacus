@@ -9,13 +9,12 @@ import torch
 from opacus.accountants.analysis.bnb import (
     DeltaVerificationResult,
     GaussianMixture,
-    build_balls_in_bins_gaussian_mixture,
+    build_b_min_sep_gaussian_mixture,
     compute_llr_samples,
     estimate_hockey_stick_delta_from_llr_samples,
     make_bnb_calibration_report,
     select_evr_candidate_ladder,
 )
-from opacus.utils.uniform_sampler import BallsInBinsSampler
 
 
 def _internal_sampling_prob(p0: float, b: int) -> float:
@@ -32,38 +31,6 @@ def test_internal_sampling_prob_eq_one_of_p0_eq_inv_bridge() -> None:
     p0 = 1.0 / float(b)
     p = _internal_sampling_prob(p0, b)
     assert abs(p - 1.0) < 1e-12
-
-
-def test_balls_in_bins_sampler_rate_matches_internal_sampling_prob_bridge() -> None:
-    # Lean bridge: internalSamplingProb (p0, b) with p0 = batch_size / num_samples.
-    num_samples = 120
-    bands = 3
-    batch_size = 30
-    sampler = BallsInBinsSampler(
-        num_samples=num_samples,
-        batch_size=batch_size,
-        bands=bands,
-        generator=torch.Generator().manual_seed(20260213),
-        steps=10,
-    )
-    p0 = float(batch_size) / float(num_samples)
-    expected = _internal_sampling_prob(p0, bands)
-    assert abs(float(sampler.sample_rate) - expected) < 1e-12
-
-
-def test_balls_in_bins_sampler_special_case_p0_inv_gives_rate_one_bridge() -> None:
-    # Lean bridge: if p0 = 1 / b then internal parameter equals 1.
-    num_samples = 96
-    bands = 3
-    batch_size = num_samples // bands
-    sampler = BallsInBinsSampler(
-        num_samples=num_samples,
-        batch_size=batch_size,
-        bands=bands,
-        generator=torch.Generator().manual_seed(17),
-        steps=12,
-    )
-    assert abs(float(sampler.sample_rate) - 1.0) < 1e-12
 
 
 def test_evr_delta_bridge_matches_report_composed_delta() -> None:
@@ -138,7 +105,7 @@ def test_evr_split_union_bound_bridge_matches_runtime_fields() -> None:
     assert math.isclose(report.evr_composed_delta_upper_bound, expected_delta, rel_tol=0, abs_tol=1e-18)
 
 
-def test_balls_in_bins_mixture_branch_sum_decomposition_bridge() -> None:
+def test_b_min_sep_mixture_branch_sum_decomposition_bridge() -> None:
     # Bridge to Lean branch/suffix decomposition spirit:
     # modes are per-component sums across the band axis.
     c = torch.tensor(
@@ -149,7 +116,7 @@ def test_balls_in_bins_mixture_branch_sum_decomposition_bridge() -> None:
         dtype=torch.float64,
     )
     bands = 3
-    gm = build_balls_in_bins_gaussian_mixture(c_matrix=c, bands=bands)
+    gm = build_b_min_sep_gaussian_mixture(c_matrix=c, bands=bands)
     d, m = c.shape
     k = m // bands
     reshaped = c.reshape(d, bands, k)  # [d, bands, k]

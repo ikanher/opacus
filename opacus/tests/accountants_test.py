@@ -82,7 +82,7 @@ def _participation_sensitivity_for_set(coeffs: list[float], n: int, subset: tupl
 
 def _bnb_c_matrix_contract(*, c_matrix: torch.Tensor, bands: int) -> dict:
     return {
-        "sampling_mode": "balls_in_bins",
+        "sampling_mode": "b_min_sep",
         "bands": int(bands),
         "granularity": "single_participation",
         "matrix_columns": int(c_matrix.shape[1]),
@@ -214,7 +214,7 @@ class AccountingTest(unittest.TestCase):
             dtype=torch.float64,
         )
         sampling_semantics = SamplingSemantics(
-            sampling_mode="balls_in_bins",
+            sampling_mode="b_min_sep",
             privacy_metadata={"bands": 2},
         )
         eps = accountant.get_epsilon(
@@ -239,7 +239,7 @@ class AccountingTest(unittest.TestCase):
             dtype=torch.float64,
         )
         sampling_semantics = SamplingSemantics(
-            sampling_mode="balls_in_bins",
+            sampling_mode="b_min_sep",
             privacy_metadata={"bands": 2},
         )
 
@@ -282,7 +282,7 @@ class AccountingTest(unittest.TestCase):
             dtype=torch.float64,
         )
         sampling_semantics = SamplingSemantics(
-            sampling_mode="balls_in_bins",
+            sampling_mode="b_min_sep",
             privacy_metadata={"bands": 2},
         )
 
@@ -325,7 +325,7 @@ class AccountingTest(unittest.TestCase):
             dtype=torch.float64,
         )
         sampling_semantics = SamplingSemantics(
-            sampling_mode="balls_in_bins",
+            sampling_mode="b_min_sep",
             privacy_metadata={"bands": 2},
         )
 
@@ -368,7 +368,7 @@ class AccountingTest(unittest.TestCase):
             dtype=torch.float64,
         )
         sampling_semantics = SamplingSemantics(
-            sampling_mode="balls_in_bins",
+            sampling_mode="b_min_sep",
             privacy_metadata={"bands": 2},
         )
         accountant = BNBAccountant()
@@ -395,7 +395,7 @@ class AccountingTest(unittest.TestCase):
             dtype=torch.float64,
         )
         sampling_semantics = SamplingSemantics(
-            sampling_mode="balls_in_bins",
+            sampling_mode="b_min_sep",
             privacy_metadata={"bands": 3},
         )
         accountant = BNBAccountant()
@@ -425,7 +425,7 @@ class AccountingTest(unittest.TestCase):
             dtype=torch.float64,
         )
         sampling_semantics = SamplingSemantics(
-            sampling_mode="balls_in_bins",
+            sampling_mode="b_min_sep",
             privacy_metadata={"bands": 2},
         )
         accountant = BNBAccountant()
@@ -450,7 +450,7 @@ class AccountingTest(unittest.TestCase):
         c_matrix = _lower_toeplitz_from_coeffs(coeffs, horizon=4)
         c_matrix[3, 2] += 0.3
         sampling_semantics = SamplingSemantics(
-            sampling_mode="balls_in_bins",
+            sampling_mode="b_min_sep",
             privacy_metadata={"bands": 2},
         )
         accountant = BNBAccountant()
@@ -477,7 +477,7 @@ class AccountingTest(unittest.TestCase):
         coeffs = [1.0, 0.2]
         c_matrix = _lower_toeplitz_from_coeffs(coeffs, horizon=4)
         sampling_semantics = SamplingSemantics(
-            sampling_mode="balls_in_bins",
+            sampling_mode="b_min_sep",
             privacy_metadata={"bands": 2},
         )
         accountant = BNBAccountant()
@@ -504,7 +504,7 @@ class AccountingTest(unittest.TestCase):
         coeffs = [1.0, 0.2]
         c_matrix = _lower_toeplitz_from_coeffs(coeffs, horizon=4)
         sampling_semantics = SamplingSemantics(
-            sampling_mode="balls_in_bins",
+            sampling_mode="b_min_sep",
             privacy_metadata={"bands": 2},
         )
         accountant = BNBAccountant()
@@ -941,7 +941,7 @@ class AccountingTest(unittest.TestCase):
         )
         self.assertLess(abs(noise_a - noise_b), 1e-6)
 
-    def test_bsr_accountant_branches_fixed_batch_vs_cyclic_poisson(self) -> None:
+    def test_bsr_accountant_branches_torch_sampler_vs_cyclic_poisson(self) -> None:
         delta = 1e-5
         accountant = BSRAccountant()
         accountant.history = [(1.0, 0.01, 100)]
@@ -950,7 +950,7 @@ class AccountingTest(unittest.TestCase):
             delta=delta,
             mechanism_state={"mf_sensitivity": 1.0},
             sampling_semantics=SamplingSemantics(
-                sampling_mode="fixed_batch",
+                sampling_mode="torch_sampler",
                 privacy_metadata={},
             ),
         )
@@ -1076,7 +1076,7 @@ class AccountingTest(unittest.TestCase):
             "min_separation": 1,
         }
         sampling_semantics = SamplingSemantics(
-            sampling_mode="fixed_batch",
+            sampling_mode="torch_sampler",
             privacy_metadata={},
         )
 
@@ -1107,7 +1107,7 @@ class AccountingTest(unittest.TestCase):
                 "min_separation": 2,
             },
             sampling_semantics=SamplingSemantics(
-                sampling_mode="fixed_batch",
+                sampling_mode="torch_sampler",
                 privacy_metadata={},
             ),
             bsr_iterations_number=40,

@@ -140,10 +140,10 @@ def validate_bnb_c_matrix_contract(
     """
     if not isinstance(c_matrix_contract, dict):
         raise ValueError("bnb consistency check requires c_matrix_contract to be a dict")
-    if c_matrix_contract.get("sampling_mode") != "balls_in_bins":
+    if c_matrix_contract.get("sampling_mode") != "b_min_sep":
         raise ValueError(
             "bnb consistency check failed: c_matrix_contract['sampling_mode'] "
-            "must be 'balls_in_bins'"
+            "must be 'b_min_sep'"
         )
     contract_bands = c_matrix_contract.get("bands")
     if contract_bands is None or int(contract_bands) != int(bands):
@@ -476,14 +476,14 @@ def select_evr_candidate_ladder_two_sided(
     return chosen_sigma, chosen_verification, chosen_pass_count, chosen_per_alpha
 
 
-def build_balls_in_bins_gaussian_mixture(
+def build_b_min_sep_gaussian_mixture(
     *,
     c_matrix: torch.Tensor,
     bands: int,
     reduce_dimensionality: bool = False,
 ) -> GaussianMixture:
     """
-    Builds balls-in-bins Gaussian-mixture means from C.
+    Builds b-min-sep Gaussian-mixture means from C.
 
     Mirrors the structure from the reference Monte Carlo notebook:
     if C is [d, m] and bands | m, produce m/bands equiprobable components by
@@ -577,7 +577,7 @@ def compute_llr_samples(
     return _mixture_logpdf(points, up_gm, sigma) - _mixture_logpdf(points, lo_gm, sigma)
 
 
-def sample_balls_in_bins_llr(
+def sample_b_min_sep_llr(
     *,
     c_matrix: torch.Tensor,
     bands: int,
@@ -587,7 +587,7 @@ def sample_balls_in_bins_llr(
     reduce_dimensionality: bool = False,
 ) -> torch.Tensor:
     """
-    Samples LLR values for balls-in-bins Gaussian-mixture privacy analysis.
+    Samples LLR values for b-min-sep Gaussian-mixture privacy analysis.
     """
     if num_samples <= 0:
         raise ValueError("num_samples must be > 0")
@@ -596,7 +596,7 @@ def sample_balls_in_bins_llr(
     if sigma <= 0.0:
         raise ValueError("sigma must be > 0")
 
-    up_gm = build_balls_in_bins_gaussian_mixture(
+    up_gm = build_b_min_sep_gaussian_mixture(
         c_matrix=c_matrix,
         bands=bands,
         reduce_dimensionality=reduce_dimensionality,
@@ -736,7 +736,7 @@ def estimate_epsilon_from_llr_samples(
     return float(0.5 * (low + high))
 
 
-def estimate_balls_in_bins_epsilon_monte_carlo(
+def estimate_b_min_sep_epsilon_monte_carlo(
     *,
     c_matrix: torch.Tensor,
     bands: int,
@@ -749,7 +749,7 @@ def estimate_balls_in_bins_epsilon_monte_carlo(
     max_iterations: int = 200,
 ) -> float:
     """
-    Estimates epsilon for a balls-in-bins mechanism from Monte Carlo PLD samples.
+    Estimates epsilon for a b-min-sep mechanism from Monte Carlo PLD samples.
     """
     if noise_multiplier <= 0.0:
         raise ValueError("noise_multiplier must be > 0")
@@ -758,7 +758,7 @@ def estimate_balls_in_bins_epsilon_monte_carlo(
     if seed < 0:
         raise ValueError("seed must be >= 0")
 
-    llr_samples = sample_balls_in_bins_llr(
+    llr_samples = sample_b_min_sep_llr(
         c_matrix=c_matrix,
         bands=bands,
         sigma=float(noise_multiplier),

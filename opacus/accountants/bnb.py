@@ -17,7 +17,7 @@ from __future__ import annotations
 import math
 
 from opacus.accountants.analysis.bnb import (
-    estimate_balls_in_bins_epsilon_monte_carlo,
+    estimate_b_min_sep_epsilon_monte_carlo,
     validate_bnb_c_matrix_contract,
 )
 
@@ -35,7 +35,7 @@ class BNBAccountant(IAccountant):
         super().__init__()
 
     @staticmethod
-    def _validate_builtin_balls_in_bins_consistency(
+    def _validate_builtin_b_min_sep_consistency(
         *,
         mechanism_state,
         sampling_semantics,
@@ -144,12 +144,12 @@ class BNBAccountant(IAccountant):
             tolerance = float(kwargs.get("bnb_tolerance", 1e-4))
             max_iterations = int(kwargs.get("bnb_max_iterations", 200))
             if (
-                sampling_mode == "balls_in_bins"
+                sampling_mode == "b_min_sep"
                 and c_matrix is not None
                 and bands is not None
                 and c_matrix_contract is not None
             ):
-                self._validate_builtin_balls_in_bins_consistency(
+                self._validate_builtin_b_min_sep_consistency(
                     mechanism_state=state,
                     sampling_semantics=sampling_semantics,
                     c_matrix=c_matrix,
@@ -183,7 +183,7 @@ class BNBAccountant(IAccountant):
                     )
 
                 epsilon_per_step = float(
-                    estimate_balls_in_bins_epsilon_monte_carlo(
+                    estimate_b_min_sep_epsilon_monte_carlo(
                         c_matrix=c_matrix,
                         bands=int(bands),
                         noise_multiplier=float(noise_multiplier),
@@ -200,9 +200,9 @@ class BNBAccountant(IAccountant):
                 )
 
             raise ValueError(
-                "bnb accountant requires epsilon_fn, or built-in balls_in_bins "
+                "bnb accountant requires epsilon_fn, or built-in b_min_sep "
                 "inputs (`c_matrix`, `bands`, `c_matrix_contract`, and "
-                "sampling_mode='balls_in_bins')"
+                "sampling_mode='b_min_sep')"
             )
 
         return float(

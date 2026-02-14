@@ -21,18 +21,18 @@ from opacus.accountants.analysis.bnb import (
     BNBCalibrationReport,
     DeltaVerificationResult,
     GaussianMixture,
-    build_balls_in_bins_gaussian_mixture,
+    build_b_min_sep_gaussian_mixture,
     calibrate_sigma_evr_binary_search,
     compute_llr_samples,
     describe_bnb_calibration_report,
-    estimate_balls_in_bins_epsilon_monte_carlo,
+    estimate_b_min_sep_epsilon_monte_carlo,
     estimate_epsilon_from_llr_samples,
     estimate_hockey_stick_delta_from_llr_samples,
     find_sigma_binary_search,
     make_bnb_calibration_report,
     parse_bnb_calibration_report,
     generate_mixture_samples,
-    sample_balls_in_bins_llr,
+    sample_b_min_sep_llr,
     select_evr_candidate_ladder,
     select_evr_candidate_ladder_two_sided,
     split_confidence_alpha,
@@ -49,22 +49,22 @@ class BNBAnalysisTest(unittest.TestCase):
                 probs=torch.tensor([0.9, 0.2]),
             )
 
-    def test_build_balls_in_bins_mixture_expected_modes(self) -> None:
+    def test_build_b_min_sep_mixture_expected_modes(self) -> None:
         c = torch.tensor(
             [
                 [1.0, 10.0, 2.0, 20.0, 3.0, 30.0],
                 [4.0, 40.0, 5.0, 50.0, 6.0, 60.0],
             ]
         )
-        gm = build_balls_in_bins_gaussian_mixture(c_matrix=c, bands=3)
+        gm = build_b_min_sep_gaussian_mixture(c_matrix=c, bands=3)
         expected_modes = torch.tensor([[6.0, 15.0], [60.0, 150.0]])
         self.assertTrue(torch.allclose(gm.modes, expected_modes))
         self.assertTrue(torch.allclose(gm.probs, torch.tensor([0.5, 0.5])))
 
-    def test_build_balls_in_bins_reduced_dimensionality(self) -> None:
+    def test_build_b_min_sep_reduced_dimensionality(self) -> None:
         # d > k so reduction should project to k-dimensional subspace.
         c = torch.arange(1, 11, dtype=torch.float32).reshape(5, 2)
-        gm = build_balls_in_bins_gaussian_mixture(
+        gm = build_b_min_sep_gaussian_mixture(
             c_matrix=c,
             bands=1,
             reduce_dimensionality=True,
@@ -225,7 +225,7 @@ class BNBAnalysisTest(unittest.TestCase):
         )
         self.assertEqual(estimated, 0.0)
 
-    def test_estimate_balls_in_bins_epsilon_is_seed_reproducible(self) -> None:
+    def test_estimate_b_min_sep_epsilon_is_seed_reproducible(self) -> None:
         c = torch.tensor(
             [
                 [1.0, 0.0, 1.0, 0.0],
@@ -241,8 +241,8 @@ class BNBAnalysisTest(unittest.TestCase):
             num_samples=10_000,
             seed=7,
         )
-        eps_1 = estimate_balls_in_bins_epsilon_monte_carlo(**kwargs)
-        eps_2 = estimate_balls_in_bins_epsilon_monte_carlo(**kwargs)
+        eps_1 = estimate_b_min_sep_epsilon_monte_carlo(**kwargs)
+        eps_2 = estimate_b_min_sep_epsilon_monte_carlo(**kwargs)
         self.assertAlmostEqual(eps_1, eps_2, places=12)
         self.assertGreaterEqual(eps_1, 0.0)
 
@@ -284,7 +284,7 @@ class BNBAnalysisTest(unittest.TestCase):
         self.assertLessEqual(sigma, 3.0)
         self.assertTrue(verification.accepted)
 
-    def test_sample_balls_in_bins_llr_is_seed_reproducible(self) -> None:
+    def test_sample_b_min_sep_llr_is_seed_reproducible(self) -> None:
         c = torch.tensor(
             [
                 [1.0, 0.0, 1.0, 0.0],
@@ -292,14 +292,14 @@ class BNBAnalysisTest(unittest.TestCase):
             ],
             dtype=torch.float64,
         )
-        llr_1 = sample_balls_in_bins_llr(
+        llr_1 = sample_b_min_sep_llr(
             c_matrix=c,
             bands=2,
             sigma=1.1,
             num_samples=5000,
             seed=42,
         )
-        llr_2 = sample_balls_in_bins_llr(
+        llr_2 = sample_b_min_sep_llr(
             c_matrix=c,
             bands=2,
             sigma=1.1,

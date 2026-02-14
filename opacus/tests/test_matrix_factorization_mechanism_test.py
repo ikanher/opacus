@@ -22,7 +22,10 @@ import torch.nn.functional as F
 from opacus import NoiseMechanismConfig, PrivacyEngine
 from opacus.optimizers import CorrelatedNoiseMechanism, DistributedDPOptimizer
 from opacus.mechanism_contracts import SamplingSemantics
-from opacus.utils.uniform_sampler import DistributedCyclicPoissonSampler
+from opacus.utils.uniform_sampler import (
+    DistributedBMinSepSampler,
+    DistributedCyclicPoissonSampler,
+)
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -130,7 +133,7 @@ def test_make_private_rejects_correlated_alias() -> None:
         )
 
 
-def test_make_private_bsr_requires_fixed_batch() -> None:
+def test_make_private_bsr_requires_torch_sampler() -> None:
     pe = PrivacyEngine()
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
@@ -214,6 +217,73 @@ def test_distributed_bsr_supports_cyclic_poisson_sampling(monkeypatch) -> None:
     assert isinstance(private_loader.batch_sampler, DistributedCyclicPoissonSampler)
 
 
+def test_distributed_bnb_supports_b_min_sep_sampling(monkeypatch) -> None:
+    monkeypatch.setattr(pe_mod, "DDP", nn.Linear)
+    _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
+
+    pe = PrivacyEngine()
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+
+    _, dp_optimizer, private_loader = pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        noise_multiplier=0.0,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping="flat",
+        grad_sample_mode="hooks",
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="b_min_sep",
+            privacy_metadata={"b": 2, "p": 0.25},
+        ),
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bnb",
+            accounting_mode="bnb_accountant",
+            mechanism_state={"coeffs": [1.0, 0.3], "z_std": 0.01, "bands": 2},
+        ),
+    )
+
+    assert isinstance(dp_optimizer, DistributedDPOptimizer)
+    assert isinstance(dp_optimizer.noise_mechanism, CorrelatedNoiseMechanism)
+    assert isinstance(private_loader.batch_sampler, DistributedBMinSepSampler)
+
+
+def test_distributed_bnb_supports_b_min_sep_sampling_alt(monkeypatch) -> None:
+    monkeypatch.setattr(pe_mod, "DDP", nn.Linear)
+    _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
+
+    pe = PrivacyEngine()
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+
+    _, dp_optimizer, private_loader = pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        noise_multiplier=0.0,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping="flat",
+        grad_sample_mode="hooks",
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="b_min_sep",
+            privacy_metadata={"b": 2, "p": 0.25},
+        ),
+            
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bnb",
+            accounting_mode="bnb_accountant",
+            mechanism_state={"coeffs": [1.0, 0.3], "z_std": 0.01, "bands": 2},
+        ),
+    )
+
+    assert isinstance(dp_optimizer, DistributedDPOptimizer)
+    assert isinstance(dp_optimizer.noise_mechanism, CorrelatedNoiseMechanism)
+    assert isinstance(private_loader.batch_sampler, DistributedBMinSepSampler)
+
+
 def test_distributed_bsr_rejects_non_flat_clipping(monkeypatch) -> None:
     monkeypatch.setattr(pe_mod, "DDP", nn.Linear)
     _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
@@ -265,7 +335,10 @@ def test_distributed_bsr_save_rejects_nonzero_rank(monkeypatch) -> None:
     )
 
     with io.BytesIO() as bio:
-        with pytest.raises(ValueError, match="distributed bsr checkpoint save is supported only on rank 0"):
+        with pytest.raises(
+            ValueError,
+            match="distributed correlated-noise checkpoint save is supported only on rank 0",
+        ):
             pe.save_checkpoint(path=bio, module=private_model, optimizer=dp_optimizer)
 
 
@@ -295,7 +368,10 @@ def test_distributed_bsr_load_rejects_nonzero_saved_rank(monkeypatch) -> None:
 
     state = dp_optimizer.state_dict()
     state["_dp_distributed_saved_rank"] = 1
-    with pytest.raises(ValueError, match="distributed bsr checkpoint must be saved on rank 0"):
+    with pytest.raises(
+        ValueError,
+        match="distributed correlated-noise checkpoint must be saved on rank 0",
+    ):
         dp_optimizer.load_state_dict(state)
 
 

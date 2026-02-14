@@ -111,7 +111,7 @@ def test_bsr_resume_matches_uninterrupted_next_step() -> None:
     assert torch.allclose(mech1.last_flat_u, mech2.last_flat_u, atol=1e-7, rtol=1e-6)
 
 
-def test_missing_bsr_mechanism_state_fails_loudly() -> None:
+def test_missing_correlated_mechanism_state_fails_loudly() -> None:
     mech_state = {"coeffs": [1.0, 0.2], "z_std": 0.02}
     model1 = nn.Linear(4, 3)
     pmodel1, opt1, loader1, _ = _make_private(
@@ -123,7 +123,7 @@ def test_missing_bsr_mechanism_state_fails_loudly() -> None:
 
     model2 = nn.Linear(4, 3)
     _, opt2, _, _ = _make_private(model2, noise_seed=201, mechanism_state=mech_state)
-    with pytest.raises(ValueError, match="missing bsr noise mechanism state"):
+    with pytest.raises(ValueError, match="missing correlated noise mechanism state"):
         opt2.load_state_dict(state)
 
 
@@ -168,7 +168,7 @@ def test_checkpoint_load_preserves_bnb_report_and_sampling_metadata() -> None:
             },
         )
         pe.sampling_semantics = SamplingSemantics(
-            sampling_mode="balls_in_bins",
+            sampling_mode="b_min_sep",
             privacy_metadata={"bands": 2},
         )
         pe.save_checkpoint(
@@ -184,7 +184,7 @@ def test_checkpoint_load_preserves_bnb_report_and_sampling_metadata() -> None:
     assert report["version"] == 2
     assert report["evr_num_checks"] == 1
     assert "bnb_calibration_summary" in loaded
-    assert pe.sampling_semantics.sampling_mode == "balls_in_bins"
+    assert pe.sampling_semantics.sampling_mode == "b_min_sep"
     parsed = pe.get_bnb_calibration_report()
     assert parsed is not None
     summary = pe.get_bnb_calibration_summary()
@@ -193,4 +193,4 @@ def test_checkpoint_load_preserves_bnb_report_and_sampling_metadata() -> None:
     status = pe.get_bnb_calibration_status()
     assert status is not None
     assert status.report.version == 2
-    assert status.sampling_mode == "balls_in_bins"
+    assert status.sampling_mode == "b_min_sep"

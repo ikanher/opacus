@@ -813,7 +813,7 @@ class DPOptimizer(Optimizer):
         self.original_optimizer.load_state_dict(optimizer_state)
         if isinstance(self.noise_mechanism, CorrelatedNoiseMechanism) and mechanism_state is None:
             raise ValueError(
-                "missing bsr noise mechanism state in optimizer checkpoint"
+                "missing correlated noise mechanism state in optimizer checkpoint"
             )
         if mechanism_state is not None:
             self.noise_mechanism.load_state_dict(mechanism_state)

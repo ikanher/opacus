@@ -187,6 +187,8 @@ class BMinSepSampler(Sampler[List[int]]):
 
     When an eligible example participates, its cooldown is reset to
     `min_separation - 1`. Cooldown decrements by one at each step.
+
+    "Privacy Amplification for BandMF via b-Min-Sep Subsampling" (Dong et al., 2026)
     """
 
     def __init__(
@@ -226,12 +228,15 @@ class BMinSepSampler(Sampler[List[int]]):
 
         for _ in range(self.steps):
             eligible = cooldown == 0
+
             draws = (
                 torch.rand(self.num_samples, generator=self.generator)
                 < self.sample_rate
             )
+
             selected_mask = eligible & draws
             indices = selected_mask.nonzero(as_tuple=False).reshape(-1).tolist()
+
             yield indices
 
             cooldown = torch.where(cooldown > 0, cooldown - 1, cooldown)
@@ -239,106 +244,100 @@ class BMinSepSampler(Sampler[List[int]]):
                 cooldown[selected_mask] = self.min_separation - 1
 
 
-class WarmStartBMinSepSampler(BMinSepSampler):
+class DistributedBMinSepSampler(Sampler[List[int]]):
     r"""
-    b-min-separation sampler with per-example cooldowns initialized from
-    the stationary distribution of the cooldown Markov chain.
-    """
+    Distributed b-min-separation sampler.
 
-    def _sample_initial_cooldown(self) -> torch.Tensor:
-        if self.min_separation == 1:
-            return torch.zeros(self.num_samples, dtype=torch.int64)
-
-        p = self.sample_rate
-        b = self.min_separation
-        pi0 = 1.0 / (1.0 + p * (b - 1))
-        r = p * pi0
-        draws = torch.rand(self.num_samples, generator=self.generator)
-
-        cooldown = torch.zeros(self.num_samples, dtype=torch.int64)
-        # State 0 has mass pi0, states 1..b-1 each have mass r.
-        thresholds = [pi0 + k * r for k in range(1, b)]
-        lower = pi0
-        for state, upper in enumerate(thresholds, start=1):
-            state_mask = (draws >= lower) & (draws < upper)
-            cooldown[state_mask] = state
-            lower = upper
-
-        # Guard against floating-point edge effects at 1.0.
-        cooldown[draws >= 1.0 - 1e-12] = b - 1
-        return cooldown
-
-    def __iter__(self):
-        cooldown = self._sample_initial_cooldown()
-
-        for _ in range(self.steps):
-            eligible = cooldown == 0
-            draws = (
-                torch.rand(self.num_samples, generator=self.generator)
-                < self.sample_rate
-            )
-            selected_mask = eligible & draws
-            indices = selected_mask.nonzero(as_tuple=False).reshape(-1).tolist()
-            yield indices
-
-            cooldown = torch.where(cooldown > 0, cooldown - 1, cooldown)
-            if self.min_separation > 1:
-                cooldown[selected_mask] = self.min_separation - 1
-
-
-class BallsInBinsSampler(WarmStartBMinSepSampler):
-    r"""
-    Balls-in-bins sampler as a warm-start b-min-separation specialization.
-
-    Uses `min_separation=bands` and chooses a Bernoulli participation rate
-    that matches the requested expected batch size under stationarity.
+    The global index set is sharded across ranks (optionally after deterministic
+    shuffle per epoch). Each rank then runs local b-min-separation sampling on
+    its shard and yields global indices selected on that rank.
     """
 
     def __init__(
         self,
         *,
-        num_samples: int,
-        batch_size: int,
-        bands: int,
+        total_size: int,
+        sample_rate: float,
+        min_separation: int,
+        shuffle: bool = True,
+        shuffle_seed: int = 0,
         generator=None,
         steps: int = None,
     ):
-        num_samples = int(num_samples)
-        batch_size = int(batch_size)
-        bands = int(bands)
+        self.total_size = int(total_size)
+        self.sample_rate = float(sample_rate)
+        self.min_separation = int(min_separation)
+        self.shuffle = bool(shuffle)
+        self.shuffle_seed = int(shuffle_seed)
+        self.generator = generator
+        self.epoch = 0
+        self.num_replicas = torch.distributed.get_world_size()
+        self.rank = torch.distributed.get_rank()
 
-        if num_samples <= 0:
-            raise ValueError(f"num_samples should be positive, got {num_samples}")
-        if batch_size <= 0:
-            raise ValueError(f"batch_size should be positive, got {batch_size}")
-        if bands <= 0:
-            raise ValueError(f"bands should be positive, got {bands}")
-        if batch_size > num_samples:
-            raise ValueError("batch_size must be <= num_samples")
+        if self.total_size <= 0:
+            raise ValueError(f"total_size should be positive, got {self.total_size}")
 
-        q = float(batch_size) / float(num_samples)
-        denom = 1.0 - q * float(bands - 1)
-        if denom <= 0.0:
+        if self.sample_rate <= 0.0 or self.sample_rate > 1.0:
+            raise ValueError(f"sample_rate should be in (0, 1], got {self.sample_rate}")
+
+        if self.min_separation <= 0:
             raise ValueError(
-                "invalid (batch_size, num_samples, bands): "
-                "cannot derive stationary Bernoulli rate"
-            )
-        sample_rate = q / denom
-        if sample_rate <= 0.0 or sample_rate > 1.0:
-            raise ValueError(
-                "derived sample_rate must be in (0, 1]; "
-                f"got {sample_rate}"
+                f"min_separation should be positive, got {self.min_separation}"
             )
 
-        self.batch_size = batch_size
-        self.bands = bands
-        super().__init__(
-            num_samples=num_samples,
-            sample_rate=sample_rate,
-            min_separation=bands,
-            generator=generator,
-            steps=steps,
-        )
+        if self.num_replicas <= 0:
+            raise ValueError(
+                f"num_replicas should be positive, got {self.num_replicas}"
+            )
+
+        if self.rank < 0 or self.rank >= self.num_replicas:
+            raise ValueError(
+                f"invalid rank {self.rank} for world size {self.num_replicas}"
+            )
+
+        # Size of the local shard for this rank.
+        self.num_samples = self.total_size // self.num_replicas
+        if self.rank < self.total_size % self.num_replicas:
+            self.num_samples += 1
+
+        self.steps = int(steps) if steps is not None else int(1 / self.sample_rate)
+        if self.steps <= 0:
+            raise ValueError(f"steps should be positive, got {self.steps}")
+
+    def __len__(self):
+        return self.steps
+
+    def __iter__(self):
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.shuffle_seed + self.epoch)
+            indices = torch.randperm(self.total_size, generator=g)
+        else:
+            indices = torch.arange(self.total_size)
+
+        indices = indices[self.rank : self.total_size : self.num_replicas]
+        assert len(indices) == self.num_samples
+
+        cooldown = torch.zeros(self.num_samples, dtype=torch.int64)
+        for _ in range(self.steps):
+            eligible = cooldown == 0
+
+            draws = (
+                torch.rand(self.num_samples, generator=self.generator)
+                < self.sample_rate
+            )
+
+            selected_mask = eligible & draws
+            selected_local = selected_mask.nonzero(as_tuple=False).reshape(-1)
+
+            yield indices[selected_local].tolist()
+
+            cooldown = torch.where(cooldown > 0, cooldown - 1, cooldown)
+            if self.min_separation > 1:
+                cooldown[selected_mask] = self.min_separation - 1
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
 
 
 class CyclicPoissonSampler(Sampler[List[int]]):

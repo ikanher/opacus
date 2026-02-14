@@ -170,10 +170,10 @@ def test_bnb_b_min_sep_training_smoke_loop() -> None:
     )
 
 
-def test_bnb_balls_in_bins_training_smoke_loop() -> None:
+def test_bnb_b_min_sep_training_smoke_loop_alt() -> None:
     _run_bnb_training_smoke(
         sampling_semantics=SamplingSemantics(
-            sampling_mode="balls_in_bins",
-            privacy_metadata={"bands": 2},
-        )
+            sampling_mode="b_min_sep",
+            privacy_metadata={"b": 3, "p": 0.25},
+        ),
     )
