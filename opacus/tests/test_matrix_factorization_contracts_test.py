@@ -23,6 +23,7 @@ import torch.nn.functional as F
 from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
 from opacus.optimizers import CorrelatedNoiseMechanism, GaussianNoiseMechanism
 from opacus.utils.uniform_sampler import (
+    BallsInBinsSampler,
     BMinSepSampler,
     CyclicPoissonSampler,
 )
@@ -294,6 +295,44 @@ def test_sampling_semantics_b_min_sep_switches_sampler_for_bnb_alt() -> None:
     assert isinstance(private_loader.batch_sampler, BMinSepSampler)
 
 
+def test_sampling_semantics_balls_in_bins_switches_sampler_for_bnb() -> None:
+    model = nn.Linear(4, 3)
+    _, _dp_optimizer, private_loader = _make_private(
+        model,
+        poisson_sampling=False,
+        noise_seed=119,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bnb",
+            accounting_mode="bnb_accountant",
+            mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 8},
+        ),
+    )
+    assert isinstance(private_loader.batch_sampler, BallsInBinsSampler)
+
+
+def test_sampling_semantics_balls_in_bins_requires_bins_metadata() -> None:
+    model = nn.Linear(4, 3)
+    with pytest.raises(ValueError, match="requires privacy_metadata\\['bins'\\]"):
+        _make_private(
+            model,
+            poisson_sampling=False,
+            noise_seed=120,
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bnb",
+                accounting_mode="bnb_accountant",
+                mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+            ),
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="balls_in_bins",
+                privacy_metadata={},
+            ),
+        )
+
+
 def test_make_private_total_steps_nonpoisson_requires_explicit_custom_sampler() -> None:
     model = nn.Linear(4, 3)
     with pytest.raises(ValueError, match="requires explicit sampling_semantics"):
@@ -345,6 +384,27 @@ def test_make_private_total_steps_supports_b_min_sep_sampler() -> None:
     )
     assert isinstance(private_loader.batch_sampler, BMinSepSampler)
     assert len(private_loader) == 7
+
+
+def test_make_private_total_steps_supports_balls_in_bins_sampler() -> None:
+    model = nn.Linear(4, 3)
+    _, _, private_loader = _make_private(
+        model,
+        poisson_sampling=False,
+        noise_seed=203,
+        total_steps=9,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bnb",
+            accounting_mode="bnb_accountant",
+            mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 10},
+        ),
+    )
+    assert isinstance(private_loader.batch_sampler, BallsInBinsSampler)
+    assert len(private_loader) == 9
 
 
 def test_default_gaussian_path_parity_with_explicit_contract_args() -> None:
@@ -769,7 +829,7 @@ def test_make_private_with_epsilon_bnb_noncallback_b_min_sep_succeeds() -> None:
     assert status_dict["report"]["version"] == 2
 
 
-def test_make_private_with_epsilon_bnb_noncallback_requires_b_min_sep_mode() -> None:
+def test_make_private_with_epsilon_bnb_noncallback_requires_supported_sampling_mode() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
@@ -781,7 +841,10 @@ def test_make_private_with_epsilon_bnb_noncallback_requires_b_min_sep_mode() -> 
         dtype=torch.float64,
     )
 
-    with pytest.raises(ValueError, match="requires sampling_semantics in \\{'b_min_sep'\\}"):
+    with pytest.raises(
+        ValueError,
+        match="requires sampling_semantics in \\{'b_min_sep', 'balls_in_bins'\\}",
+    ):
         pe.make_private_with_epsilon(
             module=model,
             optimizer=optimizer,
@@ -804,6 +867,49 @@ def test_make_private_with_epsilon_bnb_noncallback_requires_b_min_sep_mode() -> 
             sampling_semantics=SamplingSemantics(
                 sampling_mode="torch_sampler",
                 privacy_metadata={},
+            ),
+                bnb_num_samples=2_000,
+            )
+
+
+def test_make_private_with_epsilon_bnb_noncallback_balls_in_bins_not_yet_supported() -> None:
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    pe = PrivacyEngine()
+    c_matrix = torch.tensor(
+        [
+            [1.0, 0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0, 1.0],
+        ],
+        dtype=torch.float64,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="non-callback calibration currently requires sampling_mode='b_min_sep'",
+    ):
+        pe.make_private_with_epsilon(
+            module=model,
+            optimizer=optimizer,
+            data_loader=_loader(),
+            target_epsilon=1.0,
+            target_delta=0.2,
+            epochs=1,
+            max_grad_norm=1.0,
+            poisson_sampling=False,
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bnb",
+                accounting_mode="bnb_accountant",
+                mechanism_state={
+                    "coeffs": [1.0, 0.2],
+                    "z_std": 0.01,
+                    "c_matrix": c_matrix,
+                    "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+                },
+            ),
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 2, "bands": 2},
             ),
             bnb_num_samples=2_000,
         )
@@ -1155,6 +1261,18 @@ def test_make_private_with_epsilon_bnb_noncallback_allows_evr_reject_when_disabl
     report = pe.noise_mechanism_config.mechanism_state.get("_bnb_calibration_report")
     assert isinstance(report, dict)
     assert report["verification_passed"] is False
+    assert report["verification_contract"] == "evr_union_bound_alpha_split_v1"
+    assert 0 <= report["evr_pass_count"] <= report["evr_num_checks"]
+    assert report["evr_num_checks"] == 6  # two-sided, 3 checks per direction
+    assert report["evr_per_check_alpha"] > 0.0
+    # Runtime splits alpha across candidate ladder as well, so this is an upper bound.
+    assert report["evr_per_check_alpha"] <= (
+        report["evr_confidence_alpha_total"] / report["evr_num_checks"]
+    )
+    expected_guard_delta = report["target_delta"] + report["evr_confidence_alpha_total"] * (
+        1.0 - report["target_delta"]
+    )
+    assert abs(report["evr_composed_delta_upper_bound"] - expected_guard_delta) <= 1e-18
 
 
 def test_default_config_uses_gaussian_mechanism() -> None:

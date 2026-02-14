@@ -340,6 +340,122 @@ class DistributedBMinSepSampler(Sampler[List[int]]):
         self.epoch = int(epoch)
 
 
+class BallsInBinsSampler(Sampler[List[int]]):
+    r"""
+    Non-distributed balls-in-bins sampler.
+
+    Each example is assigned once to a uniform random bin in ``[0, bins-1]`` and
+    participates at steps congruent to its assigned bin modulo ``bins``.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_samples: int,
+        bins: int,
+        generator=None,
+        steps: int = None,
+    ):
+        self.num_samples = int(num_samples)
+        self.bins = int(bins)
+        self.generator = generator
+
+        if self.num_samples <= 0:
+            raise ValueError(f"num_samples should be positive, got {self.num_samples}")
+
+        if self.bins <= 0:
+            raise ValueError(f"bins should be positive, got {self.bins}")
+
+        self.steps = int(steps) if steps is not None else self.bins
+        if self.steps <= 0:
+            raise ValueError(f"steps should be positive, got {self.steps}")
+
+        self._assignment = torch.randint(
+            low=0,
+            high=self.bins,
+            size=(self.num_samples,),
+            generator=self.generator,
+        )
+
+    def __len__(self):
+        return self.steps
+
+    def __iter__(self):
+        for step in range(self.steps):
+            mask = self._assignment == (step % self.bins)
+            indices = mask.nonzero(as_tuple=False).reshape(-1).tolist()
+            yield indices
+
+
+class DistributedBallsInBinsSampler(Sampler[List[int]]):
+    r"""
+    Distributed balls-in-bins sampler.
+
+    The global index set is sharded across ranks. Each local index is assigned
+    once to a uniform random bin in ``[0, bins-1]`` and participates at steps
+    congruent to its assigned bin modulo ``bins``.
+    """
+
+    def __init__(
+        self,
+        *,
+        total_size: int,
+        bins: int,
+        shuffle: bool = True,
+        shuffle_seed: int = 0,
+        generator=None,
+        steps: int = None,
+    ):
+        self.total_size = int(total_size)
+        self.bins = int(bins)
+        self.shuffle = bool(shuffle)
+        self.shuffle_seed = int(shuffle_seed)
+        self.generator = generator
+        self.epoch = 0
+        self.num_replicas = torch.distributed.get_world_size()
+        self.rank = torch.distributed.get_rank()
+
+        if self.total_size <= 0:
+            raise ValueError(f"total_size should be positive, got {self.total_size}")
+
+        if self.bins <= 0:
+            raise ValueError(f"bins should be positive, got {self.bins}")
+
+        self.num_samples = self.total_size // self.num_replicas
+        if self.rank < self.total_size % self.num_replicas:
+            self.num_samples += 1
+
+        self.steps = int(steps) if steps is not None else self.bins
+        if self.steps <= 0:
+            raise ValueError(f"steps should be positive, got {self.steps}")
+
+        self._assignment = torch.randint(
+            low=0,
+            high=self.bins,
+            size=(self.num_samples,),
+            generator=self.generator,
+        )
+
+    def __len__(self):
+        return self.steps
+
+    def __iter__(self):
+        # Balls-in-bins assigns each example to a single bin once and then
+        # reuses that assignment periodically. We therefore keep a fixed rank
+        # shard across epochs instead of reshuffling per epoch.
+        indices = torch.arange(self.total_size)
+        indices = indices[self.rank : self.total_size : self.num_replicas]
+        assert len(indices) == self.num_samples
+
+        for step in range(self.steps):
+            mask = self._assignment == (step % self.bins)
+            local = mask.nonzero(as_tuple=False).reshape(-1)
+            yield indices[local].tolist()
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+
+
 class CyclicPoissonSampler(Sampler[List[int]]):
     r"""
     Cyclic partitioned fixed-size sampler.

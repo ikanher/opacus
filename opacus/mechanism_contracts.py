@@ -30,6 +30,7 @@ SamplingModeName = Literal[
     "torch_sampler",
     "cyclic_poisson",
     "b_min_sep",
+    "balls_in_bins",
 ]
 
 
@@ -53,15 +54,26 @@ class SamplingSemantics:
     privacy_metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        alias_map = {
+            "balls_n_bins": "balls_in_bins",
+            "balls-in-bins": "balls_in_bins",
+            "balls_in_bins_sampler": "balls_in_bins",
+            "balls-in-bins-sampler": "balls_in_bins",
+        }
+        normalized_sampling_mode = alias_map.get(self.sampling_mode, self.sampling_mode)
+        object.__setattr__(self, "sampling_mode", normalized_sampling_mode)
+
         if self.sampling_mode not in (
             "poisson",
             "torch_sampler",
             "cyclic_poisson",
             "b_min_sep",
+            "balls_in_bins",
         ):
             raise ValueError(
                 "sampling_mode must be one of "
-                "{'poisson', 'torch_sampler', 'cyclic_poisson', 'b_min_sep'}"
+                "{'poisson', 'torch_sampler', 'cyclic_poisson', 'b_min_sep', 'balls_in_bins'} "
+                "(aliases: 'balls_n_bins', 'balls-in-bins', 'balls_in_bins_sampler')"
             )
 
 

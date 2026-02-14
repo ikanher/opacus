@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
+import time
 import warnings
 import copy
 from itertools import chain
@@ -50,8 +52,10 @@ from opacus.schedulers import _GradClipScheduler, _NoiseScheduler
 from opacus.utils.fast_gradient_clipping_utils import DPLossFastGradientClipping
 from opacus.validators.module_validator import ModuleValidator
 from opacus.utils.uniform_sampler import (
+    BallsInBinsSampler,
     BMinSepSampler,
     CyclicPoissonSampler,
+    DistributedBallsInBinsSampler,
     DistributedBMinSepSampler,
     DistributedCyclicPoissonSampler,
 )
@@ -59,6 +63,8 @@ from torch import nn, optim
 from torch.distributed._composable.fsdp import FSDPModule
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+
+logger = logging.getLogger(__name__)
 
 
 class PrivacyEngine:
@@ -503,6 +509,34 @@ class PrivacyEngine:
             steps=steps,
         )
 
+    def _build_balls_in_bins_sampler(
+        self,
+        *,
+        data_loader: DataLoader,
+        distributed: bool,
+        bins: int,
+        total_steps: Optional[int],
+    ):
+        if isinstance(data_loader.dataset, torch.utils.data.IterableDataset):
+            raise ValueError("balls_in_bins sampling is not supported for IterableDataset")
+
+        steps = total_steps if total_steps is not None else len(data_loader)
+        generator = self._sampler_generator(data_loader)
+        if distributed:
+            return DistributedBallsInBinsSampler(
+                total_size=len(data_loader.dataset),
+                bins=bins,
+                generator=generator,
+                steps=steps,
+            )
+
+        return BallsInBinsSampler(
+            num_samples=len(data_loader.dataset),
+            bins=bins,
+            generator=generator,
+            steps=steps,
+        )
+
     @staticmethod
     def _validate_bnb_sampling_policy(
         *,
@@ -511,10 +545,12 @@ class PrivacyEngine:
     ) -> None:
         if mechanism != "bnb" or sampling_semantics is None:
             return
+
         mode = sampling_semantics.sampling_mode
-        if mode != "b_min_sep":
+        if mode not in ("b_min_sep", "balls_in_bins"):
             raise ValueError(
-                "bnb mechanism requires sampling_semantics in {'b_min_sep'}"
+                "bnb mechanism requires sampling_semantics in "
+                "{'b_min_sep', 'balls_in_bins'}"
             )
 
     def _prepare_data_loader(
@@ -569,6 +605,26 @@ class PrivacyEngine:
                 distributed=distributed,
                 b=int(b),
                 p=float(p),
+                total_steps=total_steps,
+            )
+
+            return self._rebuild_data_loader_with_batch_sampler(data_loader, sampler)
+
+        if sampling_semantics is not None and sampling_semantics.sampling_mode == "balls_in_bins":
+            bins = sampling_semantics.privacy_metadata.get("bins")
+            if bins is None:
+                bins = sampling_semantics.privacy_metadata.get("b")
+
+            if bins is None:
+                raise ValueError(
+                    "balls_in_bins sampling requires privacy_metadata['bins'] "
+                    "(or legacy key 'b')"
+                )
+
+            sampler = self._build_balls_in_bins_sampler(
+                data_loader=data_loader,
+                distributed=distributed,
+                bins=int(bins),
                 total_steps=total_steps,
             )
 
@@ -823,7 +879,7 @@ class PrivacyEngine:
         if mechanism_config.mechanism == "bnb" and sampling_semantics is None:
             raise ValueError(
                 "bnb mechanism requires explicit sampling_semantics "
-                "in {'b_min_sep'}"
+                "in {'b_min_sep', 'balls_in_bins'}"
             )
 
         self._validate_bnb_sampling_policy(
@@ -838,6 +894,14 @@ class PrivacyEngine:
         ):
             raise ValueError(
                 "b_min_sep sampling is supported only for mechanism='bnb'"
+            )
+        if (
+            sampling_semantics is not None
+            and sampling_semantics.sampling_mode == "balls_in_bins"
+            and mechanism_config.mechanism != "bnb"
+        ):
+            raise ValueError(
+                "balls_in_bins sampling is supported only for mechanism='bnb'"
             )
 
         if (
@@ -920,7 +984,7 @@ class PrivacyEngine:
             if not poisson_sampling and sampling_mode in (None, "torch_sampler"):
                 raise ValueError(
                     "Setting total_steps with non-Poisson sampling requires "
-                    "explicit sampling_semantics in {'cyclic_poisson', 'b_min_sep'}"
+                    "explicit sampling_semantics in {'cyclic_poisson', 'b_min_sep', 'balls_in_bins'}"
                 )
 
             if not poisson_sampling and sampling_mode == "b_min_sep":
@@ -930,6 +994,16 @@ class PrivacyEngine:
                         "b_min_sep sampling requires privacy_metadata['p']"
                     )
                 sample_rate = float(p)
+            elif not poisson_sampling and sampling_mode == "balls_in_bins":
+                bins = sampling_semantics.privacy_metadata.get("bins")
+                if bins is None:
+                    bins = sampling_semantics.privacy_metadata.get("b")
+                if bins is None:
+                    raise ValueError(
+                        "balls_in_bins sampling requires privacy_metadata['bins'] "
+                        "(or legacy key 'b')"
+                    )
+                sample_rate = 1.0 / float(int(bins))
             else:
                 # For Poisson and cyclic_poisson, q follows the batch-size ratio.
                 sample_rate = batch_size / len(data_loader.dataset)
@@ -1106,7 +1180,7 @@ class PrivacyEngine:
         if mechanism_config.mechanism == "bnb" and sampling_semantics is None:
             raise ValueError(
                 "bnb mechanism requires explicit sampling_semantics "
-                "in {'b_min_sep'}"
+                "in {'b_min_sep', 'balls_in_bins'}"
             )
 
         self._validate_bnb_sampling_policy(
@@ -1121,6 +1195,14 @@ class PrivacyEngine:
         ):
             raise ValueError(
                 "b_min_sep sampling is supported only for mechanism='bnb'"
+            )
+        if (
+            sampling_semantics is not None
+            and sampling_semantics.sampling_mode == "balls_in_bins"
+            and mechanism_config.mechanism != "bnb"
+        ):
+            raise ValueError(
+                "balls_in_bins sampling is supported only for mechanism='bnb'"
             )
 
         local_sampling_semantics = sampling_semantics
@@ -1184,7 +1266,7 @@ class PrivacyEngine:
             if not poisson_sampling and sampling_mode in (None, "torch_sampler"):
                 raise ValueError(
                     "Setting total_steps with non-Poisson sampling requires "
-                    "explicit sampling_semantics in {'cyclic_poisson', 'b_min_sep'}"
+                    "explicit sampling_semantics in {'cyclic_poisson', 'b_min_sep', 'balls_in_bins'}"
                 )
 
             if epochs is not None:
@@ -1199,6 +1281,16 @@ class PrivacyEngine:
                         "b_min_sep sampling requires privacy_metadata['p']"
                     )
                 sample_rate = float(p)
+            elif not poisson_sampling and sampling_mode == "balls_in_bins":
+                bins = local_sampling_semantics.privacy_metadata.get("bins")
+                if bins is None:
+                    bins = local_sampling_semantics.privacy_metadata.get("b")
+                if bins is None:
+                    raise ValueError(
+                        "balls_in_bins sampling requires privacy_metadata['bins'] "
+                        "(or legacy key 'b')"
+                    )
+                sample_rate = 1.0 / float(int(bins))
             else:
                 # For Poisson and cyclic_poisson, q follows the batch-size ratio.
                 sample_rate = data_loader.batch_size / len(data_loader.dataset)
@@ -1217,6 +1309,14 @@ class PrivacyEngine:
 
             nm_kwargs = dict(kwargs)
             nm_kwargs.pop("bsr_mf_sensitivity", None)
+            if mechanism_config.mechanism == "bnb":
+                logger.info(
+                    "bnb init: starting get_noise_multiplier (steps=%s, sample_rate=%.6g, eps=%.6g, delta=%.6g)",
+                    int(total_steps),
+                    float(sample_rate),
+                    float(target_epsilon),
+                    float(target_delta),
+                )
             noise_multiplier = get_noise_multiplier(
                 target_epsilon=target_epsilon,
                 target_delta=target_delta,
@@ -1229,6 +1329,11 @@ class PrivacyEngine:
                 bsr_mf_sensitivity=bsr_mf_sensitivity,
                 **nm_kwargs,
             )
+            if mechanism_config.mechanism == "bnb":
+                logger.info(
+                    "bnb init: get_noise_multiplier done -> sigma=%.6g",
+                    float(noise_multiplier),
+                )
         else:
             sample_rate = 1 / len(data_loader)
             if (
@@ -1247,6 +1352,14 @@ class PrivacyEngine:
 
             nm_kwargs = dict(kwargs)
             nm_kwargs.pop("bsr_mf_sensitivity", None)
+            if mechanism_config.mechanism == "bnb":
+                logger.info(
+                    "bnb init: starting get_noise_multiplier (epochs=%s, sample_rate=%.6g, eps=%.6g, delta=%.6g)",
+                    int(epochs),
+                    float(sample_rate),
+                    float(target_epsilon),
+                    float(target_delta),
+                )
             noise_multiplier = get_noise_multiplier(
                 target_epsilon=target_epsilon,
                 target_delta=target_delta,
@@ -1259,6 +1372,11 @@ class PrivacyEngine:
                 bsr_mf_sensitivity=bsr_mf_sensitivity,
                 **nm_kwargs,
             )
+            if mechanism_config.mechanism == "bnb":
+                logger.info(
+                    "bnb init: get_noise_multiplier done -> sigma=%.6g",
+                    float(noise_multiplier),
+                )
 
         bnb_calibration_report = None
         if (
@@ -1267,6 +1385,23 @@ class PrivacyEngine:
             and bnb_c_matrix is not None
             and bnb_bands is not None
         ):
+            calibration_start = time.monotonic()
+            timeout_seconds = float(kwargs.get("bnb_calibration_timeout_seconds", 10.0))
+            if timeout_seconds <= 0.0:
+                raise ValueError("bnb_calibration_timeout_seconds must be > 0")
+            deadline = calibration_start + timeout_seconds
+
+            def _check_timeout(*, stage: str) -> None:
+                now = time.monotonic()
+                if now > deadline:
+                    elapsed = now - calibration_start
+                    raise TimeoutError(
+                        "bnb calibration timed out "
+                        f"after {elapsed:.2f}s at stage='{stage}' "
+                        f"(timeout={timeout_seconds:.2f}s). "
+                        "Tune bnb_num_samples/bnb_evr_num_checks/candidate ladder."
+                    )
+
             num_samples = int(kwargs.get("bnb_num_samples", 100_000))
             seed = int(kwargs.get("bnb_seed", 0))
             reduce_dimensionality = bool(kwargs.get("bnb_reduce_dimensionality", False))
@@ -1306,56 +1441,83 @@ class PrivacyEngine:
                     "bnb candidate sigma ladder must not include values below the "
                     "accountant-calibrated sigma"
                 )
+            logger.info(
+                "bnb calibration start: candidates=%d checks=%d samples=%d timeout=%.2fs",
+                len(sigma_candidates),
+                num_checks,
+                num_samples,
+                timeout_seconds,
+            )
 
             def _llr_samples_seq_for_sigma_forward(sigma: float):
-                return [
-                    sample_b_min_sep_llr(
-                        c_matrix=bnb_c_matrix,
-                        bands=int(bnb_bands),
-                        sigma=float(sigma),
-                        num_samples=num_samples,
-                        seed=seed + i,
-                        reduce_dimensionality=reduce_dimensionality,
+                out = []
+                for i in range(num_checks):
+                    _check_timeout(
+                        stage=f"forward_llr_sigma={sigma:.6g}_check={i+1}/{num_checks}"
                     )
-                    for i in range(num_checks)
-                ]
+                    out.append(
+                        sample_b_min_sep_llr(
+                            c_matrix=bnb_c_matrix,
+                            bands=int(bnb_bands),
+                            sigma=float(sigma),
+                            num_samples=num_samples,
+                            seed=seed + i,
+                            reduce_dimensionality=reduce_dimensionality,
+                        )
+                    )
+                return out
 
             def _llr_samples_seq_for_sigma_reverse(sigma: float):
                 # Reverse direction uses independent sample streams via seed offset.
-                return [
-                    -sample_b_min_sep_llr(
-                        c_matrix=bnb_c_matrix,
-                        bands=int(bnb_bands),
-                        sigma=float(sigma),
-                        num_samples=num_samples,
-                        seed=seed + num_checks + i,
-                        reduce_dimensionality=reduce_dimensionality,
+                out = []
+                for i in range(num_checks):
+                    _check_timeout(
+                        stage=f"reverse_llr_sigma={sigma:.6g}_check={i+1}/{num_checks}"
                     )
-                    for i in range(num_checks)
-                ]
+                    out.append(
+                        -sample_b_min_sep_llr(
+                            c_matrix=bnb_c_matrix,
+                            bands=int(bnb_bands),
+                            sigma=float(sigma),
+                            num_samples=num_samples,
+                            seed=seed + num_checks + i,
+                            reduce_dimensionality=reduce_dimensionality,
+                        )
+                    )
+                return out
 
-            (
-                selected_sigma,
-                verification,
-                evr_pass_count,
-                evr_per_check_alpha,
-            ) = (
-                select_evr_candidate_ladder_two_sided(
-                    candidate_sigmas=sigma_candidates,
-                    llr_samples_seq_fn_forward=_llr_samples_seq_for_sigma_forward,
-                    llr_samples_seq_fn_reverse=_llr_samples_seq_for_sigma_reverse,
-                    epsilon=float(target_epsilon),
-                    target_delta=float(target_delta),
-                    total_confidence_alpha=confidence_alpha_total,
+            try:
+                _check_timeout(stage="before_evr_selection")
+                (
+                    selected_sigma,
+                    verification,
+                    evr_pass_count,
+                    evr_per_check_alpha,
+                ) = (
+                    select_evr_candidate_ladder_two_sided(
+                        candidate_sigmas=sigma_candidates,
+                        llr_samples_seq_fn_forward=_llr_samples_seq_for_sigma_forward,
+                        llr_samples_seq_fn_reverse=_llr_samples_seq_for_sigma_reverse,
+                        epsilon=float(target_epsilon),
+                        target_delta=float(target_delta),
+                        total_confidence_alpha=confidence_alpha_total,
+                    )
+                    if bool(kwargs.get("bnb_verify_both_directions", True))
+                    else select_evr_candidate_ladder(
+                        candidate_sigmas=sigma_candidates,
+                        llr_samples_seq_fn=_llr_samples_seq_for_sigma_forward,
+                        epsilon=float(target_epsilon),
+                        target_delta=float(target_delta),
+                        total_confidence_alpha=confidence_alpha_total,
+                    )
                 )
-                if bool(kwargs.get("bnb_verify_both_directions", True))
-                else select_evr_candidate_ladder(
-                    candidate_sigmas=sigma_candidates,
-                    llr_samples_seq_fn=_llr_samples_seq_for_sigma_forward,
-                    epsilon=float(target_epsilon),
-                    target_delta=float(target_delta),
-                    total_confidence_alpha=confidence_alpha_total,
-                )
+            except TimeoutError as exc:
+                raise ValueError(str(exc)) from exc
+            logger.info(
+                "bnb calibration done in %.2fs: selected_sigma=%.6g pass=%s",
+                time.monotonic() - calibration_start,
+                float(selected_sigma),
+                bool(verification.accepted),
             )
             total_checks_reported = (
                 int(2 * num_checks)

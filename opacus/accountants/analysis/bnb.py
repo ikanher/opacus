@@ -128,6 +128,92 @@ class BNBCalibrationStatus:
         }
 
 
+def build_lower_toeplitz_c_matrix_from_coeffs(
+    *,
+    coeffs: Sequence[float],
+    horizon: int,
+    dtype: torch.dtype = torch.float64,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """
+    Build lower-triangular Toeplitz C matrix from coefficient sequence.
+    """
+    coeff_list = [float(c) for c in coeffs]
+    if len(coeff_list) == 0:
+        raise ValueError("coeffs must be non-empty")
+    if not all(math.isfinite(c) for c in coeff_list):
+        raise ValueError("coeffs must be finite")
+    if int(horizon) < 1:
+        raise ValueError("horizon must be >= 1")
+
+    h = int(horizon)
+    c_matrix = torch.zeros((h, h), dtype=dtype, device=device)
+    for i in range(h):
+        max_lag = min(i, len(coeff_list) - 1)
+        for lag in range(max_lag + 1):
+            c_matrix[i, i - lag] = coeff_list[lag]
+    return c_matrix
+
+
+def make_bnb_toeplitz_c_matrix_contract(
+    *,
+    c_matrix: torch.Tensor,
+    bands: int,
+    horizon: int | None = None,
+    atol: float = 1e-9,
+) -> dict[str, Any]:
+    """
+    Build contract payload for lower_toeplitz_from_coeffs C matrix derivation.
+    """
+    if c_matrix.ndim != 2:
+        raise ValueError("c_matrix must have shape [d, m]")
+    if int(bands) < 1:
+        raise ValueError("bands must be >= 1")
+    if float(atol) <= 0.0:
+        raise ValueError("atol must be > 0")
+
+    h = int(horizon) if horizon is not None else int(c_matrix.shape[1])
+    if h < 1:
+        raise ValueError("horizon must be >= 1")
+
+    return {
+        "sampling_mode": "b_min_sep",
+        "bands": int(bands),
+        "granularity": "single_participation",
+        "matrix_columns": int(c_matrix.shape[1]),
+        "derivation": "lower_toeplitz_from_coeffs",
+        "horizon": int(h),
+        "atol": float(atol),
+    }
+
+
+def build_bnb_toeplitz_c_matrix_and_contract(
+    *,
+    coeffs: Sequence[float],
+    bands: int,
+    horizon: int,
+    dtype: torch.dtype = torch.float64,
+    device: torch.device | None = None,
+    atol: float = 1e-9,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """
+    Convenience API: build Toeplitz C matrix and matching validation contract.
+    """
+    c_matrix = build_lower_toeplitz_c_matrix_from_coeffs(
+        coeffs=coeffs,
+        horizon=int(horizon),
+        dtype=dtype,
+        device=device,
+    )
+    contract = make_bnb_toeplitz_c_matrix_contract(
+        c_matrix=c_matrix,
+        bands=int(bands),
+        horizon=int(horizon),
+        atol=float(atol),
+    )
+    return c_matrix, contract
+
+
 def validate_bnb_c_matrix_contract(
     *,
     c_matrix: torch.Tensor,
@@ -179,16 +265,12 @@ def validate_bnb_c_matrix_contract(
             f"square c_matrix with shape [{horizon}, {horizon}]"
         )
 
-    expected = torch.zeros(
-        (horizon, horizon),
+    expected = build_lower_toeplitz_c_matrix_from_coeffs(
+        coeffs=coeffs,
+        horizon=int(horizon),
         dtype=torch.float64,
         device=c_matrix.device,
     )
-    coeff_list = [float(c) for c in coeffs]
-    for i in range(horizon):
-        max_lag = min(i, len(coeff_list) - 1)
-        for lag in range(max_lag + 1):
-            expected[i, i - lag] = coeff_list[lag]
 
     atol = float(c_matrix_contract.get("atol", 1e-9))
     max_abs_diff = float(torch.max(torch.abs(c_matrix.to(dtype=torch.float64) - expected)))
@@ -491,6 +573,7 @@ def build_b_min_sep_gaussian_mixture(
     """
     if c_matrix.ndim != 2:
         raise ValueError("c_matrix must have shape [d, m]")
+
     if bands <= 0:
         raise ValueError("bands must be > 0")
 
@@ -506,16 +589,20 @@ def build_b_min_sep_gaussian_mixture(
     if reduce_dimensionality:
         # Keep the same behavior class as notebook-style dimensionality reduction.
         modes = torch.linalg.qr(modes, mode="r").R
+
     modes = modes.T.contiguous()  # [k, d']
     probs = torch.full((num_components,), 1.0 / float(num_components), dtype=modes.dtype)
+
     return GaussianMixture(modes=modes, probs=probs)
 
 
 def _mixture_logpdf(points: torch.Tensor, gm: GaussianMixture, sigma: float) -> torch.Tensor:
     if sigma <= 0.0:
         raise ValueError("sigma must be > 0")
+
     if points.ndim != 2:
         raise ValueError("points must have shape [n, d]")
+
     if points.shape[1] != gm.modes.shape[1]:
         raise ValueError("points dimension must match mixture modes")
 
@@ -523,6 +610,7 @@ def _mixture_logpdf(points: torch.Tensor, gm: GaussianMixture, sigma: float) -> 
     centered = points[:, None, :] - gm.modes[None, :, :]  # [n, k, d]
     sq_dist = torch.sum(centered * centered, dim=2)  # [n, k]
     component_log_probs = torch.log(gm.probs)[None, :] - 0.5 * sq_dist / sigma_sq
+
     return torch.logsumexp(component_log_probs, dim=1)
 
 
@@ -535,6 +623,7 @@ def generate_mixture_samples(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if num_samples <= 0:
         raise ValueError("num_samples must be > 0")
+
     if sigma <= 0.0:
         raise ValueError("sigma must be > 0")
 
@@ -546,6 +635,7 @@ def generate_mixture_samples(
         replacement=True,
         generator=generator,
     ).to(device=device)
+
     means = gm.modes[component_ids]
     noise = torch.randn(
         num_samples,
@@ -554,6 +644,7 @@ def generate_mixture_samples(
         device=device,
         dtype=dtype,
     )
+
     return component_ids, means + sigma * noise
 
 
@@ -574,6 +665,7 @@ def compute_llr_samples(
         num_samples=num_samples,
         generator=generator,
     )
+
     return _mixture_logpdf(points, up_gm, sigma) - _mixture_logpdf(points, lo_gm, sigma)
 
 
@@ -591,8 +683,10 @@ def sample_b_min_sep_llr(
     """
     if num_samples <= 0:
         raise ValueError("num_samples must be > 0")
+
     if seed < 0:
         raise ValueError("seed must be >= 0")
+
     if sigma <= 0.0:
         raise ValueError("sigma must be > 0")
 
@@ -611,6 +705,7 @@ def sample_b_min_sep_llr(
         modes=zero_mode,
         probs=torch.ones(1, dtype=up_gm.modes.dtype, device=up_gm.modes.device),
     )
+
     generator = torch.Generator(device=up_gm.modes.device).manual_seed(int(seed))
     return compute_llr_samples(
         up_gm=up_gm,
@@ -628,10 +723,12 @@ def estimate_hockey_stick_delta_from_llr_samples(
 ) -> float:
     if llr_samples.ndim != 1:
         raise ValueError("llr_samples must be a 1-D tensor")
+
     if llr_samples.numel() == 0:
         raise ValueError("llr_samples must be non-empty")
 
     vals = torch.clamp(1.0 - torch.exp(epsilon - llr_samples), min=0.0)
+
     return float(torch.mean(vals))
 
 
@@ -647,17 +744,21 @@ def verify_hockey_stick_delta_hoeffding(
     """
     if target_delta <= 0.0 or target_delta >= 1.0:
         raise ValueError("target_delta must be in (0, 1)")
+
     if confidence_alpha <= 0.0 or confidence_alpha >= 1.0:
         raise ValueError("confidence_alpha must be in (0, 1)")
+
     if llr_samples.ndim != 1 or llr_samples.numel() == 0:
         raise ValueError("llr_samples must be a non-empty 1-D tensor")
 
     samples = llr_samples.to(dtype=torch.float64)
     vals = torch.clamp(1.0 - torch.exp(float(epsilon) - samples), min=0.0, max=1.0)
-    n = float(vals.numel())
     delta_estimate = float(torch.mean(vals))
+
+    n = float(vals.numel())
     radius = math.sqrt(math.log(1.0 / confidence_alpha) / (2.0 * n))
     upper = min(1.0, delta_estimate + radius)
+
     return DeltaVerificationResult(
         delta_estimate=delta_estimate,
         upper_confidence_bound=upper,
@@ -682,10 +783,13 @@ def estimate_epsilon_from_llr_samples(
     """
     if target_delta < 0.0 or target_delta >= 1.0:
         raise ValueError("target_delta must be in [0, 1)")
+
     if epsilon_low < 0.0:
         raise ValueError("epsilon_low must be >= 0")
+
     if tolerance <= 0.0:
         raise ValueError("tolerance must be > 0")
+
     if max_iterations <= 0:
         raise ValueError("max_iterations must be > 0")
 
@@ -694,30 +798,36 @@ def estimate_epsilon_from_llr_samples(
         epsilon=epsilon_low,
         llr_samples=samples,
     )
+
     if target_delta >= delta_at_low:
         return float(epsilon_low)
 
     low = float(epsilon_low)
     if epsilon_high is None:
         high = max(1.0, low + 1.0)
+
         for _ in range(max_iterations):
             d_high = estimate_hockey_stick_delta_from_llr_samples(
                 epsilon=high,
                 llr_samples=samples,
             )
+
             if d_high <= target_delta:
                 break
             high *= 2.0
+
         else:
             raise ValueError("could not bracket epsilon; increase max_iterations")
     else:
         high = float(epsilon_high)
         if high <= low:
             raise ValueError("epsilon_high must be > epsilon_low")
+
         d_high = estimate_hockey_stick_delta_from_llr_samples(
             epsilon=high,
             llr_samples=samples,
         )
+
         if d_high > target_delta:
             raise ValueError("epsilon_high does not satisfy target_delta")
 
@@ -727,12 +837,16 @@ def estimate_epsilon_from_llr_samples(
             epsilon=mid,
             llr_samples=samples,
         )
+
         if abs(d_mid - target_delta) <= tolerance:
             return float(mid)
+
         if d_mid > target_delta:
             low = mid
+
         else:
             high = mid
+
     return float(0.5 * (low + high))
 
 
@@ -753,8 +867,10 @@ def estimate_b_min_sep_epsilon_monte_carlo(
     """
     if noise_multiplier <= 0.0:
         raise ValueError("noise_multiplier must be > 0")
+
     if num_samples <= 0:
         raise ValueError("num_samples must be > 0")
+
     if seed < 0:
         raise ValueError("seed must be >= 0")
 
@@ -766,6 +882,7 @@ def estimate_b_min_sep_epsilon_monte_carlo(
         seed=int(seed),
         reduce_dimensionality=reduce_dimensionality,
     )
+
     return estimate_epsilon_from_llr_samples(
         target_delta=float(target_delta),
         llr_samples=llr_samples,
@@ -790,10 +907,13 @@ def calibrate_sigma_evr_binary_search(
     """
     if target_epsilon < 0.0:
         raise ValueError("target_epsilon must be >= 0")
+
     if sigma_low <= 0.0 or sigma_high <= sigma_low:
         raise ValueError("require 0 < sigma_low < sigma_high")
+
     if tolerance <= 0.0:
         raise ValueError("tolerance must be > 0")
+
     if max_iterations <= 0:
         raise ValueError("max_iterations must be > 0")
 
@@ -806,6 +926,7 @@ def calibrate_sigma_evr_binary_search(
         target_delta=target_delta,
         confidence_alpha=confidence_alpha,
     )
+
     if not verification_at_high.accepted:
         raise ValueError(
             "sigma_high does not satisfy EVR acceptance; increase sigma_high"
@@ -819,15 +940,18 @@ def calibrate_sigma_evr_binary_search(
             target_delta=target_delta,
             confidence_alpha=confidence_alpha,
         )
+
         if high - low <= tolerance:
             if verification.accepted:
                 return mid, verification
             break
+
         if verification.accepted:
             high = mid
             verification_at_high = verification
         else:
             low = mid
+
     return high, verification_at_high
 
 
@@ -842,10 +966,13 @@ def find_sigma_binary_search(
 ) -> float:
     if target_delta <= 0.0 or target_delta >= 1.0:
         raise ValueError("target_delta must be in (0, 1)")
+
     if sigma_low <= 0.0 or sigma_high <= sigma_low:
         raise ValueError("require 0 < sigma_low < sigma_high")
+
     if tolerance <= 0.0:
         raise ValueError("tolerance must be > 0")
+
     if max_iterations <= 0:
         raise ValueError("max_iterations must be > 0")
 
@@ -854,10 +981,13 @@ def find_sigma_binary_search(
     for _ in range(max_iterations):
         mid = 0.5 * (low + high)
         delta = float(delta_fn(mid))
+
         if abs(delta - target_delta) < tolerance:
             return mid
+
         if delta > target_delta:
             low = mid
         else:
             high = mid
+
     return 0.5 * (low + high)

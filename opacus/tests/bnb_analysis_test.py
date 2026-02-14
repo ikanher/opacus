@@ -21,7 +21,9 @@ from opacus.accountants.analysis.bnb import (
     BNBCalibrationReport,
     DeltaVerificationResult,
     GaussianMixture,
+    build_bnb_toeplitz_c_matrix_and_contract,
     build_b_min_sep_gaussian_mixture,
+    build_lower_toeplitz_c_matrix_from_coeffs,
     calibrate_sigma_evr_binary_search,
     compute_llr_samples,
     describe_bnb_calibration_report,
@@ -30,6 +32,7 @@ from opacus.accountants.analysis.bnb import (
     estimate_hockey_stick_delta_from_llr_samples,
     find_sigma_binary_search,
     make_bnb_calibration_report,
+    make_bnb_toeplitz_c_matrix_contract,
     parse_bnb_calibration_report,
     generate_mixture_samples,
     sample_b_min_sep_llr,
@@ -42,6 +45,51 @@ from opacus.accountants.analysis.bnb import (
 
 
 class BNBAnalysisTest(unittest.TestCase):
+    def test_build_lower_toeplitz_c_matrix_from_coeffs_expected_entries(self) -> None:
+        c = build_lower_toeplitz_c_matrix_from_coeffs(
+            coeffs=[1.0, 0.5, 0.25],
+            horizon=4,
+        )
+        expected = torch.tensor(
+            [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.5, 1.0, 0.0, 0.0],
+                [0.25, 0.5, 1.0, 0.0],
+                [0.0, 0.25, 0.5, 1.0],
+            ],
+            dtype=torch.float64,
+        )
+        self.assertTrue(torch.allclose(c, expected))
+
+    def test_make_bnb_toeplitz_c_matrix_contract_schema(self) -> None:
+        c = build_lower_toeplitz_c_matrix_from_coeffs(coeffs=[1.0], horizon=3)
+        contract = make_bnb_toeplitz_c_matrix_contract(
+            c_matrix=c,
+            bands=2,
+            horizon=3,
+            atol=1e-8,
+        )
+        self.assertEqual(contract["sampling_mode"], "b_min_sep")
+        self.assertEqual(contract["bands"], 2)
+        self.assertEqual(contract["granularity"], "single_participation")
+        self.assertEqual(contract["matrix_columns"], 3)
+        self.assertEqual(contract["derivation"], "lower_toeplitz_from_coeffs")
+        self.assertEqual(contract["horizon"], 3)
+        self.assertAlmostEqual(float(contract["atol"]), 1e-8, places=20)
+
+    def test_build_bnb_toeplitz_c_matrix_and_contract_round_trip(self) -> None:
+        coeffs = [1.0, 0.2]
+        c, contract = build_bnb_toeplitz_c_matrix_and_contract(
+            coeffs=coeffs,
+            bands=2,
+            horizon=4,
+        )
+        self.assertEqual(tuple(c.shape), (4, 4))
+        self.assertEqual(contract["bands"], 2)
+        self.assertEqual(contract["matrix_columns"], 4)
+        self.assertEqual(contract["horizon"], 4)
+        self.assertEqual(contract["derivation"], "lower_toeplitz_from_coeffs")
+
     def test_gaussian_mixture_requires_probs_sum_to_one(self) -> None:
         with self.assertRaisesRegex(ValueError, "sum to 1"):
             GaussianMixture(
@@ -246,6 +294,116 @@ class BNBAnalysisTest(unittest.TestCase):
         self.assertAlmostEqual(eps_1, eps_2, places=12)
         self.assertGreaterEqual(eps_1, 0.0)
 
+    def test_estimate_b_min_sep_epsilon_monotone_in_sigma_grid(self) -> None:
+        c = torch.tensor(
+            [
+                [1.0, 0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0, 1.0],
+            ],
+            dtype=torch.float64,
+        )
+        target_delta = 0.2
+        sigmas = [0.8, 1.2, 1.8]
+        eps = []
+        for sigma in sigmas:
+            eps.append(
+                estimate_b_min_sep_epsilon_monte_carlo(
+                    c_matrix=c,
+                    bands=2,
+                    noise_multiplier=float(sigma),
+                    target_delta=target_delta,
+                    num_samples=20_000,
+                    seed=1234,
+                    tolerance=1e-4,
+                    max_iterations=200,
+                )
+            )
+
+        # MC estimate should respect monotonic trend up to tiny numerical slack.
+        self.assertLessEqual(eps[1], eps[0] + 1e-3)
+        self.assertLessEqual(eps[2], eps[1] + 1e-3)
+
+    def test_estimate_epsilon_from_llr_samples_matches_delta_grid_targets(self) -> None:
+        c = torch.tensor(
+            [
+                [1.0, 0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0, 1.0],
+            ],
+            dtype=torch.float64,
+        )
+        llr = sample_b_min_sep_llr(
+            c_matrix=c,
+            bands=2,
+            sigma=1.1,
+            num_samples=25_000,
+            seed=31415,
+        )
+
+        for target_delta in [0.3, 0.2, 0.1]:
+            epsilon = estimate_epsilon_from_llr_samples(
+                target_delta=target_delta,
+                llr_samples=llr,
+                tolerance=1e-5,
+                max_iterations=300,
+            )
+            recovered_delta = estimate_hockey_stick_delta_from_llr_samples(
+                epsilon=epsilon,
+                llr_samples=llr,
+            )
+            self.assertAlmostEqual(recovered_delta, target_delta, delta=2e-3)
+
+    def test_estimate_b_min_sep_epsilon_stability_extreme_sigma_and_long_horizon(self) -> None:
+        # Long-horizon Toeplitz fixture to exercise numerical stability envelope.
+        c = build_lower_toeplitz_c_matrix_from_coeffs(
+            coeffs=[1.0, 0.4, 0.2, 0.1],
+            horizon=64,
+        )
+        kwargs = dict(
+            c_matrix=c,
+            bands=4,
+            target_delta=1e-5,
+            num_samples=15_000,
+            seed=2026,
+            tolerance=1e-4,
+            max_iterations=250,
+        )
+
+        eps_low_sigma = estimate_b_min_sep_epsilon_monte_carlo(
+            noise_multiplier=0.35,
+            **kwargs,
+        )
+        eps_high_sigma = estimate_b_min_sep_epsilon_monte_carlo(
+            noise_multiplier=4.0,
+            **kwargs,
+        )
+
+        self.assertTrue(torch.isfinite(torch.tensor(eps_low_sigma)))
+        self.assertTrue(torch.isfinite(torch.tensor(eps_high_sigma)))
+        self.assertGreaterEqual(eps_low_sigma, 0.0)
+        self.assertGreaterEqual(eps_high_sigma, 0.0)
+        self.assertLessEqual(eps_high_sigma, eps_low_sigma + 1e-2)
+
+    def test_estimate_b_min_sep_epsilon_tiny_delta_is_finite(self) -> None:
+        c = torch.tensor(
+            [
+                [1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+            ],
+            dtype=torch.float64,
+        )
+        eps = estimate_b_min_sep_epsilon_monte_carlo(
+            c_matrix=c,
+            bands=2,
+            noise_multiplier=1.8,
+            target_delta=1e-7,
+            num_samples=20_000,
+            seed=424242,
+            tolerance=1e-4,
+            max_iterations=300,
+        )
+        self.assertTrue(torch.isfinite(torch.tensor(eps)))
+        self.assertGreaterEqual(eps, 0.0)
+
     def test_verify_hockey_stick_delta_hoeffding_accepts_and_rejects(self) -> None:
         llr = torch.full((20_000,), 2.0, dtype=torch.float64)
         ok = verify_hockey_stick_delta_hoeffding(
@@ -338,6 +496,10 @@ class BNBAnalysisTest(unittest.TestCase):
         self.assertEqual(payload["evr_pass_count"], 2)
         self.assertEqual(payload["verification_contract"], "evr_union_bound_alpha_split_v1")
         self.assertGreaterEqual(payload["evr_composed_delta_upper_bound"], payload["target_delta"])
+        expected = payload["target_delta"] + payload["evr_confidence_alpha_total"] * (
+            1.0 - payload["target_delta"]
+        )
+        self.assertAlmostEqual(payload["evr_composed_delta_upper_bound"], expected, places=18)
 
     def test_split_confidence_alpha(self) -> None:
         alpha = split_confidence_alpha(total_confidence_alpha=1e-3, num_checks=4)
