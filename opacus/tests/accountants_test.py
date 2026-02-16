@@ -16,6 +16,7 @@
 import unittest
 import math
 import itertools
+from unittest.mock import patch
 
 import hypothesis.strategies as st
 import torch
@@ -229,6 +230,134 @@ class AccountingTest(unittest.TestCase):
             bnb_seed=123,
         )
         self.assertGreaterEqual(eps, 0.0)
+
+    def test_bnb_accountant_builtin_effective_steps_delta_split(self) -> None:
+        accountant = BNBAccountant()
+        accountant.history = [(1.0, 0.4, 7)]  # effective_steps = ceil(7 * 0.4) = 3
+        c_matrix = torch.tensor(
+            [
+                [1.0, 0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0, 1.0],
+            ],
+            dtype=torch.float64,
+        )
+        sampling_semantics = SamplingSemantics(
+            sampling_mode="b_min_sep",
+            privacy_metadata={"bands": 2},
+        )
+
+        calls = []
+
+        def _mock_estimator(**kwargs):
+            calls.append(kwargs)
+            return 0.5
+
+        with patch(
+            "opacus.accountants.bnb.estimate_b_min_sep_epsilon_monte_carlo",
+            side_effect=_mock_estimator,
+        ):
+            eps = accountant.get_epsilon(
+                delta=0.2,
+                mechanism_state={
+                    "c_matrix": c_matrix,
+                    "coeffs": [1.0, 0.2],
+                    "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+                },
+                sampling_semantics=sampling_semantics,
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertAlmostEqual(float(calls[0]["target_delta"]), 0.2 / 3.0, places=12)
+        self.assertAlmostEqual(float(eps), 3.0 * 0.5, places=12)
+
+    def test_bnb_accountant_builtin_sample_rate_clamp_sets_min_effective_steps_one(self) -> None:
+        accountant = BNBAccountant()
+        accountant.history = [(1.0, -0.3, 9)]  # clamped to 0 -> effective_steps = 1
+        c_matrix = torch.tensor(
+            [
+                [1.0, 0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0, 1.0],
+            ],
+            dtype=torch.float64,
+        )
+        sampling_semantics = SamplingSemantics(
+            sampling_mode="b_min_sep",
+            privacy_metadata={"bands": 2},
+        )
+
+        calls = []
+
+        def _mock_estimator(**kwargs):
+            calls.append(kwargs)
+            return 0.25
+
+        with patch(
+            "opacus.accountants.bnb.estimate_b_min_sep_epsilon_monte_carlo",
+            side_effect=_mock_estimator,
+        ):
+            eps = accountant.get_epsilon(
+                delta=0.2,
+                mechanism_state={
+                    "c_matrix": c_matrix,
+                    "coeffs": [1.0, 0.2],
+                    "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+                },
+                sampling_semantics=sampling_semantics,
+            )
+
+        self.assertEqual(len(calls), 1)
+        self.assertAlmostEqual(float(calls[0]["target_delta"]), 0.2, places=12)
+        self.assertAlmostEqual(float(eps), 0.25, places=12)
+
+    def test_bnb_accountant_builtin_rejects_delta_per_step_out_of_domain(self) -> None:
+        accountant = BNBAccountant()
+        accountant.history = [(1.0, 0.8, 5)]  # effective_steps >= 1
+        c_matrix = torch.tensor(
+            [
+                [1.0, 0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0, 1.0],
+            ],
+            dtype=torch.float64,
+        )
+        sampling_semantics = SamplingSemantics(
+            sampling_mode="b_min_sep",
+            privacy_metadata={"bands": 2},
+        )
+        with self.assertRaisesRegex(ValueError, "target delta is incompatible"):
+            accountant.get_epsilon(
+                delta=4.0,
+                mechanism_state={
+                    "c_matrix": c_matrix,
+                    "coeffs": [1.0, 0.2],
+                    "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+                },
+                sampling_semantics=sampling_semantics,
+            )
+
+    def test_bnb_accountant_builtin_rejects_non_b_min_sep_sampling_mode(self) -> None:
+        accountant = BNBAccountant()
+        accountant.history = [(1.0, 0.1, 5)]
+        c_matrix = torch.tensor(
+            [
+                [1.0, 0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0, 1.0],
+            ],
+            dtype=torch.float64,
+        )
+        sampling_semantics = SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bands": 2},
+        )
+        with self.assertRaisesRegex(ValueError, "sampling_mode='b_min_sep'"):
+            accountant.get_epsilon(
+                delta=0.2,
+                mechanism_state={
+                    "c_matrix": c_matrix,
+                    "coeffs": [1.0, 0.2],
+                    "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+                },
+                sampling_semantics=sampling_semantics,
+            )
 
     def test_bnb_accountant_builtin_monte_carlo_noise_monotonicity_smoke(self) -> None:
         c_matrix = torch.tensor(
