@@ -35,17 +35,23 @@ class GaussianMixture:
     def __post_init__(self) -> None:
         if self.modes.ndim != 2:
             raise ValueError("modes must have shape [k, d]")
+
         if self.probs.ndim != 1:
             raise ValueError("probs must have shape [k]")
+
         if self.modes.shape[0] != self.probs.shape[0]:
             raise ValueError("modes/probs component mismatch")
+
         if self.modes.shape[0] == 0:
             raise ValueError("mixture must have at least one component")
+
         if torch.any(self.probs < 0):
             raise ValueError("probs must be nonnegative")
+
         s = torch.sum(self.probs)
         if not torch.isfinite(s):
             raise ValueError("probs must be finite")
+
         if abs(float(s) - 1.0) > 1e-6:
             raise ValueError("probs must sum to 1")
 
@@ -141,17 +147,21 @@ def build_lower_toeplitz_c_matrix_from_coeffs(
     coeff_list = [float(c) for c in coeffs]
     if len(coeff_list) == 0:
         raise ValueError("coeffs must be non-empty")
+
     if not all(math.isfinite(c) for c in coeff_list):
         raise ValueError("coeffs must be finite")
+
     if int(horizon) < 1:
         raise ValueError("horizon must be >= 1")
 
     h = int(horizon)
     c_matrix = torch.zeros((h, h), dtype=dtype, device=device)
     for i in range(h):
+
         max_lag = min(i, len(coeff_list) - 1)
         for lag in range(max_lag + 1):
             c_matrix[i, i - lag] = coeff_list[lag]
+
     return c_matrix
 
 
@@ -167,8 +177,10 @@ def make_bnb_toeplitz_c_matrix_contract(
     """
     if c_matrix.ndim != 2:
         raise ValueError("c_matrix must have shape [d, m]")
+
     if int(bands) < 1:
         raise ValueError("bands must be >= 1")
+
     if float(atol) <= 0.0:
         raise ValueError("atol must be > 0")
 
@@ -231,17 +243,20 @@ def validate_bnb_c_matrix_contract(
             "bnb consistency check failed: c_matrix_contract['sampling_mode'] "
             "must be 'b_min_sep'"
         )
+
     contract_bands = c_matrix_contract.get("bands")
     if contract_bands is None or int(contract_bands) != int(bands):
         raise ValueError(
             "bnb consistency check failed: c_matrix_contract['bands'] "
             f"({contract_bands}) != accounting bands ({int(bands)})"
         )
+
     if c_matrix_contract.get("granularity") != "single_participation":
         raise ValueError(
             "bnb consistency check failed: c_matrix_contract['granularity'] "
             "must be 'single_participation'"
         )
+
     matrix_columns = c_matrix_contract.get("matrix_columns")
     if matrix_columns is None or int(matrix_columns) != int(c_matrix.shape[1]):
         raise ValueError(
@@ -376,6 +391,7 @@ def describe_bnb_calibration_report(
     """
     report = payload if isinstance(payload, BNBCalibrationReport) else parse_bnb_calibration_report(payload)
     status = "PASS" if report.verification_passed else "FAIL"
+
     return (
         f"BNB calibration v{report.version} [{status}] "
         f"eps={report.target_epsilon:.6g} delta={report.target_delta:.6g} "
@@ -397,8 +413,10 @@ def split_confidence_alpha(
     """
     if total_confidence_alpha <= 0.0 or total_confidence_alpha >= 1.0:
         raise ValueError("total_confidence_alpha must be in (0, 1)")
+
     if num_checks <= 0:
         raise ValueError("num_checks must be > 0")
+
     return float(total_confidence_alpha) / float(num_checks)
 
 
@@ -420,6 +438,7 @@ def verify_evr_confidence_split(
         total_confidence_alpha=total_confidence_alpha,
         num_checks=len(llr_samples_seq),
     )
+
     checks: list[DeltaVerificationResult] = []
     for llr in llr_samples_seq:
         checks.append(
@@ -430,8 +449,10 @@ def verify_evr_confidence_split(
                 confidence_alpha=per_check_alpha,
             )
         )
+
     pass_count = sum(1 for c in checks if c.accepted)
     worst = max(checks, key=lambda c: c.upper_confidence_bound)
+
     return (
         DeltaVerificationResult(
             delta_estimate=worst.delta_estimate,
@@ -462,6 +483,7 @@ def select_evr_candidate_ladder(
     cleaned = [float(s) for s in candidate_sigmas]
     if any(s <= 0.0 for s in cleaned):
         raise ValueError("candidate_sigmas must be > 0")
+
     if any(cleaned[i] >= cleaned[i + 1] for i in range(len(cleaned) - 1)):
         raise ValueError("candidate_sigmas must be strictly increasing")
 
@@ -482,10 +504,12 @@ def select_evr_candidate_ladder(
         chosen_verification = verification
         chosen_pass_count = int(pass_count)
         chosen_per_alpha = float(per_alpha)
+
         if verification.accepted:
             break
 
     assert chosen_verification is not None
+
     return chosen_sigma, chosen_verification, chosen_pass_count, chosen_per_alpha
 
 
@@ -508,8 +532,10 @@ def select_evr_candidate_ladder_two_sided(
     cleaned = [float(s) for s in candidate_sigmas]
     if any(s <= 0.0 for s in cleaned):
         raise ValueError("candidate_sigmas must be > 0")
+
     if any(cleaned[i] >= cleaned[i + 1] for i in range(len(cleaned) - 1)):
         raise ValueError("candidate_sigmas must be strictly increasing")
+
     if total_confidence_alpha <= 0.0 or total_confidence_alpha >= 1.0:
         raise ValueError("total_confidence_alpha must be in (0, 1)")
 
@@ -555,6 +581,7 @@ def select_evr_candidate_ladder_two_sided(
             break
 
     assert chosen_verification is not None
+
     return chosen_sigma, chosen_verification, chosen_pass_count, chosen_per_alpha
 
 
@@ -803,33 +830,13 @@ def estimate_epsilon_from_llr_samples(
         return float(epsilon_low)
 
     low = float(epsilon_low)
-    if epsilon_high is None:
-        high = max(1.0, low + 1.0)
-
-        for _ in range(max_iterations):
-            d_high = estimate_hockey_stick_delta_from_llr_samples(
-                epsilon=high,
-                llr_samples=samples,
-            )
-
-            if d_high <= target_delta:
-                break
-            high *= 2.0
-
-        else:
-            raise ValueError("could not bracket epsilon; increase max_iterations")
-    else:
-        high = float(epsilon_high)
-        if high <= low:
-            raise ValueError("epsilon_high must be > epsilon_low")
-
-        d_high = estimate_hockey_stick_delta_from_llr_samples(
-            epsilon=high,
-            llr_samples=samples,
-        )
-
-        if d_high > target_delta:
-            raise ValueError("epsilon_high does not satisfy target_delta")
+    high = _resolve_epsilon_upper_bound(
+        target_delta=target_delta,
+        llr_samples=samples,
+        epsilon_low=low,
+        epsilon_high=epsilon_high,
+        max_iterations=max_iterations,
+    )
 
     for _ in range(max_iterations):
         mid = 0.5 * (low + high)
@@ -848,6 +855,42 @@ def estimate_epsilon_from_llr_samples(
             high = mid
 
     return float(0.5 * (low + high))
+
+
+def _resolve_epsilon_upper_bound(
+    *,
+    target_delta: float,
+    llr_samples: torch.Tensor,
+    epsilon_low: float,
+    epsilon_high: float | None,
+    max_iterations: int,
+) -> float:
+    if epsilon_high is not None:
+        high = float(epsilon_high)
+        if high <= epsilon_low:
+            raise ValueError("epsilon_high must be > epsilon_low")
+
+        d_high = estimate_hockey_stick_delta_from_llr_samples(
+            epsilon=high,
+            llr_samples=llr_samples,
+        )
+        if d_high > target_delta:
+            raise ValueError("epsilon_high does not satisfy target_delta")
+
+        return high
+
+    high = max(1.0, epsilon_low + 1.0)
+    for _ in range(max_iterations):
+        d_high = estimate_hockey_stick_delta_from_llr_samples(
+            epsilon=high,
+            llr_samples=llr_samples,
+        )
+        if d_high <= target_delta:
+            return high
+
+        high *= 2.0
+
+    raise ValueError("could not bracket epsilon; increase max_iterations")
 
 
 def estimate_b_min_sep_epsilon_monte_carlo(

@@ -138,7 +138,6 @@ class DistributedBallsInBinsSamplerTest(unittest.TestCase):
             batches_epoch5 = list(sampler)
 
         local_indices = np.arange(total_size)[0:total_size:2]
-        local_n = len(local_indices)
 
         def counts_over_cycle(batches):
             counts = np.zeros(total_size, dtype=np.int64)

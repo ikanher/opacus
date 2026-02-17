@@ -553,6 +553,557 @@ class PrivacyEngine:
                 "{'b_min_sep', 'balls_in_bins'}"
             )
 
+    def _validate_mechanism_sampling_compatibility(
+        self,
+        *,
+        mechanism_config: NoiseMechanismConfig,
+        poisson_sampling: bool,
+        sampling_semantics: Optional[SamplingSemantics],
+        validate_cyclic_poisson_mode: bool,
+    ) -> None:
+        mechanism = mechanism_config.mechanism
+        if mechanism == "bsr" and poisson_sampling:
+            raise ValueError(
+                "bsr mechanism requires fixed-batch semantics; "
+                "set poisson_sampling=False"
+            )
+
+        if mechanism == "bnb" and poisson_sampling:
+            raise ValueError(
+                "bnb mechanism requires explicit non-Poisson sampling semantics; "
+                "set poisson_sampling=False and provide sampling_semantics"
+            )
+
+        if mechanism == "bnb" and sampling_semantics is None:
+            raise ValueError(
+                "bnb mechanism requires explicit sampling_semantics "
+                "in {'b_min_sep', 'balls_in_bins'}"
+            )
+
+        self._validate_bnb_sampling_policy(
+            sampling_semantics=sampling_semantics,
+            mechanism=mechanism,
+        )
+
+        if (
+            sampling_semantics is not None
+            and sampling_semantics.sampling_mode == "b_min_sep"
+            and mechanism != "bnb"
+        ):
+            raise ValueError(
+                "b_min_sep sampling is supported only for mechanism='bnb'"
+            )
+
+        if (
+            sampling_semantics is not None
+            and sampling_semantics.sampling_mode == "balls_in_bins"
+            and mechanism != "bnb"
+        ):
+            raise ValueError(
+                "balls_in_bins sampling is supported only for mechanism='bnb'"
+            )
+
+        if (
+            validate_cyclic_poisson_mode
+            and sampling_semantics is not None
+            and sampling_semantics.sampling_mode == "cyclic_poisson"
+            and mechanism != "bsr"
+        ):
+            raise ValueError(
+                "cyclic_poisson sampling is supported only for mechanism='bsr'"
+            )
+
+    @staticmethod
+    def _resolve_total_steps_sample_rate(
+        *,
+        poisson_sampling: bool,
+        sampling_semantics: Optional[SamplingSemantics],
+        batch_size: int,
+        dataset_size: int,
+    ) -> float:
+        sampling_mode = (
+            sampling_semantics.sampling_mode
+            if sampling_semantics is not None
+            else None
+        )
+        if not poisson_sampling and sampling_mode in (None, "torch_sampler"):
+            raise ValueError(
+                "Setting total_steps with non-Poisson sampling requires "
+                "explicit sampling_semantics in {'cyclic_poisson', 'b_min_sep', 'balls_in_bins'}"
+            )
+
+        if not poisson_sampling and sampling_mode == "b_min_sep":
+            p = sampling_semantics.privacy_metadata.get("p")
+            if p is None:
+                raise ValueError(
+                    "b_min_sep sampling requires privacy_metadata['p']"
+                )
+            return float(p)
+
+        if not poisson_sampling and sampling_mode == "balls_in_bins":
+            bins = sampling_semantics.privacy_metadata.get("bins")
+            if bins is None:
+                bins = sampling_semantics.privacy_metadata.get("b")
+            if bins is None:
+                raise ValueError(
+                    "balls_in_bins sampling requires privacy_metadata['bins'] "
+                    "(or legacy key 'b')"
+                )
+            return 1.0 / float(int(bins))
+
+        # For Poisson and cyclic_poisson, q follows the batch-size ratio.
+        return batch_size / dataset_size
+
+    def _resolve_local_sampling_semantics_for_epsilon(
+        self,
+        *,
+        mechanism: str,
+        sampling_semantics: Optional[SamplingSemantics],
+        poisson_sampling: bool,
+        total_steps: Optional[int],
+        data_loader: DataLoader,
+    ) -> Optional[SamplingSemantics]:
+        local_sampling_semantics = sampling_semantics
+        if mechanism == "bsr" and local_sampling_semantics is None:
+            if total_steps:
+                local_sample_rate = data_loader.batch_size / len(data_loader.dataset)
+            else:
+                local_sample_rate = 1 / len(data_loader)
+
+            local_sampling_semantics = self._build_sampling_semantics(
+                poisson_sampling=poisson_sampling,
+                sample_rate=local_sample_rate,
+                expected_batch_size=data_loader.batch_size,
+                distributed=False,
+                explicit_sampling_semantics=None,
+            )
+
+        return local_sampling_semantics
+
+    def _resolve_bnb_runtime_inputs_for_epsilon(
+        self,
+        *,
+        mechanism_config: NoiseMechanismConfig,
+        sampling_semantics: Optional[SamplingSemantics],
+        epsilon_fn,
+        kwargs: Dict[str, Any],
+    ) -> Tuple[Optional[torch.Tensor], Optional[int], Optional[Dict[str, Any]]]:
+        if mechanism_config.mechanism != "bnb" or epsilon_fn is not None:
+            return None, None, None
+
+        if (
+            sampling_semantics is None
+            or sampling_semantics.sampling_mode != "b_min_sep"
+        ):
+            raise ValueError(
+                "bnb non-callback calibration currently requires "
+                "sampling_mode='b_min_sep'"
+            )
+
+        bnb_c_matrix, bnb_bands, bnb_c_matrix_contract = self._resolve_bnb_b_min_sep_inputs(
+            mechanism_state=mechanism_config.mechanism_state,
+            sampling_semantics=sampling_semantics,
+            kwargs=kwargs,
+        )
+
+        self._validate_bnb_accounting_runtime_consistency(
+            mechanism_state=mechanism_config.mechanism_state,
+            sampling_semantics=sampling_semantics,
+            c_matrix=bnb_c_matrix,
+            bands=int(bnb_bands),
+            c_matrix_contract=bnb_c_matrix_contract,
+        )
+        return bnb_c_matrix, int(bnb_bands), bnb_c_matrix_contract
+
+    def _resolve_noise_multiplier_for_target_epsilon(
+        self,
+        *,
+        mechanism_config: NoiseMechanismConfig,
+        active_accountant,
+        target_epsilon: float,
+        target_delta: float,
+        total_steps: Optional[int],
+        epochs: Optional[int],
+        poisson_sampling: bool,
+        data_loader: DataLoader,
+        sampling_semantics: Optional[SamplingSemantics],
+        epsilon_fn,
+        kwargs: Dict[str, Any],
+    ) -> Tuple[float, float]:
+        nm_kwargs = dict(kwargs)
+        nm_kwargs.pop("bsr_mf_sensitivity", None)
+
+        if total_steps:
+            if epochs is not None:
+                raise ValueError(
+                    "make_private_with_epsilon takes as input EITHER a number of steps or a number of epochs"
+                )
+
+            sample_rate = self._resolve_total_steps_sample_rate(
+                poisson_sampling=poisson_sampling,
+                sampling_semantics=sampling_semantics,
+                batch_size=data_loader.batch_size,
+                dataset_size=len(data_loader.dataset),
+            )
+
+            bsr_mf_sensitivity = None
+            if (
+                mechanism_config.mechanism == "bsr"
+                and epsilon_fn is None
+                and sampling_semantics is not None
+                and sampling_semantics.sampling_mode == "torch_sampler"
+            ):
+                bsr_mf_sensitivity = self._resolve_bsr_mf_sensitivity_for_fixed_batch(
+                    mechanism_state=mechanism_config.mechanism_state,
+                    sampling_semantics=sampling_semantics,
+                    steps=int(total_steps),
+                    kwargs=kwargs,
+                )
+
+            if mechanism_config.mechanism == "bnb":
+                logger.info(
+                    "bnb init: starting get_noise_multiplier (steps=%s, sample_rate=%.6g, eps=%.6g, delta=%.6g)",
+                    int(total_steps),
+                    float(sample_rate),
+                    float(target_epsilon),
+                    float(target_delta),
+                )
+
+            noise_multiplier = get_noise_multiplier(
+                target_epsilon=target_epsilon,
+                target_delta=target_delta,
+                sample_rate=sample_rate,
+                steps=total_steps,
+                accountant=active_accountant.mechanism(),
+                epsilon_fn=epsilon_fn,
+                mechanism_state=mechanism_config.mechanism_state,
+                sampling_semantics=sampling_semantics,
+                bsr_mf_sensitivity=bsr_mf_sensitivity,
+                **nm_kwargs,
+            )
+
+            if mechanism_config.mechanism == "bnb":
+                logger.info(
+                    "bnb init: get_noise_multiplier done -> sigma=%.6g",
+                    float(noise_multiplier),
+                )
+            return float(noise_multiplier), float(sample_rate)
+
+        sample_rate = 1 / len(data_loader)
+        bsr_mf_sensitivity = None
+        if (
+            mechanism_config.mechanism == "bsr"
+            and epsilon_fn is None
+            and sampling_semantics is not None
+            and sampling_semantics.sampling_mode == "torch_sampler"
+        ):
+            implied_steps = int(epochs / sample_rate)
+            bsr_mf_sensitivity = self._resolve_bsr_mf_sensitivity_for_fixed_batch(
+                mechanism_state=mechanism_config.mechanism_state,
+                sampling_semantics=sampling_semantics,
+                steps=implied_steps,
+                kwargs=kwargs,
+            )
+
+        if mechanism_config.mechanism == "bnb":
+            logger.info(
+                "bnb init: starting get_noise_multiplier (epochs=%s, sample_rate=%.6g, eps=%.6g, delta=%.6g)",
+                int(epochs),
+                float(sample_rate),
+                float(target_epsilon),
+                float(target_delta),
+            )
+        noise_multiplier = get_noise_multiplier(
+            target_epsilon=target_epsilon,
+            target_delta=target_delta,
+            sample_rate=sample_rate,
+            epochs=epochs,
+            accountant=active_accountant.mechanism(),
+            epsilon_fn=epsilon_fn,
+            mechanism_state=mechanism_config.mechanism_state,
+            sampling_semantics=sampling_semantics,
+            bsr_mf_sensitivity=bsr_mf_sensitivity,
+            **nm_kwargs,
+        )
+        if mechanism_config.mechanism == "bnb":
+            logger.info(
+                "bnb init: get_noise_multiplier done -> sigma=%.6g",
+                float(noise_multiplier),
+            )
+
+        return float(noise_multiplier), float(sample_rate)
+
+    @staticmethod
+    def _build_bnb_sigma_candidates(
+        *,
+        noise_multiplier: float,
+        kwargs: Dict[str, Any],
+    ) -> List[float]:
+        candidate_sigmas = kwargs.get("bnb_candidate_sigmas")
+        if candidate_sigmas is not None:
+            return [float(s) for s in candidate_sigmas]
+
+        if bool(kwargs.get("bnb_evr_use_candidate_ladder", True)):
+            multipliers = kwargs.get(
+                "bnb_candidate_multipliers",
+                (1.0, 1.1, 1.25, 1.5, 2.0),
+            )
+            return sorted(
+                {
+                    max(1e-12, float(noise_multiplier) * float(m))
+                    for m in multipliers
+                    if float(m) > 0.0
+                }
+            )
+
+        return [float(noise_multiplier)]
+
+    @staticmethod
+    def _validate_bnb_sigma_candidates(
+        *,
+        sigma_candidates: List[float],
+        calibrated_sigma: float,
+    ) -> None:
+        if len(sigma_candidates) == 0:
+            raise ValueError("bnb candidate sigma ladder must contain positive values")
+        if any(
+            float(sigma_candidates[i]) >= float(sigma_candidates[i + 1])
+            for i in range(len(sigma_candidates) - 1)
+        ):
+            raise ValueError("candidate_sigmas must be strictly increasing")
+        if any(float(s) < calibrated_sigma for s in sigma_candidates):
+            raise ValueError(
+                "bnb candidate sigma ladder must not include values below the "
+                "accountant-calibrated sigma"
+            )
+
+    @staticmethod
+    def _build_bnb_llr_samples_seq_fn(
+        *,
+        c_matrix: torch.Tensor,
+        bands: int,
+        num_samples: int,
+        seed: int,
+        num_checks: int,
+        reduce_dimensionality: bool,
+        check_timeout,
+        reverse: bool,
+    ):
+        def _llr_samples_seq_for_sigma(sigma: float):
+            out = []
+            for i in range(num_checks):
+                direction = "reverse" if reverse else "forward"
+                check_timeout(stage=f"{direction}_llr_sigma={sigma:.6g}_check={i+1}/{num_checks}")
+                llr = sample_b_min_sep_llr(
+                    c_matrix=c_matrix,
+                    bands=int(bands),
+                    sigma=float(sigma),
+                    num_samples=num_samples,
+                    seed=seed + i,
+                    reduce_dimensionality=reduce_dimensionality,
+                )
+                out.append(-llr if reverse else llr)
+            return out
+
+        return _llr_samples_seq_for_sigma
+
+    @staticmethod
+    def _select_bnb_sigma_with_evr(
+        *,
+        sigma_candidates: List[float],
+        llr_samples_seq_fn_forward,
+        llr_samples_seq_fn_reverse,
+        target_epsilon: float,
+        target_delta: float,
+        confidence_alpha_total: float,
+        verify_both_directions: bool,
+    ):
+        if verify_both_directions:
+            return select_evr_candidate_ladder_two_sided(
+                candidate_sigmas=sigma_candidates,
+                llr_samples_seq_fn_forward=llr_samples_seq_fn_forward,
+                llr_samples_seq_fn_reverse=llr_samples_seq_fn_reverse,
+                epsilon=float(target_epsilon),
+                target_delta=float(target_delta),
+                total_confidence_alpha=confidence_alpha_total,
+            )
+        return select_evr_candidate_ladder(
+            candidate_sigmas=sigma_candidates,
+            llr_samples_seq_fn=llr_samples_seq_fn_forward,
+            epsilon=float(target_epsilon),
+            target_delta=float(target_delta),
+            total_confidence_alpha=confidence_alpha_total,
+        )
+
+    def _calibrate_bnb_noise_multiplier_with_evr(
+        self,
+        *,
+        mechanism: str,
+        epsilon_fn,
+        bnb_c_matrix: Optional[torch.Tensor],
+        bnb_bands: Optional[int],
+        noise_multiplier: float,
+        target_epsilon: float,
+        target_delta: float,
+        kwargs: Dict[str, Any],
+    ) -> Tuple[float, Optional[Dict[str, Any]]]:
+        if (
+            mechanism != "bnb"
+            or epsilon_fn is not None
+            or bnb_c_matrix is None
+            or bnb_bands is None
+        ):
+            return float(noise_multiplier), None
+
+        calibration_start = time.monotonic()
+        timeout_seconds = float(kwargs.get("bnb_calibration_timeout_seconds", 10.0))
+        if timeout_seconds <= 0.0:
+            raise ValueError("bnb_calibration_timeout_seconds must be > 0")
+
+        deadline = calibration_start + timeout_seconds
+
+        def _check_timeout(*, stage: str) -> None:
+            now = time.monotonic()
+            if now > deadline:
+                elapsed = now - calibration_start
+
+                raise TimeoutError(
+                    "bnb calibration timed out "
+                    f"after {elapsed:.2f}s at stage='{stage}' "
+                    f"(timeout={timeout_seconds:.2f}s). "
+                    "Tune bnb_num_samples/bnb_evr_num_checks/candidate ladder."
+                )
+
+        num_samples = int(kwargs.get("bnb_num_samples", 100_000))
+        seed = int(kwargs.get("bnb_seed", 0))
+        reduce_dimensionality = bool(kwargs.get("bnb_reduce_dimensionality", False))
+        confidence_alpha_total = float(kwargs.get("bnb_confidence_alpha", 1e-6))
+        num_checks = int(kwargs.get("bnb_evr_num_checks", 3))
+        verify_both_directions = bool(kwargs.get("bnb_verify_both_directions", True))
+
+        sigma_candidates = self._build_bnb_sigma_candidates(
+            noise_multiplier=float(noise_multiplier),
+            kwargs=kwargs,
+        )
+        self._validate_bnb_sigma_candidates(
+            sigma_candidates=sigma_candidates,
+            calibrated_sigma=float(noise_multiplier),
+        )
+
+        logger.info(
+            "bnb calibration start: candidates=%d checks=%d samples=%d timeout=%.2fs",
+            len(sigma_candidates),
+            num_checks,
+            num_samples,
+            timeout_seconds,
+        )
+
+        llr_samples_seq_fn_forward = self._build_bnb_llr_samples_seq_fn(
+            c_matrix=bnb_c_matrix,
+            bands=int(bnb_bands),
+            num_samples=num_samples,
+            seed=seed,
+            num_checks=num_checks,
+            reduce_dimensionality=reduce_dimensionality,
+            check_timeout=_check_timeout,
+            reverse=False,
+        )
+
+        llr_samples_seq_fn_reverse = self._build_bnb_llr_samples_seq_fn(
+            c_matrix=bnb_c_matrix,
+            bands=int(bnb_bands),
+            num_samples=num_samples,
+            seed=seed + num_checks,
+            num_checks=num_checks,
+            reduce_dimensionality=reduce_dimensionality,
+            check_timeout=_check_timeout,
+            reverse=True,
+        )
+
+        try:
+            _check_timeout(stage="before_evr_selection")
+            (
+                selected_sigma,
+                verification,
+                evr_pass_count,
+                evr_per_check_alpha,
+            ) = self._select_bnb_sigma_with_evr(
+                sigma_candidates=sigma_candidates,
+                llr_samples_seq_fn_forward=llr_samples_seq_fn_forward,
+                llr_samples_seq_fn_reverse=llr_samples_seq_fn_reverse,
+                target_epsilon=float(target_epsilon),
+                target_delta=float(target_delta),
+                confidence_alpha_total=float(confidence_alpha_total),
+                verify_both_directions=verify_both_directions,
+            )
+        except TimeoutError as exc:
+            raise ValueError(str(exc)) from exc
+
+        logger.info(
+            "bnb calibration done in %.2fs: selected_sigma=%.6g pass=%s",
+            time.monotonic() - calibration_start,
+            float(selected_sigma),
+            bool(verification.accepted),
+        )
+
+        if bool(kwargs.get("bnb_require_evr_pass", True)) and not verification.accepted:
+            raise ValueError(
+                "bnb verification guard failed for calibrated noise multiplier; "
+                "increase noise, sample budget, or loosen targets"
+            )
+
+        total_checks_reported = int(2 * num_checks) if verify_both_directions else int(num_checks)
+        noise_multiplier = float(selected_sigma)
+        bnb_calibration_report = make_bnb_calibration_report(
+            target_epsilon=float(target_epsilon),
+            target_delta=float(target_delta),
+            noise_multiplier=float(noise_multiplier),
+            num_samples=int(num_samples),
+            seed=int(seed),
+            bands=int(bnb_bands),
+            verification=verification,
+            evr_confidence_alpha_total=float(confidence_alpha_total),
+            evr_num_checks=int(total_checks_reported),
+            evr_per_check_alpha=float(evr_per_check_alpha),
+            evr_pass_count=int(evr_pass_count),
+        ).to_dict()
+
+        return float(noise_multiplier), bnb_calibration_report
+
+    @staticmethod
+    def _apply_correlated_runtime_calibration(
+        *,
+        mechanism_config: NoiseMechanismConfig,
+        max_grad_norm: Union[float, List[float]],
+        noise_multiplier: float,
+        correlated_denominator: Optional[float],
+        bnb_calibration_report: Optional[Dict[str, Any]],
+    ) -> NoiseMechanismConfig:
+        if mechanism_config.mechanism not in ("bsr", "bnb"):
+            return mechanism_config
+
+        if isinstance(max_grad_norm, list):
+            raise ValueError(
+                f"{mechanism_config.mechanism} calibration requires scalar "
+                "max_grad_norm under flat clipping"
+            )
+
+        state = copy.deepcopy(mechanism_config.mechanism_state)
+        state["z_std"] = calibrate_bsr_z_std(
+            noise_multiplier_ref=float(noise_multiplier),
+            max_grad_norm=float(max_grad_norm),
+            denominator=float(correlated_denominator),
+        )
+
+        if bnb_calibration_report is not None:
+            state["_bnb_calibration_report"] = bnb_calibration_report
+
+        return NoiseMechanismConfig(
+            mechanism=mechanism_config.mechanism,
+            accounting_mode=mechanism_config.accounting_mode,
+            mechanism_state=state,
+        )
+
     def _prepare_data_loader(
         self,
         data_loader: DataLoader,
@@ -864,52 +1415,12 @@ class PrivacyEngine:
             raise ValueError("Passing seed is prohibited in secure mode")
 
         mechanism_config = noise_mechanism_config or NoiseMechanismConfig()
-        if mechanism_config.mechanism == "bsr" and poisson_sampling:
-            raise ValueError(
-                "bsr mechanism requires fixed-batch semantics; "
-                "set poisson_sampling=False"
-            )
-
-        if mechanism_config.mechanism == "bnb" and poisson_sampling:
-            raise ValueError(
-                "bnb mechanism requires explicit non-Poisson sampling semantics; "
-                "set poisson_sampling=False and provide sampling_semantics"
-            )
-
-        if mechanism_config.mechanism == "bnb" and sampling_semantics is None:
-            raise ValueError(
-                "bnb mechanism requires explicit sampling_semantics "
-                "in {'b_min_sep', 'balls_in_bins'}"
-            )
-
-        self._validate_bnb_sampling_policy(
+        self._validate_mechanism_sampling_compatibility(
+            mechanism_config=mechanism_config,
+            poisson_sampling=poisson_sampling,
             sampling_semantics=sampling_semantics,
-            mechanism=mechanism_config.mechanism,
+            validate_cyclic_poisson_mode=True,
         )
-
-        if (
-            sampling_semantics is not None
-            and sampling_semantics.sampling_mode == "b_min_sep"
-            and mechanism_config.mechanism != "bnb"
-        ):
-            raise ValueError(
-                "b_min_sep sampling is supported only for mechanism='bnb'"
-            )
-        if (
-            sampling_semantics is not None
-            and sampling_semantics.sampling_mode == "balls_in_bins"
-            and mechanism_config.mechanism != "bnb"
-        ):
-            raise ValueError(
-                "balls_in_bins sampling is supported only for mechanism='bnb'"
-            )
-
-        if (
-            sampling_semantics is not None
-            and sampling_semantics.sampling_mode == "cyclic_poisson"
-            and mechanism_config.mechanism != "bsr"
-        ):
-            raise ValueError("cyclic_poisson sampling is supported only for mechanism='bsr'")
 
         if noise_mechanism_config is not None and "noise_mechanism" in kwargs:
             raise ValueError(
@@ -976,37 +1487,12 @@ class PrivacyEngine:
         )
 
         if total_steps:
-            sampling_mode = (
-                sampling_semantics.sampling_mode
-                if sampling_semantics is not None
-                else None
+            sample_rate = self._resolve_total_steps_sample_rate(
+                poisson_sampling=poisson_sampling,
+                sampling_semantics=sampling_semantics,
+                batch_size=batch_size,
+                dataset_size=len(data_loader.dataset),
             )
-            if not poisson_sampling and sampling_mode in (None, "torch_sampler"):
-                raise ValueError(
-                    "Setting total_steps with non-Poisson sampling requires "
-                    "explicit sampling_semantics in {'cyclic_poisson', 'b_min_sep', 'balls_in_bins'}"
-                )
-
-            if not poisson_sampling and sampling_mode == "b_min_sep":
-                p = sampling_semantics.privacy_metadata.get("p")
-                if p is None:
-                    raise ValueError(
-                        "b_min_sep sampling requires privacy_metadata['p']"
-                    )
-                sample_rate = float(p)
-            elif not poisson_sampling and sampling_mode == "balls_in_bins":
-                bins = sampling_semantics.privacy_metadata.get("bins")
-                if bins is None:
-                    bins = sampling_semantics.privacy_metadata.get("b")
-                if bins is None:
-                    raise ValueError(
-                        "balls_in_bins sampling requires privacy_metadata['bins'] "
-                        "(or legacy key 'b')"
-                    )
-                sample_rate = 1.0 / float(int(bins))
-            else:
-                # For Poisson and cyclic_poisson, q follows the batch-size ratio.
-                sample_rate = batch_size / len(data_loader.dataset)
         else:
             sample_rate = 1 / len(data_loader)
 
@@ -1165,60 +1651,20 @@ class PrivacyEngine:
             default_accountant=self.default_accountant,
         )
 
-        if mechanism_config.mechanism == "bsr" and poisson_sampling:
-            raise ValueError(
-                "bsr mechanism requires fixed-batch semantics; "
-                "set poisson_sampling=False"
-            )
-
-        if mechanism_config.mechanism == "bnb" and poisson_sampling:
-            raise ValueError(
-                "bnb mechanism requires explicit non-Poisson sampling semantics; "
-                "set poisson_sampling=False and provide sampling_semantics"
-            )
-
-        if mechanism_config.mechanism == "bnb" and sampling_semantics is None:
-            raise ValueError(
-                "bnb mechanism requires explicit sampling_semantics "
-                "in {'b_min_sep', 'balls_in_bins'}"
-            )
-
-        self._validate_bnb_sampling_policy(
+        self._validate_mechanism_sampling_compatibility(
+            mechanism_config=mechanism_config,
+            poisson_sampling=poisson_sampling,
             sampling_semantics=sampling_semantics,
-            mechanism=mechanism_config.mechanism,
+            validate_cyclic_poisson_mode=False,
         )
 
-        if (
-            sampling_semantics is not None
-            and sampling_semantics.sampling_mode == "b_min_sep"
-            and mechanism_config.mechanism != "bnb"
-        ):
-            raise ValueError(
-                "b_min_sep sampling is supported only for mechanism='bnb'"
-            )
-        if (
-            sampling_semantics is not None
-            and sampling_semantics.sampling_mode == "balls_in_bins"
-            and mechanism_config.mechanism != "bnb"
-        ):
-            raise ValueError(
-                "balls_in_bins sampling is supported only for mechanism='bnb'"
-            )
-
-        local_sampling_semantics = sampling_semantics
-        if mechanism_config.mechanism == "bsr" and local_sampling_semantics is None:
-            if total_steps:
-                local_sample_rate = data_loader.batch_size / len(data_loader.dataset)
-            else:
-                local_sample_rate = 1 / len(data_loader)
-
-            local_sampling_semantics = self._build_sampling_semantics(
-                poisson_sampling=poisson_sampling,
-                sample_rate=local_sample_rate,
-                expected_batch_size=data_loader.batch_size,
-                distributed=False,
-                explicit_sampling_semantics=None,
-            )
+        local_sampling_semantics = self._resolve_local_sampling_semantics_for_epsilon(
+            mechanism=mechanism_config.mechanism,
+            sampling_semantics=sampling_semantics,
+            poisson_sampling=poisson_sampling,
+            total_steps=total_steps,
+            data_loader=data_loader,
+        )
 
         correlated_denominator = None
         if mechanism_config.mechanism in ("bsr", "bnb"):
@@ -1228,346 +1674,45 @@ class PrivacyEngine:
                 data_loader=data_loader,
             )
 
-        bsr_mf_sensitivity = None
-        bnb_c_matrix = None
-        bnb_bands = None
-        bnb_c_matrix_contract = None
+        bnb_c_matrix, bnb_bands, _ = self._resolve_bnb_runtime_inputs_for_epsilon(
+            mechanism_config=mechanism_config,
+            sampling_semantics=local_sampling_semantics,
+            epsilon_fn=epsilon_fn,
+            kwargs=kwargs,
+        )
 
-        if mechanism_config.mechanism == "bnb" and epsilon_fn is None:
-            if (
-                local_sampling_semantics is None
-                or local_sampling_semantics.sampling_mode != "b_min_sep"
-            ):
-                raise ValueError(
-                    "bnb non-callback calibration currently requires "
-                    "sampling_mode='b_min_sep'"
-                )
+        noise_multiplier, _ = self._resolve_noise_multiplier_for_target_epsilon(
+            mechanism_config=mechanism_config,
+            active_accountant=active_accountant,
+            target_epsilon=target_epsilon,
+            target_delta=target_delta,
+            total_steps=total_steps,
+            epochs=epochs,
+            poisson_sampling=poisson_sampling,
+            data_loader=data_loader,
+            sampling_semantics=local_sampling_semantics,
+            epsilon_fn=epsilon_fn,
+            kwargs=kwargs,
+        )
 
-            bnb_c_matrix, bnb_bands, bnb_c_matrix_contract = self._resolve_bnb_b_min_sep_inputs(
-                mechanism_state=mechanism_config.mechanism_state,
-                sampling_semantics=local_sampling_semantics,
-                kwargs=kwargs,
-            )
+        noise_multiplier, bnb_calibration_report = self._calibrate_bnb_noise_multiplier_with_evr(
+            mechanism=mechanism_config.mechanism,
+            epsilon_fn=epsilon_fn,
+            bnb_c_matrix=bnb_c_matrix,
+            bnb_bands=bnb_bands,
+            noise_multiplier=float(noise_multiplier),
+            target_epsilon=target_epsilon,
+            target_delta=target_delta,
+            kwargs=kwargs,
+        )
 
-            self._validate_bnb_accounting_runtime_consistency(
-                mechanism_state=mechanism_config.mechanism_state,
-                sampling_semantics=local_sampling_semantics,
-                c_matrix=bnb_c_matrix,
-                bands=int(bnb_bands),
-                c_matrix_contract=bnb_c_matrix_contract,
-            )
-
-        if total_steps:
-            sampling_mode = (
-                local_sampling_semantics.sampling_mode
-                if local_sampling_semantics is not None
-                else None
-            )
-            if not poisson_sampling and sampling_mode in (None, "torch_sampler"):
-                raise ValueError(
-                    "Setting total_steps with non-Poisson sampling requires "
-                    "explicit sampling_semantics in {'cyclic_poisson', 'b_min_sep', 'balls_in_bins'}"
-                )
-
-            if epochs is not None:
-                raise ValueError(
-                    "make_private_with_epsilon takes as input EITHER a number of steps or a number of epochs"
-                )
-
-            if not poisson_sampling and sampling_mode == "b_min_sep":
-                p = local_sampling_semantics.privacy_metadata.get("p")
-                if p is None:
-                    raise ValueError(
-                        "b_min_sep sampling requires privacy_metadata['p']"
-                    )
-                sample_rate = float(p)
-            elif not poisson_sampling and sampling_mode == "balls_in_bins":
-                bins = local_sampling_semantics.privacy_metadata.get("bins")
-                if bins is None:
-                    bins = local_sampling_semantics.privacy_metadata.get("b")
-                if bins is None:
-                    raise ValueError(
-                        "balls_in_bins sampling requires privacy_metadata['bins'] "
-                        "(or legacy key 'b')"
-                    )
-                sample_rate = 1.0 / float(int(bins))
-            else:
-                # For Poisson and cyclic_poisson, q follows the batch-size ratio.
-                sample_rate = data_loader.batch_size / len(data_loader.dataset)
-            if (
-                mechanism_config.mechanism == "bsr"
-                and epsilon_fn is None
-                and local_sampling_semantics is not None
-                and local_sampling_semantics.sampling_mode == "torch_sampler"
-            ):
-                bsr_mf_sensitivity = self._resolve_bsr_mf_sensitivity_for_fixed_batch(
-                    mechanism_state=mechanism_config.mechanism_state,
-                    sampling_semantics=local_sampling_semantics,
-                    steps=int(total_steps),
-                    kwargs=kwargs,
-                )
-
-            nm_kwargs = dict(kwargs)
-            nm_kwargs.pop("bsr_mf_sensitivity", None)
-            if mechanism_config.mechanism == "bnb":
-                logger.info(
-                    "bnb init: starting get_noise_multiplier (steps=%s, sample_rate=%.6g, eps=%.6g, delta=%.6g)",
-                    int(total_steps),
-                    float(sample_rate),
-                    float(target_epsilon),
-                    float(target_delta),
-                )
-            noise_multiplier = get_noise_multiplier(
-                target_epsilon=target_epsilon,
-                target_delta=target_delta,
-                sample_rate=sample_rate,
-                steps=total_steps,
-                accountant=active_accountant.mechanism(),
-                epsilon_fn=epsilon_fn,
-                mechanism_state=mechanism_config.mechanism_state,
-                sampling_semantics=local_sampling_semantics,
-                bsr_mf_sensitivity=bsr_mf_sensitivity,
-                **nm_kwargs,
-            )
-            if mechanism_config.mechanism == "bnb":
-                logger.info(
-                    "bnb init: get_noise_multiplier done -> sigma=%.6g",
-                    float(noise_multiplier),
-                )
-        else:
-            sample_rate = 1 / len(data_loader)
-            if (
-                mechanism_config.mechanism == "bsr"
-                and epsilon_fn is None
-                and local_sampling_semantics is not None
-                and local_sampling_semantics.sampling_mode == "torch_sampler"
-            ):
-                implied_steps = int(epochs / sample_rate)
-                bsr_mf_sensitivity = self._resolve_bsr_mf_sensitivity_for_fixed_batch(
-                    mechanism_state=mechanism_config.mechanism_state,
-                    sampling_semantics=local_sampling_semantics,
-                    steps=implied_steps,
-                    kwargs=kwargs,
-                )
-
-            nm_kwargs = dict(kwargs)
-            nm_kwargs.pop("bsr_mf_sensitivity", None)
-            if mechanism_config.mechanism == "bnb":
-                logger.info(
-                    "bnb init: starting get_noise_multiplier (epochs=%s, sample_rate=%.6g, eps=%.6g, delta=%.6g)",
-                    int(epochs),
-                    float(sample_rate),
-                    float(target_epsilon),
-                    float(target_delta),
-                )
-            noise_multiplier = get_noise_multiplier(
-                target_epsilon=target_epsilon,
-                target_delta=target_delta,
-                sample_rate=sample_rate,
-                epochs=epochs,
-                accountant=active_accountant.mechanism(),
-                epsilon_fn=epsilon_fn,
-                mechanism_state=mechanism_config.mechanism_state,
-                sampling_semantics=local_sampling_semantics,
-                bsr_mf_sensitivity=bsr_mf_sensitivity,
-                **nm_kwargs,
-            )
-            if mechanism_config.mechanism == "bnb":
-                logger.info(
-                    "bnb init: get_noise_multiplier done -> sigma=%.6g",
-                    float(noise_multiplier),
-                )
-
-        bnb_calibration_report = None
-        if (
-            mechanism_config.mechanism == "bnb"
-            and epsilon_fn is None
-            and bnb_c_matrix is not None
-            and bnb_bands is not None
-        ):
-            calibration_start = time.monotonic()
-            timeout_seconds = float(kwargs.get("bnb_calibration_timeout_seconds", 10.0))
-            if timeout_seconds <= 0.0:
-                raise ValueError("bnb_calibration_timeout_seconds must be > 0")
-            deadline = calibration_start + timeout_seconds
-
-            def _check_timeout(*, stage: str) -> None:
-                now = time.monotonic()
-                if now > deadline:
-                    elapsed = now - calibration_start
-                    raise TimeoutError(
-                        "bnb calibration timed out "
-                        f"after {elapsed:.2f}s at stage='{stage}' "
-                        f"(timeout={timeout_seconds:.2f}s). "
-                        "Tune bnb_num_samples/bnb_evr_num_checks/candidate ladder."
-                    )
-
-            num_samples = int(kwargs.get("bnb_num_samples", 100_000))
-            seed = int(kwargs.get("bnb_seed", 0))
-            reduce_dimensionality = bool(kwargs.get("bnb_reduce_dimensionality", False))
-            confidence_alpha_total = float(kwargs.get("bnb_confidence_alpha", 1e-6))
-            num_checks = int(kwargs.get("bnb_evr_num_checks", 3))
-            candidate_sigmas = kwargs.get("bnb_candidate_sigmas")
-
-            if candidate_sigmas is not None:
-                sigma_candidates = [float(s) for s in candidate_sigmas]
-
-            elif bool(kwargs.get("bnb_evr_use_candidate_ladder", True)):
-                multipliers = kwargs.get(
-                    "bnb_candidate_multipliers",
-                    (1.0, 1.1, 1.25, 1.5, 2.0),
-                )
-                sigma_candidates = sorted(
-                    {
-                        max(1e-12, float(noise_multiplier) * float(m))
-                        for m in multipliers
-                        if float(m) > 0.0
-                    }
-                )
-            else:
-                sigma_candidates = [float(noise_multiplier)]
-
-            if len(sigma_candidates) == 0:
-                raise ValueError("bnb candidate sigma ladder must contain positive values")
-            if any(
-                float(sigma_candidates[i]) >= float(sigma_candidates[i + 1])
-                for i in range(len(sigma_candidates) - 1)
-            ):
-                raise ValueError("candidate_sigmas must be strictly increasing")
-
-            calibrated_sigma = float(noise_multiplier)
-            if any(float(s) < calibrated_sigma for s in sigma_candidates):
-                raise ValueError(
-                    "bnb candidate sigma ladder must not include values below the "
-                    "accountant-calibrated sigma"
-                )
-            logger.info(
-                "bnb calibration start: candidates=%d checks=%d samples=%d timeout=%.2fs",
-                len(sigma_candidates),
-                num_checks,
-                num_samples,
-                timeout_seconds,
-            )
-
-            def _llr_samples_seq_for_sigma_forward(sigma: float):
-                out = []
-                for i in range(num_checks):
-                    _check_timeout(
-                        stage=f"forward_llr_sigma={sigma:.6g}_check={i+1}/{num_checks}"
-                    )
-                    out.append(
-                        sample_b_min_sep_llr(
-                            c_matrix=bnb_c_matrix,
-                            bands=int(bnb_bands),
-                            sigma=float(sigma),
-                            num_samples=num_samples,
-                            seed=seed + i,
-                            reduce_dimensionality=reduce_dimensionality,
-                        )
-                    )
-                return out
-
-            def _llr_samples_seq_for_sigma_reverse(sigma: float):
-                # Reverse direction uses independent sample streams via seed offset.
-                out = []
-                for i in range(num_checks):
-                    _check_timeout(
-                        stage=f"reverse_llr_sigma={sigma:.6g}_check={i+1}/{num_checks}"
-                    )
-                    out.append(
-                        -sample_b_min_sep_llr(
-                            c_matrix=bnb_c_matrix,
-                            bands=int(bnb_bands),
-                            sigma=float(sigma),
-                            num_samples=num_samples,
-                            seed=seed + num_checks + i,
-                            reduce_dimensionality=reduce_dimensionality,
-                        )
-                    )
-                return out
-
-            try:
-                _check_timeout(stage="before_evr_selection")
-                (
-                    selected_sigma,
-                    verification,
-                    evr_pass_count,
-                    evr_per_check_alpha,
-                ) = (
-                    select_evr_candidate_ladder_two_sided(
-                        candidate_sigmas=sigma_candidates,
-                        llr_samples_seq_fn_forward=_llr_samples_seq_for_sigma_forward,
-                        llr_samples_seq_fn_reverse=_llr_samples_seq_for_sigma_reverse,
-                        epsilon=float(target_epsilon),
-                        target_delta=float(target_delta),
-                        total_confidence_alpha=confidence_alpha_total,
-                    )
-                    if bool(kwargs.get("bnb_verify_both_directions", True))
-                    else select_evr_candidate_ladder(
-                        candidate_sigmas=sigma_candidates,
-                        llr_samples_seq_fn=_llr_samples_seq_for_sigma_forward,
-                        epsilon=float(target_epsilon),
-                        target_delta=float(target_delta),
-                        total_confidence_alpha=confidence_alpha_total,
-                    )
-                )
-            except TimeoutError as exc:
-                raise ValueError(str(exc)) from exc
-            logger.info(
-                "bnb calibration done in %.2fs: selected_sigma=%.6g pass=%s",
-                time.monotonic() - calibration_start,
-                float(selected_sigma),
-                bool(verification.accepted),
-            )
-            total_checks_reported = (
-                int(2 * num_checks)
-                if bool(kwargs.get("bnb_verify_both_directions", True))
-                else int(num_checks)
-            )
-
-            noise_multiplier = float(selected_sigma)
-            if bool(kwargs.get("bnb_require_evr_pass", True)) and not verification.accepted:
-                raise ValueError(
-                    "bnb verification guard failed for calibrated noise multiplier; "
-                    "increase noise, sample budget, or loosen targets"
-                )
-
-            bnb_calibration_report = make_bnb_calibration_report(
-                target_epsilon=float(target_epsilon),
-                target_delta=float(target_delta),
-                noise_multiplier=float(noise_multiplier),
-                num_samples=int(num_samples),
-                seed=int(seed),
-                bands=int(bnb_bands),
-                verification=verification,
-                evr_confidence_alpha_total=float(confidence_alpha_total),
-                evr_num_checks=int(total_checks_reported),
-                evr_per_check_alpha=float(evr_per_check_alpha),
-                evr_pass_count=int(evr_pass_count),
-            ).to_dict()
-
-        if mechanism_config.mechanism in ("bsr", "bnb"):
-            if isinstance(max_grad_norm, list):
-                raise ValueError(
-                    f"{mechanism_config.mechanism} calibration requires scalar "
-                    "max_grad_norm under flat clipping"
-                )
-
-            state = copy.deepcopy(mechanism_config.mechanism_state)
-            state["z_std"] = calibrate_bsr_z_std(
-                noise_multiplier_ref=float(noise_multiplier),
-                max_grad_norm=float(max_grad_norm),
-                denominator=float(correlated_denominator),
-            )
-
-            if bnb_calibration_report is not None:
-                state["_bnb_calibration_report"] = bnb_calibration_report
-
-            mechanism_config = NoiseMechanismConfig(
-                mechanism=mechanism_config.mechanism,
-                accounting_mode=mechanism_config.accounting_mode,
-                mechanism_state=state,
-            )
+        mechanism_config = self._apply_correlated_runtime_calibration(
+            mechanism_config=mechanism_config,
+            max_grad_norm=max_grad_norm,
+            noise_multiplier=float(noise_multiplier),
+            correlated_denominator=correlated_denominator,
+            bnb_calibration_report=bnb_calibration_report,
+        )
 
         if len(active_accountant) > 0:
             warnings.warn(

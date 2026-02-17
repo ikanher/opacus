@@ -48,38 +48,46 @@ __all__ = [
 
 def get_optimizer_class(clipping: str, distributed: bool, grad_sample_mode: str = None):
     if grad_sample_mode == "ghost":
-        if clipping == "flat" and distributed is False:
-            return DPOptimizerFastGradientClipping
-        elif clipping == "flat" and distributed is True:
-            return DistributedDPOptimizerFastGradientClipping
-        else:
+        if clipping != "flat":
             raise ValueError(
                 f"Unsupported combination of parameters. Clipping: {clipping} and grad_sample_mode: {grad_sample_mode}"
             )
-    elif grad_sample_mode == "ghost_fsdp":
-        if clipping == "flat" and distributed is True:
+
+        return (
+            DistributedDPOptimizerFastGradientClipping
+            if distributed
+            else DPOptimizerFastGradientClipping
+        )
+
+    if grad_sample_mode == "ghost_fsdp":
+        if clipping == "flat" and distributed:
             return FSDPOptimizerFastGradientClipping
-        else:
-            raise ValueError(
-                f"Unsupported combination of parameters. Clipping: {clipping}, distributed: {distributed}, and grad_sample_mode: {grad_sample_mode}"
-            )
-    elif clipping == "flat" and distributed is False:
-        return DPOptimizer
-    elif clipping == "flat" and distributed is True:
-        return DistributedDPOptimizer
-    elif clipping == "per_layer" and distributed is False:
-        return DPPerLayerOptimizer
-    elif clipping == "per_layer" and distributed is True:
-        if grad_sample_mode == "hooks" or grad_sample_mode == "ew":
+
+        raise ValueError(
+            f"Unsupported combination of parameters. Clipping: {clipping}, distributed: {distributed}, and grad_sample_mode: {grad_sample_mode}"
+        )
+
+    if clipping == "flat":
+        return DistributedDPOptimizer if distributed else DPOptimizer
+
+    if clipping == "per_layer":
+        if not distributed:
+            return DPPerLayerOptimizer
+
+        if grad_sample_mode in ("hooks", "ew"):
             return SimpleDistributedPerLayerOptimizer
-        else:
-            raise ValueError(f"Unexpected grad_sample_mode: {grad_sample_mode}")
-    elif clipping == "adaptive" and distributed is False:
+
+        raise ValueError(f"Unexpected grad_sample_mode: {grad_sample_mode}")
+
+    if clipping == "adaptive" and not distributed:
         return AdaClipDPOptimizer
-    elif clipping == "auto" and distributed is True:
-        return DistributedAutoClipOptimizer
-    elif clipping == "auto" and distributed is False:
+
+    if clipping == "auto":
+        if distributed:
+            return DistributedAutoClipOptimizer
+
         raise ValueError("Automatic clipping is only implemented for distributed.")
+
     raise ValueError(
         f"Unexpected optimizer parameters. Clipping: {clipping}, distributed: {distributed}"
     )

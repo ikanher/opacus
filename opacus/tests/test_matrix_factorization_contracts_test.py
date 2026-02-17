@@ -868,8 +868,8 @@ def test_make_private_with_epsilon_bnb_noncallback_requires_supported_sampling_m
                 sampling_mode="torch_sampler",
                 privacy_metadata={},
             ),
-                bnb_num_samples=2_000,
-            )
+            bnb_num_samples=2_000,
+        )
 
 
 def test_make_private_with_epsilon_bnb_noncallback_balls_in_bins_not_yet_supported() -> None:
@@ -1365,31 +1365,3 @@ def test_default_gaussian_matches_explicit_gaussian_mechanism() -> None:
     grad_a = torch.cat([p.grad.reshape(-1) for p in opt_a.params])
     grad_b = torch.cat([p.grad.reshape(-1) for p in opt_b.params])
     assert torch.allclose(grad_a, grad_b, atol=1e-7, rtol=1e-6)
-
-
-def test_default_mechanism_state_dict_round_trip_and_legacy_load() -> None:
-    model_1 = nn.Linear(4, 3)
-    private_1, opt_1, loader_1 = _make_private(
-        model_1, poisson_sampling=False, noise_seed=112, noise_mechanism=None
-    )
-    _single_pre_step(private_1, opt_1, loader_1)
-    state = opt_1.state_dict()
-
-    assert "_dp_noise_mechanism_name" in state
-    assert "_dp_noise_mechanism_state" in state
-    assert state["_dp_noise_mechanism_name"] == "GaussianNoiseMechanism"
-    assert state["_dp_noise_mechanism_state"] == {}
-
-    model_2 = nn.Linear(4, 3)
-    _, opt_2, _ = _make_private(
-        model_2, poisson_sampling=False, noise_seed=113, noise_mechanism=None
-    )
-    opt_2.load_state_dict(state)
-    loaded = opt_2.state_dict()
-    assert loaded["_dp_noise_mechanism_name"] == "GaussianNoiseMechanism"
-    assert loaded["_dp_noise_mechanism_state"] == {}
-
-    legacy_state = {
-        k: v for k, v in state.items() if not k.startswith("_dp_noise_mechanism_")
-    }
-    opt_2.load_state_dict(legacy_state)

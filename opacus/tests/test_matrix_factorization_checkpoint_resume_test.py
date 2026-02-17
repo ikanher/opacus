@@ -129,7 +129,6 @@ def test_missing_correlated_mechanism_state_fails_loudly() -> None:
 
 def test_checkpoint_load_preserves_bnb_report_and_sampling_metadata() -> None:
     model = nn.Linear(4, 3)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
     private_model, dp_optimizer, _loader_, _ = _make_private(
         model,
