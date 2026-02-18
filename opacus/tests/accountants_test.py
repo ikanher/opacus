@@ -167,42 +167,19 @@ class AccountantRegistryTest(unittest.TestCase):
 
 
 class AccountingTest(unittest.TestCase):
-    def test_bnb_accountant_requires_epsilon_fn(self) -> None:
+    def test_bnb_accountant_requires_builtin_inputs(self) -> None:
         accountant = BNBAccountant()
         accountant.history = [(1.0, 0.1, 10)]
         with self.assertRaisesRegex(
-            ValueError, "requires epsilon_fn|currently disabled"
+            ValueError, "built-in calibration requires"
         ):
             accountant.get_epsilon(delta=1e-5)
-
-    def test_bnb_accountant_callback_path(self) -> None:
-        accountant = BNBAccountant()
-        accountant.history = [(1.5, 0.05, 12), (1.5, 0.05, 8)]
-        calls = []
-
-        def epsilon_fn(
-            *,
-            noise_multiplier: float,
-            target_delta: float,
-            sample_rate: float,
-            steps: int,
-            mechanism: str,
-            **kwargs,
-        ) -> float:
-            calls.append((noise_multiplier, target_delta, sample_rate, steps, mechanism))
-            return 0.123
-
-        eps = accountant.get_epsilon(delta=1e-5, epsilon_fn=epsilon_fn)
-        self.assertAlmostEqual(eps, 0.123)
-        self.assertTrue(calls)
-        self.assertEqual(calls[-1][-1], "bnb")
-        self.assertEqual(calls[-1][3], 20)
 
     def test_bnb_accountant_rejects_nonconstant_history(self) -> None:
         accountant = BNBAccountant()
         accountant.history = [(1.0, 0.05, 10), (1.2, 0.05, 1)]
         with self.assertRaisesRegex(ValueError, "constant noise_multiplier and sample_rate"):
-            accountant.get_epsilon(delta=1e-5, epsilon_fn=lambda **_: 1.0)
+            accountant.get_epsilon(delta=1e-5)
 
     def test_bnb_accountant_builtin_monte_carlo_path(self) -> None:
         accountant = BNBAccountant()
@@ -334,7 +311,7 @@ class AccountingTest(unittest.TestCase):
                 sampling_semantics=sampling_semantics,
             )
 
-    def test_bnb_accountant_builtin_rejects_non_b_min_sep_sampling_mode(self) -> None:
+    def test_bnb_accountant_builtin_supports_balls_in_bins_sampling_mode(self) -> None:
         accountant = BNBAccountant()
         accountant.history = [(1.0, 0.1, 5)]
         c_matrix = torch.tensor(
@@ -348,16 +325,16 @@ class AccountingTest(unittest.TestCase):
             sampling_mode="balls_in_bins",
             privacy_metadata={"bands": 2},
         )
-        with self.assertRaisesRegex(ValueError, "sampling_mode='b_min_sep'"):
-            accountant.get_epsilon(
-                delta=0.2,
-                mechanism_state={
-                    "c_matrix": c_matrix,
-                    "coeffs": [1.0, 0.2],
-                    "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
-                },
-                sampling_semantics=sampling_semantics,
-            )
+        epsilon = accountant.get_epsilon(
+            delta=0.2,
+            mechanism_state={
+                "c_matrix": c_matrix,
+                "coeffs": [1.0, 0.2],
+                "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+            },
+            sampling_semantics=sampling_semantics,
+        )
+        self.assertTrue(float(epsilon) > 0.0)
 
     def test_bnb_accountant_builtin_monte_carlo_noise_monotonicity_smoke(self) -> None:
         c_matrix = torch.tensor(
@@ -945,19 +922,6 @@ class AccountingTest(unittest.TestCase):
         sample_rate = 0.04
         epsilon = 0.5
         epochs = 1
-        calls = []
-
-        def epsilon_fn(
-            *,
-            noise_multiplier: float,
-            target_delta: float,
-            sample_rate: float,
-            steps: int,
-            mechanism: str,
-            **kwargs,
-        ) -> float:
-            calls.append((noise_multiplier, target_delta, sample_rate, steps, mechanism))
-            return 1.0 / noise_multiplier
 
         noise_multiplier = get_noise_multiplier(
             target_epsilon=epsilon,
@@ -965,31 +929,23 @@ class AccountingTest(unittest.TestCase):
             sample_rate=sample_rate,
             epochs=epochs,
             accountant="bsr",
-            epsilon_fn=epsilon_fn,
+            bsr_mf_sensitivity=1.0,
         )
 
-        self.assertLess(abs(noise_multiplier - 2.0), 0.1)
-        self.assertTrue(len(calls) > 0)
-        self.assertEqual(calls[-1][-1], "bsr")
+        self.assertGreater(noise_multiplier, 0.0)
 
     def test_get_noise_multiplier_bnb_epochs(self) -> None:
-        delta = 1e-5
+        delta = 0.2
         sample_rate = 0.04
         epsilon = 0.5
         epochs = 1
-        calls = []
-
-        def epsilon_fn(
-            *,
-            noise_multiplier: float,
-            target_delta: float,
-            sample_rate: float,
-            steps: int,
-            mechanism: str,
-            **kwargs,
-        ) -> float:
-            calls.append((noise_multiplier, target_delta, sample_rate, steps, mechanism))
-            return 1.0 / noise_multiplier
+        c_matrix = torch.tensor(
+            [
+                [1.0, 0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0, 1.0],
+            ],
+            dtype=torch.float64,
+        )
 
         noise_multiplier = get_noise_multiplier(
             target_epsilon=epsilon,
@@ -997,14 +953,20 @@ class AccountingTest(unittest.TestCase):
             sample_rate=sample_rate,
             epochs=epochs,
             accountant="bnb",
-            epsilon_fn=epsilon_fn,
+            mechanism_state={
+                "c_matrix": c_matrix,
+                "coeffs": [1.0, 0.2],
+                "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+            },
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="b_min_sep",
+                privacy_metadata={"bands": 2},
+            ),
         )
 
-        self.assertLess(abs(noise_multiplier - 2.0), 0.1)
-        self.assertTrue(len(calls) > 0)
-        self.assertEqual(calls[-1][-1], "bnb")
+        self.assertGreater(noise_multiplier, 0.0)
 
-    def test_bsr_accountant_default_calibration_without_epsilon_fn(self) -> None:
+    def test_bsr_accountant_default_calibration(self) -> None:
         target_epsilon = 1.0
         target_delta = 1e-5
         noise_multiplier = get_noise_multiplier(
@@ -1168,7 +1130,7 @@ class AccountingTest(unittest.TestCase):
         )
         self.assertAlmostEqual(eps, 5.218712005463466, places=12)
 
-    def test_bsr_cyclic_poisson_default_calibration_without_epsilon_fn(self) -> None:
+    def test_bsr_cyclic_poisson_default_calibration(self) -> None:
         target_epsilon = 1.0
         target_delta = 1e-5
         steps = 100

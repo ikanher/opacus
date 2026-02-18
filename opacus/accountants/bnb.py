@@ -75,7 +75,6 @@ class BNBAccountant(IAccountant):
         self,
         delta: float,
         *,
-        epsilon_fn=None,
         mechanism_state=None,
         sampling_semantics=None,
         **kwargs,
@@ -93,107 +92,97 @@ class BNBAccountant(IAccountant):
                 )
             total_steps += int(steps_i)
 
-        if epsilon_fn is None:
-            state = mechanism_state if isinstance(mechanism_state, dict) else {}
-            metadata = (
-                sampling_semantics.privacy_metadata
-                if sampling_semantics is not None
-                else {}
+        state = mechanism_state if isinstance(mechanism_state, dict) else {}
+        metadata = (
+            sampling_semantics.privacy_metadata
+            if sampling_semantics is not None
+            else {}
+        )
+        sampling_mode = (
+            sampling_semantics.sampling_mode
+            if sampling_semantics is not None
+            else None
+        )
+
+        c_matrix = kwargs.get("bnb_c_matrix", state.get("c_matrix"))
+        bands = kwargs.get("bnb_bands", metadata.get("bands", state.get("bands")))
+        c_matrix_contract = kwargs.get(
+            "bnb_c_matrix_contract",
+            state.get("c_matrix_contract"),
+        )
+
+        calibration_cfg = resolve_bnb_calibration_kwargs(
+            profile="opacus_strict",
+            overrides=kwargs,
+        )
+
+        num_samples = int(calibration_cfg["bnb_num_samples"])
+        seed = int(calibration_cfg["bnb_seed"])
+        reduce_dimensionality = bool(calibration_cfg["bnb_reduce_dimensionality"])
+        tolerance = float(calibration_cfg["bnb_tolerance"])
+        max_iterations = int(calibration_cfg["bnb_max_iterations"])
+        if (
+            sampling_mode in ("b_min_sep", "balls_in_bins")
+            and c_matrix is not None
+            and bands is not None
+            and c_matrix_contract is not None
+        ):
+            self._validate_builtin_b_min_sep_consistency(
+                mechanism_state=state,
+                sampling_semantics=sampling_semantics,
+                c_matrix=c_matrix,
+                bands=int(bands),
+                c_matrix_contract=c_matrix_contract,
             )
-            sampling_mode = (
-                sampling_semantics.sampling_mode
-                if sampling_semantics is not None
-                else None
+            # Conservative built-in composition:
+            # 1) convert (steps, sample_rate) to an expected-participation count;
+            # 2) split delta across those effective participations;
+            # 3) estimate one-step epsilon by MC and compose linearly.
+            effective_steps = max(
+                1,
+                int(
+                    math.ceil(
+                        float(total_steps)
+                        * min(max(float(sample_rate), 0.0), 1.0)
+                    )
+                ),
             )
 
-            c_matrix = kwargs.get("bnb_c_matrix", state.get("c_matrix"))
-            bands = kwargs.get("bnb_bands", metadata.get("bands", state.get("bands")))
-            c_matrix_contract = kwargs.get(
-                "bnb_c_matrix_contract",
-                state.get("c_matrix_contract"),
-            )
-            calibration_cfg = resolve_bnb_calibration_kwargs(
-                profile="opacus_strict",
-                overrides=kwargs,
-            )
-            num_samples = int(calibration_cfg["bnb_num_samples"])
-            seed = int(calibration_cfg["bnb_seed"])
-            reduce_dimensionality = bool(calibration_cfg["bnb_reduce_dimensionality"])
-            tolerance = float(calibration_cfg["bnb_tolerance"])
-            max_iterations = int(calibration_cfg["bnb_max_iterations"])
-            if (
-                sampling_mode == "b_min_sep"
-                and c_matrix is not None
-                and bands is not None
-                and c_matrix_contract is not None
-            ):
-                self._validate_builtin_b_min_sep_consistency(
-                    mechanism_state=state,
-                    sampling_semantics=sampling_semantics,
+            horizon = c_matrix_contract.get("horizon")
+            if horizon is not None and int(effective_steps) > int(horizon):
+                raise ValueError(
+                    "bnb consistency check failed: c_matrix_contract['horizon'] "
+                    f"({int(horizon)}) must be >= effective_steps ({int(effective_steps)})"
+                )
+
+            delta_per_step = float(delta) / float(effective_steps)
+            if delta_per_step <= 0.0 or delta_per_step >= 1.0:
+                raise ValueError(
+                    "target delta is incompatible with built-in bnb composition "
+                    f"(delta={delta}, effective_steps={effective_steps})"
+                )
+
+            epsilon_per_step = float(
+                estimate_b_min_sep_epsilon_monte_carlo(
                     c_matrix=c_matrix,
                     bands=int(bands),
-                    c_matrix_contract=c_matrix_contract,
+                    noise_multiplier=float(noise_multiplier),
+                    target_delta=delta_per_step,
+                    num_samples=num_samples,
+                    seed=seed,
+                    reduce_dimensionality=reduce_dimensionality,
+                    tolerance=tolerance,
+                    max_iterations=max_iterations,
                 )
-                # Conservative built-in composition:
-                # 1) convert (steps, sample_rate) to an expected-participation count;
-                # 2) split delta across those effective participations;
-                # 3) estimate one-step epsilon by MC and compose linearly.
-                effective_steps = max(
-                    1,
-                    int(
-                        math.ceil(
-                            float(total_steps)
-                            * min(max(float(sample_rate), 0.0), 1.0)
-                        )
-                    ),
-                )
-                horizon = c_matrix_contract.get("horizon")
-                if horizon is not None and int(effective_steps) > int(horizon):
-                    raise ValueError(
-                        "bnb consistency check failed: c_matrix_contract['horizon'] "
-                        f"({int(horizon)}) must be >= effective_steps ({int(effective_steps)})"
-                    )
-                delta_per_step = float(delta) / float(effective_steps)
-                if delta_per_step <= 0.0 or delta_per_step >= 1.0:
-                    raise ValueError(
-                        "target delta is incompatible with built-in bnb composition "
-                        f"(delta={delta}, effective_steps={effective_steps})"
-                    )
-
-                epsilon_per_step = float(
-                    estimate_b_min_sep_epsilon_monte_carlo(
-                        c_matrix=c_matrix,
-                        bands=int(bands),
-                        noise_multiplier=float(noise_multiplier),
-                        target_delta=delta_per_step,
-                        num_samples=num_samples,
-                        seed=seed,
-                        reduce_dimensionality=reduce_dimensionality,
-                        tolerance=tolerance,
-                        max_iterations=max_iterations,
-                    )
-                )
-                return float(
-                    float(effective_steps) * epsilon_per_step
-                )
-
-            raise ValueError(
-                "bnb accountant requires epsilon_fn, or built-in b_min_sep "
-                "inputs (`c_matrix`, `bands`, `c_matrix_contract`, and "
-                "sampling_mode='b_min_sep')"
+            )
+            return float(
+                float(effective_steps) * epsilon_per_step
             )
 
-        return float(
-            epsilon_fn(
-                noise_multiplier=float(noise_multiplier),
-                target_delta=float(delta),
-                sample_rate=float(sample_rate),
-                steps=int(total_steps),
-                mechanism=self.mechanism(),
-                mechanism_state=mechanism_state,
-                sampling_semantics=sampling_semantics,
-                **kwargs,
-            )
+        raise ValueError(
+            "bnb accountant built-in calibration requires b_min_sep/balls_in_bins "
+            "inputs (`c_matrix`, `bands`, `c_matrix_contract`, and "
+            "sampling_mode in {'b_min_sep', 'balls_in_bins'})"
         )
 
     def __len__(self):

@@ -685,19 +685,18 @@ class PrivacyEngine:
         *,
         mechanism_config: NoiseMechanismConfig,
         sampling_semantics: Optional[SamplingSemantics],
-        epsilon_fn,
         kwargs: Dict[str, Any],
     ) -> Tuple[Optional[torch.Tensor], Optional[int], Optional[Dict[str, Any]]]:
-        if mechanism_config.mechanism != "bnb" or epsilon_fn is not None:
+        if mechanism_config.mechanism != "bnb":
             return None, None, None
 
         if (
             sampling_semantics is None
-            or sampling_semantics.sampling_mode != "b_min_sep"
+            or sampling_semantics.sampling_mode not in ("b_min_sep", "balls_in_bins")
         ):
             raise ValueError(
-                "bnb non-callback calibration currently requires "
-                "sampling_mode='b_min_sep'"
+                "bnb calibration requires sampling_semantics with "
+                "sampling_mode in {'b_min_sep', 'balls_in_bins'}"
             )
 
         bnb_c_matrix, bnb_bands, bnb_c_matrix_contract = self._resolve_bnb_b_min_sep_inputs(
@@ -727,7 +726,6 @@ class PrivacyEngine:
         poisson_sampling: bool,
         data_loader: DataLoader,
         sampling_semantics: Optional[SamplingSemantics],
-        epsilon_fn,
         kwargs: Dict[str, Any],
     ) -> Tuple[float, float]:
         nm_kwargs = dict(kwargs)
@@ -749,7 +747,6 @@ class PrivacyEngine:
             bsr_mf_sensitivity = None
             if (
                 mechanism_config.mechanism == "bsr"
-                and epsilon_fn is None
                 and sampling_semantics is not None
                 and sampling_semantics.sampling_mode == "torch_sampler"
             ):
@@ -775,7 +772,6 @@ class PrivacyEngine:
                 sample_rate=sample_rate,
                 steps=total_steps,
                 accountant=active_accountant.mechanism(),
-                epsilon_fn=epsilon_fn,
                 mechanism_state=mechanism_config.mechanism_state,
                 sampling_semantics=sampling_semantics,
                 bsr_mf_sensitivity=bsr_mf_sensitivity,
@@ -793,7 +789,6 @@ class PrivacyEngine:
         bsr_mf_sensitivity = None
         if (
             mechanism_config.mechanism == "bsr"
-            and epsilon_fn is None
             and sampling_semantics is not None
             and sampling_semantics.sampling_mode == "torch_sampler"
         ):
@@ -819,7 +814,6 @@ class PrivacyEngine:
             sample_rate=sample_rate,
             epochs=epochs,
             accountant=active_accountant.mechanism(),
-            epsilon_fn=epsilon_fn,
             mechanism_state=mechanism_config.mechanism_state,
             sampling_semantics=sampling_semantics,
             bsr_mf_sensitivity=bsr_mf_sensitivity,
@@ -939,7 +933,6 @@ class PrivacyEngine:
         self,
         *,
         mechanism: str,
-        epsilon_fn,
         bnb_c_matrix: Optional[torch.Tensor],
         bnb_bands: Optional[int],
         noise_multiplier: float,
@@ -949,7 +942,6 @@ class PrivacyEngine:
     ) -> Tuple[float, Optional[Dict[str, Any]]]:
         if (
             mechanism != "bnb"
-            or epsilon_fn is not None
             or bnb_c_matrix is None
             or bnb_bands is None
         ):
@@ -1573,7 +1565,6 @@ class PrivacyEngine:
         total_steps: int = None,
         noise_mechanism_config: Optional[NoiseMechanismConfig] = None,
         sampling_semantics: Optional[SamplingSemantics] = None,
-        epsilon_fn=None,
         **kwargs,
     ) -> Union[
         Tuple[GradSampleModule, DPOptimizer, DataLoader],
@@ -1623,10 +1614,6 @@ class PrivacyEngine:
             total_steps: Instead of stepping through once the dataloader for once expected epoch,
             we will step through it `total_steps` times. This will set the sample rate to
             batch_size/data_size. The parameter total_steps is any positive integer.
-            epsilon_fn: Callback used by the ``bsr``/``bnb`` accountant path to compute epsilon given
-                ``noise_multiplier``, ``target_delta``, ``sample_rate``, ``steps``,
-                and ``mechanism``.
-
         Returns:
             Tuple of (model, optimizer, data_loader) or (model, optimizer, criterion, data_loader).
 
@@ -1677,7 +1664,6 @@ class PrivacyEngine:
         bnb_c_matrix, bnb_bands, _ = self._resolve_bnb_runtime_inputs_for_epsilon(
             mechanism_config=mechanism_config,
             sampling_semantics=local_sampling_semantics,
-            epsilon_fn=epsilon_fn,
             kwargs=kwargs,
         )
 
@@ -1691,13 +1677,11 @@ class PrivacyEngine:
             poisson_sampling=poisson_sampling,
             data_loader=data_loader,
             sampling_semantics=local_sampling_semantics,
-            epsilon_fn=epsilon_fn,
             kwargs=kwargs,
         )
 
         noise_multiplier, bnb_calibration_report = self._calibrate_bnb_noise_multiplier_with_evr(
             mechanism=mechanism_config.mechanism,
-            epsilon_fn=epsilon_fn,
             bnb_c_matrix=bnb_c_matrix,
             bnb_bands=bnb_bands,
             noise_multiplier=float(noise_multiplier),

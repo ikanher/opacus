@@ -18,6 +18,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
+from opacus.accountants.analysis.bnb import build_bnb_toeplitz_c_matrix_and_contract
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -69,14 +70,15 @@ def test_bsr_dp_training_smoke_loop() -> None:
         max_grad_norm=max_grad_norm,
         poisson_sampling=False,
         noise_generator=torch.Generator().manual_seed(7),
-        noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bsr",
-            accounting_mode="bsr_accountant",
-            mechanism_state={
-                "coeffs": [1.0, 0.2],
-                "z_std": noise_multiplier * max_grad_norm / float(batch_size),
-            },
-        ),
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bsr",
+                accounting_mode="bsr_accountant",
+                mechanism_state={
+                    "coeffs": [1.0, 0.2],
+                    "mf_sensitivity": 1.0,
+                    "z_std": noise_multiplier * max_grad_norm / float(batch_size),
+                },
+            ),
     )
 
     initial = [p.detach().clone() for p in private_model.parameters() if p.requires_grad]
@@ -99,12 +101,7 @@ def test_bsr_dp_training_smoke_loop() -> None:
     total_change = sum((f - i).abs().sum().item() for i, f in zip(initial, final))
     assert total_change > 0.0
 
-    eps = pe.get_epsilon(
-        delta=1e-5,
-        epsilon_fn=lambda **kwargs: (
-            kwargs["steps"] * kwargs["sample_rate"]
-        ) / max(kwargs["noise_multiplier"], 1e-9),
-    )
+    eps = pe.get_epsilon(delta=1e-5)
     assert eps > 0.0
 
 
@@ -234,7 +231,7 @@ def test_target_epsilon_sampler_paths_smoke() -> None:
         (
             "bsr",
             SamplingSemantics(sampling_mode="torch_sampler", privacy_metadata={}),
-            {"coeffs": [1.0, 0.2]},
+            {"coeffs": [1.0, 0.2], "mf_sensitivity": 1.0},
         ),
         (
             "bsr",
@@ -242,7 +239,7 @@ def test_target_epsilon_sampler_paths_smoke() -> None:
                 sampling_mode="cyclic_poisson",
                 privacy_metadata={"bands": 2},
             ),
-            {"coeffs": [1.0, 0.2]},
+            {"coeffs": [1.0, 0.2], "mf_sensitivity": 1.0},
         ),
         (
             "bnb",
@@ -250,7 +247,20 @@ def test_target_epsilon_sampler_paths_smoke() -> None:
                 sampling_mode="b_min_sep",
                 privacy_metadata={"b": 2, "p": 0.2, "bands": 2},
             ),
-            {"coeffs": [1.0, 0.2], "bands": 2},
+            {
+                "coeffs": [1.0, 0.2],
+                "bands": 2,
+                "c_matrix": build_bnb_toeplitz_c_matrix_and_contract(
+                    coeffs=[1.0, 0.2],
+                    bands=2,
+                    horizon=8,
+                )[0],
+                "c_matrix_contract": build_bnb_toeplitz_c_matrix_and_contract(
+                    coeffs=[1.0, 0.2],
+                    bands=2,
+                    horizon=8,
+                )[1],
+            },
         ),
         (
             "bnb",
@@ -258,7 +268,20 @@ def test_target_epsilon_sampler_paths_smoke() -> None:
                 sampling_mode="balls_in_bins",
                 privacy_metadata={"bins": 4, "bands": 2},
             ),
-            {"coeffs": [1.0, 0.2], "bands": 2},
+            {
+                "coeffs": [1.0, 0.2],
+                "bands": 2,
+                "c_matrix": build_bnb_toeplitz_c_matrix_and_contract(
+                    coeffs=[1.0, 0.2],
+                    bands=2,
+                    horizon=8,
+                )[0],
+                "c_matrix_contract": build_bnb_toeplitz_c_matrix_and_contract(
+                    coeffs=[1.0, 0.2],
+                    bands=2,
+                    horizon=8,
+                )[1],
+            },
         ),
     ]
 
@@ -284,7 +307,7 @@ def test_target_epsilon_sampler_paths_smoke() -> None:
                 mechanism_state=state,
             ),
             sampling_semantics=semantics,
-            epsilon_fn=lambda **_: 1.0,
+            bnb_require_evr_pass=False,
         )
 
         xb, yb = next(iter(private_loader))

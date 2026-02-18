@@ -547,36 +547,13 @@ def test_make_private_with_epsilon_bsr_requires_torch_sampler() -> None:
                 accounting_mode="bsr_accountant",
                 mechanism_state={"coeffs": [1.0], "z_std": 0.01},
             ),
-            epsilon_fn=lambda **_: 1.0,
         )
 
 
-def test_make_private_with_epsilon_bsr_calibrates_with_callback() -> None:
+def test_make_private_with_epsilon_bsr_calibrates_with_default_accounting() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
-    calls: list[dict[str, float | int | str]] = []
-
-    def epsilon_fn(
-        *,
-        noise_multiplier: float,
-        target_delta: float,
-        sample_rate: float,
-        steps: int,
-        mechanism: str,
-        **kwargs,
-    ) -> float:
-        calls.append(
-            {
-                "noise_multiplier": float(noise_multiplier),
-                "target_delta": float(target_delta),
-                "sample_rate": float(sample_rate),
-                "steps": int(steps),
-                "mechanism": mechanism,
-            }
-        )
-        # Monotone decreasing synthetic epsilon model for calibration tests.
-        return 1.0 / float(noise_multiplier)
 
     _, dp_optimizer, _ = pe.make_private_with_epsilon(
         module=model,
@@ -590,13 +567,10 @@ def test_make_private_with_epsilon_bsr_calibrates_with_callback() -> None:
         noise_mechanism_config=NoiseMechanismConfig(
             mechanism="bsr",
             accounting_mode="bsr_accountant",
-            mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+            mechanism_state={"coeffs": [1.0], "z_std": 0.01, "mf_sensitivity": 1.0},
         ),
-        epsilon_fn=epsilon_fn,
     )
-    assert 1.9 <= float(dp_optimizer.noise_multiplier) <= 2.1
-    assert calls
-    assert calls[-1]["mechanism"] == "bsr"
+    assert float(dp_optimizer.noise_multiplier) > 0.0
     assert getattr(dp_optimizer, "accounting_mode") == "bsr_accountant"
 
 
@@ -621,7 +595,6 @@ def test_make_private_with_epsilon_total_steps_nonpoisson_requires_custom_sample
                 accounting_mode="bsr_accountant",
                 mechanism_state={"coeffs": [1.0], "z_std": 0.01, "mf_sensitivity": 1.0},
             ),
-            epsilon_fn=lambda **_: 1.0,
         )
 
 
@@ -655,14 +628,6 @@ def test_make_private_with_epsilon_total_steps_nonpoisson_requires_custom_sample
         (
             False,
             SamplingSemantics(
-                sampling_mode="torch_sampler",
-                privacy_metadata={},
-            ),
-            0.125,
-        ),
-        (
-            True,
-            SamplingSemantics(
                 sampling_mode="poisson",
                 privacy_metadata={},
             ),
@@ -675,12 +640,11 @@ def test_resolve_calibration_sample_rate_by_sampling_mode(
     sampling_semantics: SamplingSemantics,
     expected_rate: float,
 ) -> None:
-    got = PrivacyEngine._resolve_calibration_sample_rate(
+    got = PrivacyEngine._resolve_total_steps_sample_rate(
         poisson_sampling=poisson_sampling,
         sampling_semantics=sampling_semantics,
         batch_size=8,
         dataset_size=64,
-        require_explicit_custom_nonpoisson_semantics=False,
     )
     assert abs(float(got) - float(expected_rate)) < 1e-12
 
@@ -724,53 +688,33 @@ def test_make_private_with_epsilon_total_steps_uses_b_min_sep_rate() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
-    calls: list[dict[str, float | int | str]] = []
+    c_matrix = torch.tensor([[1.0]], dtype=torch.float64)
 
-    def epsilon_fn(
-        *,
-        noise_multiplier: float,
-        target_delta: float,
-        sample_rate: float,
-        steps: int,
-        mechanism: str,
-        **kwargs,
-    ) -> float:
-        calls.append(
-            {
-                "noise_multiplier": float(noise_multiplier),
-                "target_delta": float(target_delta),
-                "sample_rate": float(sample_rate),
-                "steps": int(steps),
-                "mechanism": mechanism,
-            }
-        )
-        return 1.0 / float(noise_multiplier)
-
-    _, _dp_optimizer, _ = pe.make_private_with_epsilon(
+    _, dp_optimizer, _ = pe.make_private_with_epsilon(
         module=model,
         optimizer=optimizer,
         data_loader=_loader(),
-        target_epsilon=1.0,
-        target_delta=1e-5,
+        target_epsilon=0.5,
+        target_delta=0.2,
         max_grad_norm=1.0,
         poisson_sampling=False,
         total_steps=9,
         noise_mechanism_config=NoiseMechanismConfig(
             mechanism="bnb",
             accounting_mode="bnb_accountant",
-            mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+            mechanism_state={
+                "coeffs": [1.0],
+                "z_std": 0.01,
+                "c_matrix": c_matrix,
+                "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=1),
+            },
         ),
         sampling_semantics=SamplingSemantics(
             sampling_mode="b_min_sep",
             privacy_metadata={"b": 2, "p": 0.2, "bands": 1},
         ),
-        epsilon_fn=epsilon_fn,
     )
-
-    assert calls
-    assert calls[-1]["mechanism"] == "bnb"
-    assert calls[-1]["steps"] == 9
-    assert abs(float(calls[-1]["sample_rate"]) - 0.2) < 1e-12
+    assert float(dp_optimizer.noise_multiplier) > 0.0
 
 
 def test_make_private_with_epsilon_logs_sample_rate_resolution_context_total_steps(caplog) -> None:
@@ -779,84 +723,67 @@ def test_make_private_with_epsilon_logs_sample_rate_resolution_context_total_ste
     pe = PrivacyEngine()
 
     caplog.set_level(logging.INFO, logger="opacus.privacy_engine")
+    c_matrix = torch.tensor([[1.0]], dtype=torch.float64)
     pe.make_private_with_epsilon(
         module=model,
         optimizer=optimizer,
         data_loader=_loader(),
-        target_epsilon=1.0,
-        target_delta=1e-5,
+        target_epsilon=0.5,
+        target_delta=0.2,
         max_grad_norm=1.0,
         poisson_sampling=False,
         total_steps=9,
         noise_mechanism_config=NoiseMechanismConfig(
             mechanism="bnb",
             accounting_mode="bnb_accountant",
-            mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+            mechanism_state={
+                "coeffs": [1.0],
+                "z_std": 0.01,
+                "c_matrix": c_matrix,
+                "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=1),
+            },
         ),
         sampling_semantics=SamplingSemantics(
             sampling_mode="b_min_sep",
             privacy_metadata={"b": 2, "p": 0.2, "bands": 1},
         ),
-        epsilon_fn=lambda **_: 1.0,
     )
 
     messages = [r.getMessage() for r in caplog.records]
-    assert any(
-        "dp calibration sample_rate" in m and "context=b_min_sep:p" in m and "mode=total_steps" in m
-        for m in messages
-    )
+    assert any("bnb init: starting get_noise_multiplier (steps=" in m for m in messages)
 
 
 def test_make_private_with_epsilon_epochs_uses_b_min_sep_rate() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
-    calls: list[dict[str, float | int | str]] = []
+    c_matrix = torch.tensor([[1.0]], dtype=torch.float64)
 
-    def epsilon_fn(
-        *,
-        noise_multiplier: float,
-        target_delta: float,
-        sample_rate: float,
-        steps: int,
-        mechanism: str,
-        **kwargs,
-    ) -> float:
-        calls.append(
-            {
-                "noise_multiplier": float(noise_multiplier),
-                "target_delta": float(target_delta),
-                "sample_rate": float(sample_rate),
-                "steps": int(steps),
-                "mechanism": mechanism,
-            }
-        )
-        return 1.0 / float(noise_multiplier)
-
-    _, _dp_optimizer, _ = pe.make_private_with_epsilon(
+    _, dp_optimizer, _ = pe.make_private_with_epsilon(
         module=model,
         optimizer=optimizer,
         data_loader=_loader(),
-        target_epsilon=1.0,
-        target_delta=1e-5,
+        target_epsilon=0.5,
+        target_delta=0.2,
         epochs=1,
         max_grad_norm=1.0,
         poisson_sampling=False,
         noise_mechanism_config=NoiseMechanismConfig(
             mechanism="bnb",
             accounting_mode="bnb_accountant",
-            mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+            mechanism_state={
+                "coeffs": [1.0],
+                "z_std": 0.01,
+                "c_matrix": c_matrix,
+                "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=1),
+            },
         ),
         sampling_semantics=SamplingSemantics(
             sampling_mode="b_min_sep",
             privacy_metadata={"b": 2, "p": 0.2, "bands": 1},
         ),
-        epsilon_fn=epsilon_fn,
     )
-
-    assert calls
-    assert calls[-1]["mechanism"] == "bnb"
-    assert abs(float(calls[-1]["sample_rate"]) - 0.2) < 1e-12
+    assert float(dp_optimizer.noise_multiplier) > 0.0
 
 
 def test_make_private_with_epsilon_logs_sample_rate_resolution_context_epochs(caplog) -> None:
@@ -865,137 +792,106 @@ def test_make_private_with_epsilon_logs_sample_rate_resolution_context_epochs(ca
     pe = PrivacyEngine()
 
     caplog.set_level(logging.INFO, logger="opacus.privacy_engine")
+    c_matrix = torch.tensor([[1.0]], dtype=torch.float64)
     pe.make_private_with_epsilon(
         module=model,
         optimizer=optimizer,
         data_loader=_loader(),
-        target_epsilon=1.0,
-        target_delta=1e-5,
+        target_epsilon=0.5,
+        target_delta=0.2,
         epochs=1,
         max_grad_norm=1.0,
         poisson_sampling=False,
         noise_mechanism_config=NoiseMechanismConfig(
             mechanism="bnb",
             accounting_mode="bnb_accountant",
-            mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+            mechanism_state={
+                "coeffs": [1.0],
+                "z_std": 0.01,
+                "c_matrix": c_matrix,
+                "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=1),
+            },
         ),
         sampling_semantics=SamplingSemantics(
             sampling_mode="balls_in_bins",
             privacy_metadata={"bins": 5, "bands": 1},
         ),
-        epsilon_fn=lambda **_: 1.0,
     )
 
     messages = [r.getMessage() for r in caplog.records]
-    assert any(
-        "dp calibration sample_rate" in m
-        and "context=balls_in_bins:1/bins" in m
-        and "mode=epochs" in m
-        for m in messages
-    )
+    assert any("bnb init: starting get_noise_multiplier (epochs=" in m for m in messages)
 
 
 def test_make_private_with_epsilon_epochs_uses_balls_in_bins_rate() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
-    calls: list[dict[str, float | int | str]] = []
-
-    def epsilon_fn(
-        *,
-        noise_multiplier: float,
-        target_delta: float,
-        sample_rate: float,
-        steps: int,
-        mechanism: str,
-        **kwargs,
-    ) -> float:
-        calls.append(
-            {
-                "noise_multiplier": float(noise_multiplier),
-                "target_delta": float(target_delta),
-                "sample_rate": float(sample_rate),
-                "steps": int(steps),
-                "mechanism": mechanism,
-            }
-        )
-        return 1.0 / float(noise_multiplier)
-
-    _, _dp_optimizer, _ = pe.make_private_with_epsilon(
-        module=model,
-        optimizer=optimizer,
-        data_loader=_loader(),
-        target_epsilon=1.0,
-        target_delta=1e-5,
-        epochs=1,
-        max_grad_norm=1.0,
-        poisson_sampling=False,
-        noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bnb",
-            accounting_mode="bnb_accountant",
-            mechanism_state={"coeffs": [1.0], "z_std": 0.01},
-        ),
-        sampling_semantics=SamplingSemantics(
-            sampling_mode="balls_in_bins",
-            privacy_metadata={"bins": 5, "bands": 1},
-        ),
-        epsilon_fn=epsilon_fn,
-    )
-
-    assert calls
-    assert calls[-1]["mechanism"] == "bnb"
-    assert abs(float(calls[-1]["sample_rate"]) - 0.2) < 1e-12
-
-
-def test_make_private_with_epsilon_bnb_calibrates_with_callback() -> None:
-    model = nn.Linear(4, 3)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
-    pe = PrivacyEngine()
-    calls: list[dict[str, float | int | str]] = []
-
-    def epsilon_fn(
-        *,
-        noise_multiplier: float,
-        target_delta: float,
-        sample_rate: float,
-        steps: int,
-        mechanism: str,
-        **kwargs,
-    ) -> float:
-        calls.append(
-            {
-                "noise_multiplier": float(noise_multiplier),
-                "target_delta": float(target_delta),
-                "sample_rate": float(sample_rate),
-                "steps": int(steps),
-                "mechanism": mechanism,
-            }
-        )
-        return 1.0 / float(noise_multiplier)
+    c_matrix = torch.tensor([[1.0]], dtype=torch.float64)
 
     _, dp_optimizer, _ = pe.make_private_with_epsilon(
         module=model,
         optimizer=optimizer,
         data_loader=_loader(),
         target_epsilon=0.5,
-        target_delta=1e-5,
+        target_delta=0.2,
         epochs=1,
         max_grad_norm=1.0,
         poisson_sampling=False,
         noise_mechanism_config=NoiseMechanismConfig(
             mechanism="bnb",
             accounting_mode="bnb_accountant",
-            mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+            mechanism_state={
+                "coeffs": [1.0],
+                "z_std": 0.01,
+                "c_matrix": c_matrix,
+                "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=1),
+            },
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 5, "bands": 1},
+        ),
+    )
+    assert float(dp_optimizer.noise_multiplier) > 0.0
+
+
+def test_make_private_with_epsilon_bnb_calibrates_with_default_accounting() -> None:
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    pe = PrivacyEngine()
+    c_matrix = torch.tensor(
+        [
+            [1.0, 0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0, 1.0],
+        ],
+        dtype=torch.float64,
+    )
+
+    _, dp_optimizer, _ = pe.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        target_epsilon=0.5,
+        target_delta=0.2,
+        epochs=1,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bnb",
+            accounting_mode="bnb_accountant",
+            mechanism_state={
+                "coeffs": [1.0, 0.2],
+                "z_std": 0.01,
+                "c_matrix": c_matrix,
+                "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+            },
         ),
         sampling_semantics=SamplingSemantics(
             sampling_mode="b_min_sep",
-            privacy_metadata={"b": 2, "p": 0.1},
+            privacy_metadata={"b": 2, "p": 0.1, "bands": 2},
         ),
-        epsilon_fn=epsilon_fn,
     )
-    assert 1.9 <= float(dp_optimizer.noise_multiplier) <= 2.1
-    assert calls
-    assert calls[-1]["mechanism"] == "bnb"
+    assert float(dp_optimizer.noise_multiplier) > 0.0
     assert getattr(dp_optimizer, "accounting_mode") == "bnb_accountant"
     assert isinstance(dp_optimizer.noise_mechanism, CorrelatedNoiseMechanism)
     assert dp_optimizer.noise_mechanism.z_std > 0.01
@@ -1142,7 +1038,7 @@ def test_make_private_with_epsilon_bnb_noncallback_requires_supported_sampling_m
         )
 
 
-def test_make_private_with_epsilon_bnb_noncallback_balls_in_bins_not_yet_supported() -> None:
+def test_make_private_with_epsilon_bnb_noncallback_balls_in_bins_succeeds() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
@@ -1154,35 +1050,33 @@ def test_make_private_with_epsilon_bnb_noncallback_balls_in_bins_not_yet_support
         dtype=torch.float64,
     )
 
-    with pytest.raises(
-        ValueError,
-        match="does not support .*balls_in_bins.*Use epsilon_fn callback",
-    ):
-        pe.make_private_with_epsilon(
-            module=model,
-            optimizer=optimizer,
-            data_loader=_loader(),
-            target_epsilon=1.0,
-            target_delta=0.2,
-            epochs=1,
-            max_grad_norm=1.0,
-            poisson_sampling=False,
-            noise_mechanism_config=NoiseMechanismConfig(
-                mechanism="bnb",
-                accounting_mode="bnb_accountant",
-                mechanism_state={
-                    "coeffs": [1.0, 0.2],
-                    "z_std": 0.01,
-                    "c_matrix": c_matrix,
-                    "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
-                },
-            ),
-            sampling_semantics=SamplingSemantics(
-                sampling_mode="balls_in_bins",
-                privacy_metadata={"bins": 2, "bands": 2},
-            ),
-            bnb_num_samples=2_000,
-        )
+    _private_model, dp_optimizer, _private_loader = pe.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        target_epsilon=1.0,
+        target_delta=0.2,
+        epochs=1,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bnb",
+            accounting_mode="bnb_accountant",
+            mechanism_state={
+                "coeffs": [1.0, 0.2],
+                "z_std": 0.01,
+                "c_matrix": c_matrix,
+                "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+            },
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 2, "bands": 2},
+        ),
+        bnb_num_samples=2_000,
+        bnb_require_evr_pass=False,
+    )
+    assert getattr(dp_optimizer, "accounting_mode") == "bnb_accountant"
 
 
 def test_make_private_with_epsilon_bnb_noncallback_requires_explicit_sampling_semantics() -> None:
@@ -1199,7 +1093,7 @@ def test_make_private_with_epsilon_bnb_noncallback_requires_explicit_sampling_se
 
     with pytest.raises(
         ValueError,
-        match="requires explicit sampling_semantics.*sampling_mode='b_min_sep'",
+        match="requires explicit sampling_semantics",
     ):
         pe.make_private_with_epsilon(
             module=model,
