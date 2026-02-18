@@ -177,3 +177,119 @@ def test_bnb_b_min_sep_training_smoke_loop_alt() -> None:
             privacy_metadata={"b": 3, "p": 0.25},
         ),
     )
+
+
+def test_bsr_cyclic_poisson_training_smoke_loop() -> None:
+    model = nn.Sequential(nn.Linear(4, 12), nn.Tanh(), nn.Linear(12, 3))
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    loader = _build_loader()
+    pe = PrivacyEngine()
+
+    batch_size = loader.batch_size
+    assert batch_size is not None
+    noise_multiplier = 0.7
+    max_grad_norm = 1.0
+
+    private_model, dp_optimizer, private_loader = pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=loader,
+        noise_multiplier=noise_multiplier,
+        max_grad_norm=max_grad_norm,
+        poisson_sampling=False,
+        noise_generator=torch.Generator().manual_seed(23),
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={
+                "coeffs": [1.0, 0.2],
+                "z_std": noise_multiplier * max_grad_norm / float(batch_size),
+            },
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 2},
+        ),
+    )
+
+    x, y = next(iter(private_loader))
+    dp_optimizer.zero_grad()
+    loss = F.cross_entropy(private_model(x), y)
+    loss.backward()
+    dp_optimizer.step()
+    assert torch.isfinite(loss)
+
+
+def test_bnb_balls_in_bins_training_smoke_loop() -> None:
+    _run_bnb_training_smoke(
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 4},
+        )
+    )
+
+
+def test_target_epsilon_sampler_paths_smoke() -> None:
+    cases = [
+        (
+            "bsr",
+            SamplingSemantics(sampling_mode="torch_sampler", privacy_metadata={}),
+            {"coeffs": [1.0, 0.2]},
+        ),
+        (
+            "bsr",
+            SamplingSemantics(
+                sampling_mode="cyclic_poisson",
+                privacy_metadata={"bands": 2},
+            ),
+            {"coeffs": [1.0, 0.2]},
+        ),
+        (
+            "bnb",
+            SamplingSemantics(
+                sampling_mode="b_min_sep",
+                privacy_metadata={"b": 2, "p": 0.2, "bands": 2},
+            ),
+            {"coeffs": [1.0, 0.2], "bands": 2},
+        ),
+        (
+            "bnb",
+            SamplingSemantics(
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 4, "bands": 2},
+            ),
+            {"coeffs": [1.0, 0.2], "bands": 2},
+        ),
+    ]
+
+    for mechanism, semantics, state in cases:
+        model = nn.Sequential(nn.Linear(4, 10), nn.ReLU(), nn.Linear(10, 3))
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+        loader = _build_loader()
+        pe = PrivacyEngine()
+
+        private_model, dp_optimizer, private_loader = pe.make_private_with_epsilon(
+            module=model,
+            optimizer=optimizer,
+            data_loader=loader,
+            target_epsilon=1.0,
+            target_delta=1e-5,
+            epochs=1,
+            max_grad_norm=1.0,
+            poisson_sampling=False,
+            noise_generator=torch.Generator().manual_seed(31),
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism=mechanism,
+                accounting_mode=f"{mechanism}_accountant",
+                mechanism_state=state,
+            ),
+            sampling_semantics=semantics,
+            epsilon_fn=lambda **_: 1.0,
+        )
+
+        xb, yb = next(iter(private_loader))
+        dp_optimizer.zero_grad()
+        loss = F.cross_entropy(private_model(xb), yb)
+        loss.backward()
+        dp_optimizer.step()
+        assert torch.isfinite(loss)

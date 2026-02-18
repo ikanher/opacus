@@ -18,8 +18,9 @@ import math
 
 from opacus.accountants.analysis.bnb import (
     estimate_b_min_sep_epsilon_monte_carlo,
-    validate_bnb_c_matrix_contract,
 )
+from opacus.accountants.analysis.bnb_preflight import validate_bnb_runtime_consistency
+from opacus.bnb_defaults import resolve_bnb_calibration_kwargs
 
 from .accountant import IAccountant
 
@@ -43,40 +44,13 @@ class BNBAccountant(IAccountant):
         bands: int,
         c_matrix_contract,
     ) -> None:
-        state = mechanism_state if isinstance(mechanism_state, dict) else {}
-        coeffs = state.get("coeffs")
-        if coeffs is None or not isinstance(coeffs, (list, tuple)) or len(coeffs) == 0:
-            raise ValueError(
-                "bnb consistency check requires non-empty mechanism_state['coeffs']"
-            )
-        if int(bands) != len(coeffs):
-            raise ValueError(
-                "bnb consistency check failed: `bands` must match len(coeffs); "
-                f"got bands={int(bands)} and len(coeffs)={len(coeffs)}"
-            )
-
-        metadata = (
-            sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
-        )
-        metadata_bands = metadata.get("bands")
-        if metadata_bands is not None and int(metadata_bands) != int(bands):
-            raise ValueError(
-                "bnb consistency check failed: sampling_semantics privacy_metadata['bands'] "
-                f"({int(metadata_bands)}) != accounting bands ({int(bands)})"
-            )
-
-        if not hasattr(c_matrix, "ndim") or c_matrix.ndim != 2:
-            raise ValueError("bnb consistency check requires c_matrix with shape [d, m]")
-        if int(c_matrix.shape[0]) < int(bands):
-            raise ValueError(
-                "bnb consistency check failed: c_matrix must have at least `bands` rows; "
-                f"got rows={int(c_matrix.shape[0])}, bands={int(bands)}"
-            )
-        validate_bnb_c_matrix_contract(
+        validate_bnb_runtime_consistency(
+            mechanism_state=mechanism_state,
+            sampling_semantics=sampling_semantics,
             c_matrix=c_matrix,
-            coeffs=coeffs,
             bands=int(bands),
             c_matrix_contract=c_matrix_contract,
+            coeffs_error_prefix="bnb consistency check",
         )
 
     def step(self, *, noise_multiplier: float, sample_rate: float):
@@ -138,11 +112,15 @@ class BNBAccountant(IAccountant):
                 "bnb_c_matrix_contract",
                 state.get("c_matrix_contract"),
             )
-            num_samples = int(kwargs.get("bnb_num_samples", 100_000))
-            seed = int(kwargs.get("bnb_seed", 0))
-            reduce_dimensionality = bool(kwargs.get("bnb_reduce_dimensionality", False))
-            tolerance = float(kwargs.get("bnb_tolerance", 1e-4))
-            max_iterations = int(kwargs.get("bnb_max_iterations", 200))
+            calibration_cfg = resolve_bnb_calibration_kwargs(
+                profile="opacus_strict",
+                overrides=kwargs,
+            )
+            num_samples = int(calibration_cfg["bnb_num_samples"])
+            seed = int(calibration_cfg["bnb_seed"])
+            reduce_dimensionality = bool(calibration_cfg["bnb_reduce_dimensionality"])
+            tolerance = float(calibration_cfg["bnb_tolerance"])
+            max_iterations = int(calibration_cfg["bnb_max_iterations"])
             if (
                 sampling_mode == "b_min_sep"
                 and c_matrix is not None

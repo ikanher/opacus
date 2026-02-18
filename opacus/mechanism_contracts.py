@@ -48,6 +48,31 @@ class MechanismStateSerializable(Protocol):
         ...
 
 
+def resolve_accounting_mode_from_accountant(accountant: str) -> AccountingModeName:
+    """
+    Normalize user-facing accountant names to internal accounting_mode names.
+    """
+    accountant_to_mode = {
+        "prv": "standard_step_accountant",
+        "rdp": "standard_step_accountant",
+        "gdp": "standard_step_accountant",
+        "standard_step_accountant": "standard_step_accountant",
+        "bsr": "bsr_accountant",
+        "bsr_accountant": "bsr_accountant",
+        "bnb": "bnb_accountant",
+        "bnb_accountant": "bnb_accountant",
+    }
+
+    normalized = accountant_to_mode.get(accountant)
+    if normalized is None:
+        supported = ", ".join(sorted(accountant_to_mode.keys()))
+        raise ValueError(
+            f"Unsupported accountant '{accountant}'. Supported values: {supported}"
+        )
+
+    return normalized
+
+
 @dataclass(frozen=True)
 class SamplingSemantics:
     sampling_mode: SamplingModeName
