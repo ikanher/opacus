@@ -897,12 +897,12 @@ def test_make_private_with_epsilon_bnb_calibrates_with_default_accounting() -> N
     assert dp_optimizer.noise_mechanism.z_std > 0.01
 
 
-def test_make_private_with_epsilon_bnb_requires_mc_inputs_without_callback() -> None:
+def test_make_private_with_epsilon_bnb_requires_mc_inputs() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
 
-    with pytest.raises(ValueError, match="requires b_min_sep inputs"):
+    with pytest.raises(ValueError, match="requires b_min_sep/balls_in_bins inputs"):
         pe.make_private_with_epsilon(
             module=model,
             optimizer=optimizer,
@@ -925,7 +925,7 @@ def test_make_private_with_epsilon_bnb_requires_mc_inputs_without_callback() -> 
         )
 
 
-def test_make_private_with_epsilon_bnb_noncallback_b_min_sep_succeeds() -> None:
+def test_make_private_with_epsilon_bnb_b_min_sep_succeeds() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
@@ -964,7 +964,6 @@ def test_make_private_with_epsilon_bnb_noncallback_b_min_sep_succeeds() -> None:
         bnb_num_samples=10_000,
         bnb_seed=7,
         bnb_confidence_alpha=0.5,
-        bnb_evr_num_checks=4,
         bnb_require_evr_pass=False,
     )
 
@@ -976,7 +975,7 @@ def test_make_private_with_epsilon_bnb_noncallback_b_min_sep_succeeds() -> None:
     assert report["version"] == 2
     assert report["bands"] == 2
     assert report["num_samples"] == 10_000
-    assert report["evr_num_checks"] == 8  # 2 directions * bnb_evr_num_checks
+    assert report["evr_num_checks"] == 1
     assert 0 <= report["evr_pass_count"] <= report["evr_num_checks"]
     assert report["verification_contract"] == "evr_union_bound_alpha_split_v1"
     assert report["evr_composed_delta_upper_bound"] >= report["target_delta"]
@@ -995,7 +994,7 @@ def test_make_private_with_epsilon_bnb_noncallback_b_min_sep_succeeds() -> None:
     assert status_dict["report"]["version"] == 2
 
 
-def test_make_private_with_epsilon_bnb_noncallback_requires_supported_sampling_mode() -> None:
+def test_make_private_with_epsilon_bnb_requires_supported_sampling_mode() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
@@ -1038,7 +1037,7 @@ def test_make_private_with_epsilon_bnb_noncallback_requires_supported_sampling_m
         )
 
 
-def test_make_private_with_epsilon_bnb_noncallback_balls_in_bins_succeeds() -> None:
+def test_make_private_with_epsilon_bnb_balls_in_bins_succeeds() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
@@ -1079,7 +1078,7 @@ def test_make_private_with_epsilon_bnb_noncallback_balls_in_bins_succeeds() -> N
     assert getattr(dp_optimizer, "accounting_mode") == "bnb_accountant"
 
 
-def test_make_private_with_epsilon_bnb_noncallback_requires_explicit_sampling_semantics() -> None:
+def test_make_private_with_epsilon_bnb_requires_explicit_sampling_semantics() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
@@ -1119,7 +1118,7 @@ def test_make_private_with_epsilon_bnb_noncallback_requires_explicit_sampling_se
         )
 
 
-def test_make_private_with_epsilon_bnb_noncallback_rejects_bands_coeffs_mismatch() -> None:
+def test_make_private_with_epsilon_bnb_rejects_bands_coeffs_mismatch() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
@@ -1161,7 +1160,7 @@ def test_make_private_with_epsilon_bnb_noncallback_rejects_bands_coeffs_mismatch
         )
 
 
-def test_make_private_with_epsilon_bnb_noncallback_rejects_metadata_bands_mismatch() -> None:
+def test_make_private_with_epsilon_bnb_rejects_metadata_bands_mismatch() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
@@ -1204,7 +1203,7 @@ def test_make_private_with_epsilon_bnb_noncallback_rejects_metadata_bands_mismat
         )
 
 
-def test_make_private_with_epsilon_bnb_noncallback_rejects_contract_mismatch() -> None:
+def test_make_private_with_epsilon_bnb_rejects_contract_mismatch() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
@@ -1248,7 +1247,7 @@ def test_make_private_with_epsilon_bnb_noncallback_rejects_contract_mismatch() -
         )
 
 
-def test_make_private_with_epsilon_bnb_noncallback_rejects_toeplitz_derivation_mismatch() -> None:
+def test_make_private_with_epsilon_bnb_rejects_toeplitz_derivation_mismatch() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
@@ -1290,93 +1289,7 @@ def test_make_private_with_epsilon_bnb_noncallback_rejects_toeplitz_derivation_m
         )
 
 
-def test_make_private_with_epsilon_bnb_noncallback_rejects_unordered_candidate_ladder() -> None:
-    model = nn.Linear(4, 3)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
-    pe = PrivacyEngine()
-    c_matrix = torch.tensor(
-        [
-            [1.0, 0.0, 1.0, 0.0],
-            [0.0, 1.0, 0.0, 1.0],
-        ],
-        dtype=torch.float64,
-    )
-
-    with pytest.raises(ValueError, match="strictly increasing"):
-        pe.make_private_with_epsilon(
-            module=model,
-            optimizer=optimizer,
-            data_loader=_loader(),
-            target_epsilon=1.0,
-            target_delta=0.2,
-            epochs=1,
-            max_grad_norm=1.0,
-            poisson_sampling=False,
-            noise_mechanism_config=NoiseMechanismConfig(
-                mechanism="bnb",
-                accounting_mode="bnb_accountant",
-                mechanism_state={
-                    "coeffs": [1.0, 0.2],
-                    "z_std": 0.01,
-                    "c_matrix": c_matrix,
-                    "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
-                },
-            ),
-            sampling_semantics=SamplingSemantics(
-                sampling_mode="b_min_sep",
-                privacy_metadata={"b": 2, "p": 0.1, "bands": 2},
-            ),
-            
-            bnb_num_samples=2_000,
-            bnb_seed=11,
-            bnb_candidate_sigmas=[1.0, 0.8, 1.2],
-        )
-
-
-def test_make_private_with_epsilon_bnb_noncallback_rejects_below_calibrated_sigma() -> None:
-    model = nn.Linear(4, 3)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
-    pe = PrivacyEngine()
-    c_matrix = torch.tensor(
-        [
-            [1.0, 0.0, 1.0, 0.0],
-            [0.0, 1.0, 0.0, 1.0],
-        ],
-        dtype=torch.float64,
-    )
-
-    with pytest.raises(ValueError, match="must not include values below"):
-        pe.make_private_with_epsilon(
-            module=model,
-            optimizer=optimizer,
-            data_loader=_loader(),
-            target_epsilon=1.0,
-            target_delta=0.2,
-            epochs=1,
-            max_grad_norm=1.0,
-            poisson_sampling=False,
-            noise_mechanism_config=NoiseMechanismConfig(
-                mechanism="bnb",
-                accounting_mode="bnb_accountant",
-                mechanism_state={
-                    "coeffs": [1.0, 0.2],
-                    "z_std": 0.01,
-                    "c_matrix": c_matrix,
-                    "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
-                },
-            ),
-            sampling_semantics=SamplingSemantics(
-                sampling_mode="b_min_sep",
-                privacy_metadata={"b": 2, "p": 0.1, "bands": 2},
-            ),
-            
-            bnb_num_samples=2_000,
-            bnb_seed=11,
-            bnb_candidate_sigmas=[0.5, 1.0, 1.2],
-        )
-
-
-def test_make_private_with_epsilon_bnb_noncallback_fails_on_evr_reject() -> None:
+def test_make_private_with_epsilon_bnb_fails_on_verification_reject() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
@@ -1416,11 +1329,11 @@ def test_make_private_with_epsilon_bnb_noncallback_fails_on_evr_reject() -> None
             bnb_num_samples=100,
             bnb_seed=11,
             bnb_confidence_alpha=1e-6,
-            bnb_evr_num_checks=3,
+            bnb_require_evr_pass=True,
         )
 
 
-def test_make_private_with_epsilon_bnb_noncallback_allows_evr_reject_when_disabled() -> None:
+def test_make_private_with_epsilon_bnb_allows_verification_reject_when_disabled() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
@@ -1459,7 +1372,6 @@ def test_make_private_with_epsilon_bnb_noncallback_allows_evr_reject_when_disabl
         bnb_num_samples=100,
         bnb_seed=11,
         bnb_confidence_alpha=1e-6,
-        bnb_evr_num_checks=3,
         bnb_require_evr_pass=False,
     )
     report = pe.noise_mechanism_config.mechanism_state.get("_bnb_calibration_report")
@@ -1467,12 +1379,9 @@ def test_make_private_with_epsilon_bnb_noncallback_allows_evr_reject_when_disabl
     assert report["verification_passed"] is False
     assert report["verification_contract"] == "evr_union_bound_alpha_split_v1"
     assert 0 <= report["evr_pass_count"] <= report["evr_num_checks"]
-    assert report["evr_num_checks"] == 6  # two-sided, 3 checks per direction
+    assert report["evr_num_checks"] == 1
     assert report["evr_per_check_alpha"] > 0.0
-    # Runtime splits alpha across candidate ladder as well, so this is an upper bound.
-    assert report["evr_per_check_alpha"] <= (
-        report["evr_confidence_alpha_total"] / report["evr_num_checks"]
-    )
+    assert report["evr_per_check_alpha"] == report["evr_confidence_alpha_total"]
     expected_guard_delta = report["target_delta"] + report["evr_confidence_alpha_total"] * (
         1.0 - report["target_delta"]
     )

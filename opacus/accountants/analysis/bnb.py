@@ -934,6 +934,45 @@ def estimate_b_min_sep_epsilon_monte_carlo(
     )
 
 
+def estimate_b_min_sep_delta_monte_carlo(
+    *,
+    c_matrix: torch.Tensor,
+    bands: int,
+    noise_multiplier: float,
+    epsilon: float,
+    num_samples: int,
+    seed: int = 0,
+    reduce_dimensionality: bool = False,
+) -> float:
+    """
+    Estimates hockey-stick delta for fixed epsilon from Monte Carlo PLD samples.
+    """
+    if noise_multiplier <= 0.0:
+        raise ValueError("noise_multiplier must be > 0")
+
+    if epsilon < 0.0:
+        raise ValueError("epsilon must be >= 0")
+
+    if num_samples <= 0:
+        raise ValueError("num_samples must be > 0")
+
+    if seed < 0:
+        raise ValueError("seed must be >= 0")
+
+    llr_samples = sample_b_min_sep_llr(
+        c_matrix=c_matrix,
+        bands=bands,
+        sigma=float(noise_multiplier),
+        num_samples=int(num_samples),
+        seed=int(seed),
+        reduce_dimensionality=reduce_dimensionality,
+    )
+    return estimate_hockey_stick_delta_from_llr_samples(
+        epsilon=float(epsilon),
+        llr_samples=llr_samples,
+    )
+
+
 def calibrate_sigma_evr_binary_search(
     *,
     llr_samples_fn,
@@ -1034,3 +1073,65 @@ def find_sigma_binary_search(
             high = mid
 
     return 0.5 * (low + high)
+
+
+def calibrate_b_min_sep_noise_multiplier_monte_carlo(
+    *,
+    c_matrix: torch.Tensor,
+    bands: int,
+    target_epsilon: float,
+    target_delta: float,
+    num_samples: int,
+    seed: int = 0,
+    reduce_dimensionality: bool = False,
+    sigma_low: float = 1e-7,
+    sigma_high: float = 100.0,
+    tolerance: float = 1e-7,
+    max_iterations: int = 1000,
+    max_sigma: float = 1e6,
+) -> float:
+    """
+    Monte Carlo calibration: binary-search sigma over delta(sigma).
+
+    "Privacy Amplification for BandMF via b-Min-Sep Subsampling" (Dong et al., 2026)
+
+    Based on sample code by the authors.
+    """
+    if target_epsilon < 0.0:
+        raise ValueError("target_epsilon must be >= 0")
+
+    if target_delta <= 0.0 or target_delta >= 1.0:
+        raise ValueError("target_delta must be in (0, 1)")
+
+    if max_sigma <= 0.0:
+        raise ValueError("max_sigma must be > 0")
+
+    def _delta_fn(sigma: float) -> float:
+        return estimate_b_min_sep_delta_monte_carlo(
+            c_matrix=c_matrix,
+            bands=bands,
+            noise_multiplier=float(sigma),
+            epsilon=float(target_epsilon),
+            num_samples=int(num_samples),
+            seed=int(seed),
+            reduce_dimensionality=reduce_dimensionality,
+        )
+
+    low = float(sigma_low)
+    high = float(sigma_high)
+    delta_at_high = float(_delta_fn(high))
+    while delta_at_high > float(target_delta):
+        high *= 2.0
+        if high > float(max_sigma):
+            raise ValueError("The privacy budget is too low.")
+
+        delta_at_high = float(_delta_fn(high))
+
+    return find_sigma_binary_search(
+        delta_fn=_delta_fn,
+        target_delta=float(target_delta),
+        sigma_low=low,
+        sigma_high=high,
+        tolerance=float(tolerance),
+        max_iterations=int(max_iterations),
+    )

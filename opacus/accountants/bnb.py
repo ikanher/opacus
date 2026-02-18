@@ -14,8 +14,6 @@
 
 from __future__ import annotations
 
-import math
-
 from opacus.accountants.analysis.bnb import (
     estimate_b_min_sep_epsilon_monte_carlo,
 )
@@ -83,14 +81,12 @@ class BNBAccountant(IAccountant):
             return 0.0
 
         noise_multiplier, sample_rate, _ = self.history[0]
-        total_steps = 0
-        for nm_i, sr_i, steps_i in self.history:
+        for nm_i, sr_i, _steps_i in self.history:
             if nm_i != noise_multiplier or sr_i != sample_rate:
                 raise ValueError(
                     "bnb accountant currently expects constant "
                     "noise_multiplier and sample_rate across steps"
                 )
-            total_steps += int(steps_i)
 
         state = mechanism_state if isinstance(mechanism_state, dict) else {}
         metadata = (
@@ -134,49 +130,18 @@ class BNBAccountant(IAccountant):
                 bands=int(bands),
                 c_matrix_contract=c_matrix_contract,
             )
-            # Conservative built-in composition:
-            # 1) convert (steps, sample_rate) to an expected-participation count;
-            # 2) split delta across those effective participations;
-            # 3) estimate one-step epsilon by MC and compose linearly.
-            effective_steps = max(
-                1,
-                int(
-                    math.ceil(
-                        float(total_steps)
-                        * min(max(float(sample_rate), 0.0), 1.0)
-                    )
-                ),
-            )
-
-            horizon = c_matrix_contract.get("horizon")
-            if horizon is not None and int(effective_steps) > int(horizon):
-                raise ValueError(
-                    "bnb consistency check failed: c_matrix_contract['horizon'] "
-                    f"({int(horizon)}) must be >= effective_steps ({int(effective_steps)})"
-                )
-
-            delta_per_step = float(delta) / float(effective_steps)
-            if delta_per_step <= 0.0 or delta_per_step >= 1.0:
-                raise ValueError(
-                    "target delta is incompatible with built-in bnb composition "
-                    f"(delta={delta}, effective_steps={effective_steps})"
-                )
-
-            epsilon_per_step = float(
+            return float(
                 estimate_b_min_sep_epsilon_monte_carlo(
                     c_matrix=c_matrix,
                     bands=int(bands),
                     noise_multiplier=float(noise_multiplier),
-                    target_delta=delta_per_step,
+                    target_delta=float(delta),
                     num_samples=num_samples,
                     seed=seed,
                     reduce_dimensionality=reduce_dimensionality,
-                    tolerance=tolerance,
+                    tolerance=float(tolerance),
                     max_iterations=max_iterations,
                 )
-            )
-            return float(
-                float(effective_steps) * epsilon_per_step
             )
 
         raise ValueError(

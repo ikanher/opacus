@@ -31,14 +31,15 @@ from opacus.accountants.analysis.bsr import (
 )
 from opacus.accountants.analysis.bnb import (
     BNBCalibrationStatus,
+    calibrate_b_min_sep_noise_multiplier_monte_carlo,
     describe_bnb_calibration_report,
     make_bnb_calibration_report,
     parse_bnb_calibration_report,
     sample_b_min_sep_llr,
-    select_evr_candidate_ladder_two_sided,
-    select_evr_candidate_ladder,
+    verify_hockey_stick_delta_hoeffding,
     validate_bnb_c_matrix_contract,
 )
+from opacus.bnb_defaults import resolve_bnb_calibration_kwargs
 from opacus.data_loader import DPDataLoader, switch_generator
 from opacus.distributed import DifferentiallyPrivateDistributedDataParallel as DPDDP
 from opacus.grad_sample import (
@@ -357,7 +358,7 @@ class PrivacyEngine:
 
         if c_matrix is None or bands is None or c_matrix_contract is None:
             raise ValueError(
-                "bnb non-callback calibration requires b_min_sep inputs: "
+                "bnb calibration requires b_min_sep/balls_in_bins inputs: "
                 "`c_matrix`, `bands`, and `c_matrix_contract`"
             )
 
@@ -726,10 +727,70 @@ class PrivacyEngine:
         poisson_sampling: bool,
         data_loader: DataLoader,
         sampling_semantics: Optional[SamplingSemantics],
+        bnb_c_matrix: Optional[torch.Tensor],
+        bnb_bands: Optional[int],
         kwargs: Dict[str, Any],
     ) -> Tuple[float, float]:
         nm_kwargs = dict(kwargs)
         nm_kwargs.pop("bsr_mf_sensitivity", None)
+
+        if mechanism_config.mechanism == "bnb":
+            if bnb_c_matrix is None or bnb_bands is None:
+                raise ValueError(
+                    "bnb calibration requires resolved runtime inputs (`c_matrix`, `bands`)"
+                )
+
+            if total_steps:
+                if epochs is not None:
+                    raise ValueError(
+                        "make_private_with_epsilon takes as input EITHER a number of steps or a number of epochs"
+                    )
+                sample_rate = self._resolve_total_steps_sample_rate(
+                    poisson_sampling=poisson_sampling,
+                    sampling_semantics=sampling_semantics,
+                    batch_size=data_loader.batch_size,
+                    dataset_size=len(data_loader.dataset),
+                )
+                logger.info(
+                    "bnb init: starting get_noise_multiplier (steps=%s, sample_rate=%.6g, eps=%.6g, delta=%.6g)",
+                    int(total_steps),
+                    float(sample_rate),
+                    float(target_epsilon),
+                    float(target_delta),
+                )
+            else:
+                sample_rate = 1 / len(data_loader)
+                logger.info(
+                    "bnb init: starting get_noise_multiplier (epochs=%s, sample_rate=%.6g, eps=%.6g, delta=%.6g)",
+                    int(epochs),
+                    float(sample_rate),
+                    float(target_epsilon),
+                    float(target_delta),
+                )
+
+            calibration_cfg = resolve_bnb_calibration_kwargs(
+                profile="opacus_strict",
+                overrides=kwargs,
+            )
+            noise_multiplier = calibrate_b_min_sep_noise_multiplier_monte_carlo(
+                c_matrix=bnb_c_matrix,
+                bands=int(bnb_bands),
+                target_epsilon=float(target_epsilon),
+                target_delta=float(target_delta),
+                num_samples=int(calibration_cfg["bnb_num_samples"]),
+                seed=int(calibration_cfg["bnb_seed"]),
+                reduce_dimensionality=bool(calibration_cfg["bnb_reduce_dimensionality"]),
+                sigma_low=float(kwargs.get("bnb_sigma_low", 1e-7)),
+                sigma_high=float(kwargs.get("bnb_sigma_high", 100.0)),
+                tolerance=float(calibration_cfg["bnb_tolerance"]),
+                max_iterations=int(calibration_cfg["bnb_max_iterations"]),
+                max_sigma=float(kwargs.get("bnb_max_sigma", 1e6)),
+            )
+            logger.info(
+                "bnb init: get_noise_multiplier done -> sigma=%.6g",
+                float(noise_multiplier),
+            )
+            return float(noise_multiplier), float(sample_rate)
 
         if total_steps:
             if epochs is not None:
@@ -827,109 +888,7 @@ class PrivacyEngine:
 
         return float(noise_multiplier), float(sample_rate)
 
-    @staticmethod
-    def _build_bnb_sigma_candidates(
-        *,
-        noise_multiplier: float,
-        kwargs: Dict[str, Any],
-    ) -> List[float]:
-        candidate_sigmas = kwargs.get("bnb_candidate_sigmas")
-        if candidate_sigmas is not None:
-            return [float(s) for s in candidate_sigmas]
-
-        if bool(kwargs.get("bnb_evr_use_candidate_ladder", True)):
-            multipliers = kwargs.get(
-                "bnb_candidate_multipliers",
-                (1.0, 1.1, 1.25, 1.5, 2.0),
-            )
-            return sorted(
-                {
-                    max(1e-12, float(noise_multiplier) * float(m))
-                    for m in multipliers
-                    if float(m) > 0.0
-                }
-            )
-
-        return [float(noise_multiplier)]
-
-    @staticmethod
-    def _validate_bnb_sigma_candidates(
-        *,
-        sigma_candidates: List[float],
-        calibrated_sigma: float,
-    ) -> None:
-        if len(sigma_candidates) == 0:
-            raise ValueError("bnb candidate sigma ladder must contain positive values")
-        if any(
-            float(sigma_candidates[i]) >= float(sigma_candidates[i + 1])
-            for i in range(len(sigma_candidates) - 1)
-        ):
-            raise ValueError("candidate_sigmas must be strictly increasing")
-        if any(float(s) < calibrated_sigma for s in sigma_candidates):
-            raise ValueError(
-                "bnb candidate sigma ladder must not include values below the "
-                "accountant-calibrated sigma"
-            )
-
-    @staticmethod
-    def _build_bnb_llr_samples_seq_fn(
-        *,
-        c_matrix: torch.Tensor,
-        bands: int,
-        num_samples: int,
-        seed: int,
-        num_checks: int,
-        reduce_dimensionality: bool,
-        check_timeout,
-        reverse: bool,
-    ):
-        def _llr_samples_seq_for_sigma(sigma: float):
-            out = []
-            for i in range(num_checks):
-                direction = "reverse" if reverse else "forward"
-                check_timeout(stage=f"{direction}_llr_sigma={sigma:.6g}_check={i+1}/{num_checks}")
-                llr = sample_b_min_sep_llr(
-                    c_matrix=c_matrix,
-                    bands=int(bands),
-                    sigma=float(sigma),
-                    num_samples=num_samples,
-                    seed=seed + i,
-                    reduce_dimensionality=reduce_dimensionality,
-                )
-                out.append(-llr if reverse else llr)
-            return out
-
-        return _llr_samples_seq_for_sigma
-
-    @staticmethod
-    def _select_bnb_sigma_with_evr(
-        *,
-        sigma_candidates: List[float],
-        llr_samples_seq_fn_forward,
-        llr_samples_seq_fn_reverse,
-        target_epsilon: float,
-        target_delta: float,
-        confidence_alpha_total: float,
-        verify_both_directions: bool,
-    ):
-        if verify_both_directions:
-            return select_evr_candidate_ladder_two_sided(
-                candidate_sigmas=sigma_candidates,
-                llr_samples_seq_fn_forward=llr_samples_seq_fn_forward,
-                llr_samples_seq_fn_reverse=llr_samples_seq_fn_reverse,
-                epsilon=float(target_epsilon),
-                target_delta=float(target_delta),
-                total_confidence_alpha=confidence_alpha_total,
-            )
-        return select_evr_candidate_ladder(
-            candidate_sigmas=sigma_candidates,
-            llr_samples_seq_fn=llr_samples_seq_fn_forward,
-            epsilon=float(target_epsilon),
-            target_delta=float(target_delta),
-            total_confidence_alpha=confidence_alpha_total,
-        )
-
-    def _calibrate_bnb_noise_multiplier_with_evr(
+    def _build_bnb_calibration_report(
         self,
         *,
         mechanism: str,
@@ -939,114 +898,45 @@ class PrivacyEngine:
         target_epsilon: float,
         target_delta: float,
         kwargs: Dict[str, Any],
-    ) -> Tuple[float, Optional[Dict[str, Any]]]:
+    ) -> Optional[Dict[str, Any]]:
         if (
             mechanism != "bnb"
             or bnb_c_matrix is None
             or bnb_bands is None
         ):
-            return float(noise_multiplier), None
+            return None
 
-        calibration_start = time.monotonic()
-        timeout_seconds = float(kwargs.get("bnb_calibration_timeout_seconds", 10.0))
-        if timeout_seconds <= 0.0:
-            raise ValueError("bnb_calibration_timeout_seconds must be > 0")
-
-        deadline = calibration_start + timeout_seconds
-
-        def _check_timeout(*, stage: str) -> None:
-            now = time.monotonic()
-            if now > deadline:
-                elapsed = now - calibration_start
-
-                raise TimeoutError(
-                    "bnb calibration timed out "
-                    f"after {elapsed:.2f}s at stage='{stage}' "
-                    f"(timeout={timeout_seconds:.2f}s). "
-                    "Tune bnb_num_samples/bnb_evr_num_checks/candidate ladder."
-                )
-
-        num_samples = int(kwargs.get("bnb_num_samples", 100_000))
-        seed = int(kwargs.get("bnb_seed", 0))
-        reduce_dimensionality = bool(kwargs.get("bnb_reduce_dimensionality", False))
-        confidence_alpha_total = float(kwargs.get("bnb_confidence_alpha", 1e-6))
-        num_checks = int(kwargs.get("bnb_evr_num_checks", 3))
-        verify_both_directions = bool(kwargs.get("bnb_verify_both_directions", True))
-
-        sigma_candidates = self._build_bnb_sigma_candidates(
-            noise_multiplier=float(noise_multiplier),
-            kwargs=kwargs,
+        calibration_cfg = resolve_bnb_calibration_kwargs(
+            profile="opacus_strict",
+            overrides=kwargs,
         )
-        self._validate_bnb_sigma_candidates(
-            sigma_candidates=sigma_candidates,
-            calibrated_sigma=float(noise_multiplier),
-        )
+        num_samples = int(calibration_cfg["bnb_num_samples"])
+        seed = int(calibration_cfg["bnb_seed"])
+        reduce_dimensionality = bool(calibration_cfg["bnb_reduce_dimensionality"])
+        confidence_alpha = float(calibration_cfg["bnb_confidence_alpha"])
 
-        logger.info(
-            "bnb calibration start: candidates=%d checks=%d samples=%d timeout=%.2fs",
-            len(sigma_candidates),
-            num_checks,
-            num_samples,
-            timeout_seconds,
-        )
-
-        llr_samples_seq_fn_forward = self._build_bnb_llr_samples_seq_fn(
+        llr_samples = sample_b_min_sep_llr(
             c_matrix=bnb_c_matrix,
             bands=int(bnb_bands),
             num_samples=num_samples,
             seed=seed,
-            num_checks=num_checks,
+            sigma=float(noise_multiplier),
             reduce_dimensionality=reduce_dimensionality,
-            check_timeout=_check_timeout,
-            reverse=False,
+        )
+        verification = verify_hockey_stick_delta_hoeffding(
+            epsilon=float(target_epsilon),
+            llr_samples=llr_samples,
+            target_delta=float(target_delta),
+            confidence_alpha=float(confidence_alpha),
         )
 
-        llr_samples_seq_fn_reverse = self._build_bnb_llr_samples_seq_fn(
-            c_matrix=bnb_c_matrix,
-            bands=int(bnb_bands),
-            num_samples=num_samples,
-            seed=seed + num_checks,
-            num_checks=num_checks,
-            reduce_dimensionality=reduce_dimensionality,
-            check_timeout=_check_timeout,
-            reverse=True,
-        )
-
-        try:
-            _check_timeout(stage="before_evr_selection")
-            (
-                selected_sigma,
-                verification,
-                evr_pass_count,
-                evr_per_check_alpha,
-            ) = self._select_bnb_sigma_with_evr(
-                sigma_candidates=sigma_candidates,
-                llr_samples_seq_fn_forward=llr_samples_seq_fn_forward,
-                llr_samples_seq_fn_reverse=llr_samples_seq_fn_reverse,
-                target_epsilon=float(target_epsilon),
-                target_delta=float(target_delta),
-                confidence_alpha_total=float(confidence_alpha_total),
-                verify_both_directions=verify_both_directions,
-            )
-        except TimeoutError as exc:
-            raise ValueError(str(exc)) from exc
-
-        logger.info(
-            "bnb calibration done in %.2fs: selected_sigma=%.6g pass=%s",
-            time.monotonic() - calibration_start,
-            float(selected_sigma),
-            bool(verification.accepted),
-        )
-
-        if bool(kwargs.get("bnb_require_evr_pass", True)) and not verification.accepted:
+        if bool(calibration_cfg["bnb_require_evr_pass"]) and not verification.accepted:
             raise ValueError(
                 "bnb verification guard failed for calibrated noise multiplier; "
                 "increase noise, sample budget, or loosen targets"
             )
 
-        total_checks_reported = int(2 * num_checks) if verify_both_directions else int(num_checks)
-        noise_multiplier = float(selected_sigma)
-        bnb_calibration_report = make_bnb_calibration_report(
+        return make_bnb_calibration_report(
             target_epsilon=float(target_epsilon),
             target_delta=float(target_delta),
             noise_multiplier=float(noise_multiplier),
@@ -1054,13 +944,11 @@ class PrivacyEngine:
             seed=int(seed),
             bands=int(bnb_bands),
             verification=verification,
-            evr_confidence_alpha_total=float(confidence_alpha_total),
-            evr_num_checks=int(total_checks_reported),
-            evr_per_check_alpha=float(evr_per_check_alpha),
-            evr_pass_count=int(evr_pass_count),
+            evr_confidence_alpha_total=float(confidence_alpha),
+            evr_num_checks=1,
+            evr_per_check_alpha=float(confidence_alpha),
+            evr_pass_count=1 if verification.accepted else 0,
         ).to_dict()
-
-        return float(noise_multiplier), bnb_calibration_report
 
     @staticmethod
     def _apply_correlated_runtime_calibration(
@@ -1677,10 +1565,12 @@ class PrivacyEngine:
             poisson_sampling=poisson_sampling,
             data_loader=data_loader,
             sampling_semantics=local_sampling_semantics,
+            bnb_c_matrix=bnb_c_matrix,
+            bnb_bands=bnb_bands,
             kwargs=kwargs,
         )
 
-        noise_multiplier, bnb_calibration_report = self._calibrate_bnb_noise_multiplier_with_evr(
+        bnb_calibration_report = self._build_bnb_calibration_report(
             mechanism=mechanism_config.mechanism,
             bnb_c_matrix=bnb_c_matrix,
             bnb_bands=bnb_bands,
