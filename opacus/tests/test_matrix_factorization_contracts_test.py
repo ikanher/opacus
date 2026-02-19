@@ -737,6 +737,61 @@ def test_make_private_with_epsilon_bsr_cyclic_persists_sensitivity_scale() -> No
     assert eps_default == pytest.approx(eps_override, rel=0.0, abs=1e-12)
 
 
+def test_make_private_with_epsilon_bnb_persists_accounting_kwargs_for_get_epsilon() -> None:
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    pe = PrivacyEngine()
+
+    c_matrix = torch.tensor(
+        [
+            [1.0, 0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0, 1.0],
+        ],
+        dtype=torch.float64,
+    )
+
+    pe.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        target_epsilon=1.0,
+        target_delta=0.2,
+        epochs=1,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bnb",
+            accounting_mode="bnb_accountant",
+            mechanism_state={
+                "coeffs": [1.0, 0.2],
+                "z_std": 0.01,
+                "c_matrix": c_matrix,
+                "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+            },
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 2, "bands": 2},
+        ),
+        bnb_num_samples=200,
+        bnb_seed=17,
+        bnb_require_evr_pass=False,
+    )
+
+    state = pe.noise_mechanism_config.mechanism_state
+    stored = state.get("_bnb_accounting_kwargs")
+    assert isinstance(stored, dict)
+    assert stored["bnb_num_samples"] == 200
+    assert stored["bnb_seed"] == 17
+    assert stored["bnb_reduce_dimensionality"] is False
+    assert stored["bnb_tolerance"] == pytest.approx(1e-7, rel=0.0, abs=0.0)
+    assert stored["bnb_max_iterations"] == 1000
+
+    eps_default = pe.get_epsilon(0.2)
+    eps_override = pe.get_epsilon(0.2, **stored)
+    assert eps_default == pytest.approx(eps_override, rel=0.0, abs=1e-12)
+
+
 def test_make_private_with_epsilon_total_steps_nonpoisson_requires_custom_sampler_for_non_bsr() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)

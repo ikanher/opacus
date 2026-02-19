@@ -16,11 +16,35 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any, Sequence
+from typing import Any, Dict, Sequence
 
 import torch
 
 BNB_VERIFICATION_CONTRACT = "evr_union_bound_alpha_split_v1"
+
+_BNB_CALIBRATION_DEFAULTS: Dict[str, Any] = {
+    # These are directly from the example script.
+    "bnb_num_samples": 500_000,
+    "bnb_seed": 154,
+    "bnb_reduce_dimensionality": False,
+    "bnb_confidence_alpha": 1e-6,
+    "bnb_require_evr_pass": False,
+    "bnb_tolerance": 1e-7,
+    "bnb_max_iterations": 1000,
+}
+
+
+def resolve_bnb_calibration_kwargs(
+    *,
+    overrides: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    resolved = dict(_BNB_CALIBRATION_DEFAULTS)
+    if overrides:
+        for key, value in overrides.items():
+            if key in _BNB_CALIBRATION_DEFAULTS and value is not None:
+                resolved[key] = value
+
+    return resolved
 
 
 @dataclass(frozen=True)

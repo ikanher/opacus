@@ -37,11 +37,11 @@ from opacus.accountants.analysis.bnb import (
     describe_bnb_calibration_report,
     make_bnb_calibration_report,
     parse_bnb_calibration_report,
+    resolve_bnb_calibration_kwargs,
     sample_b_min_sep_llr,
     verify_hockey_stick_delta_hoeffding,
     validate_bnb_c_matrix_contract,
 )
-from opacus.bnb_defaults import resolve_bnb_calibration_kwargs
 from opacus.data_loader import DPDataLoader, switch_generator
 from opacus.distributed import DifferentiallyPrivateDistributedDataParallel as DPDDP
 from opacus.grad_sample import (
@@ -1031,7 +1031,6 @@ class PrivacyEngine:
             )
 
         calibration_cfg = resolve_bnb_calibration_kwargs(
-            profile="opacus_strict",
             overrides=kwargs,
         )
         noise_multiplier = calibrate_b_min_sep_noise_multiplier_monte_carlo(
@@ -1121,7 +1120,6 @@ class PrivacyEngine:
             return None
 
         calibration_cfg = resolve_bnb_calibration_kwargs(
-            profile="opacus_strict",
             overrides=kwargs,
         )
         num_samples = int(calibration_cfg["bnb_num_samples"])
@@ -1165,6 +1163,28 @@ class PrivacyEngine:
         ).to_dict()
 
     @staticmethod
+    def _build_bnb_accounting_kwargs_for_state(
+        *,
+        mechanism: str,
+        kwargs: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        if mechanism != "bnb":
+            return None
+
+        calibration_cfg = resolve_bnb_calibration_kwargs(
+            overrides=kwargs,
+        )
+        return {
+            "bnb_num_samples": int(calibration_cfg["bnb_num_samples"]),
+            "bnb_seed": int(calibration_cfg["bnb_seed"]),
+            "bnb_reduce_dimensionality": bool(
+                calibration_cfg["bnb_reduce_dimensionality"]
+            ),
+            "bnb_tolerance": float(calibration_cfg["bnb_tolerance"]),
+            "bnb_max_iterations": int(calibration_cfg["bnb_max_iterations"]),
+        }
+
+    @staticmethod
     def _apply_correlated_runtime_calibration(
         *,
         mechanism_config: NoiseMechanismConfig,
@@ -1172,6 +1192,7 @@ class PrivacyEngine:
         noise_multiplier: float,
         correlated_denominator: Optional[float],
         bnb_calibration_report: Optional[Dict[str, Any]],
+        bnb_accounting_kwargs: Optional[Dict[str, Any]] = None,
     ) -> NoiseMechanismConfig:
         if mechanism_config.mechanism not in ("bsr", "bnb"):
             return mechanism_config
@@ -1191,6 +1212,9 @@ class PrivacyEngine:
 
         if bnb_calibration_report is not None:
             state["_bnb_calibration_report"] = bnb_calibration_report
+
+        if bnb_accounting_kwargs is not None:
+            state["_bnb_accounting_kwargs"] = dict(bnb_accounting_kwargs)
 
         return NoiseMechanismConfig(
             mechanism=mechanism_config.mechanism,
@@ -1865,6 +1889,10 @@ class PrivacyEngine:
             target_delta=target_delta,
             kwargs=kwargs,
         )
+        bnb_accounting_kwargs = self._build_bnb_accounting_kwargs_for_state(
+            mechanism=mechanism_config.mechanism,
+            kwargs=kwargs,
+        )
 
         mechanism_config = self._apply_correlated_runtime_calibration(
             mechanism_config=mechanism_config,
@@ -1872,6 +1900,7 @@ class PrivacyEngine:
             noise_multiplier=float(noise_multiplier),
             correlated_denominator=correlated_denominator,
             bnb_calibration_report=bnb_calibration_report,
+            bnb_accounting_kwargs=bnb_accounting_kwargs,
         )
         self._log_bsr_trace(
             stage="make_private_with_epsilon_post_calibration",

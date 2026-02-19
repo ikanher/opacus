@@ -16,9 +16,9 @@ from __future__ import annotations
 
 from opacus.accountants.analysis.bnb import (
     estimate_b_min_sep_epsilon_monte_carlo,
+    resolve_bnb_calibration_kwargs,
 )
 from opacus.accountants.analysis.bnb_preflight import validate_bnb_runtime_consistency
-from opacus.bnb_defaults import resolve_bnb_calibration_kwargs
 
 from .accountant import IAccountant
 
@@ -107,9 +107,33 @@ class BNBAccountant(IAccountant):
             state.get("c_matrix_contract"),
         )
 
+        persisted_kwargs = state.get("_bnb_accounting_kwargs", {})
+        resolved_overrides = {}
+        if isinstance(persisted_kwargs, dict):
+            for key in (
+                "bnb_num_samples",
+                "bnb_seed",
+                "bnb_reduce_dimensionality",
+                "bnb_tolerance",
+                "bnb_max_iterations",
+            ):
+                value = persisted_kwargs.get(key)
+                if value is not None:
+                    resolved_overrides[key] = value
+
+        for key in (
+            "bnb_num_samples",
+            "bnb_seed",
+            "bnb_reduce_dimensionality",
+            "bnb_tolerance",
+            "bnb_max_iterations",
+        ):
+            value = kwargs.get(key)
+            if value is not None:
+                resolved_overrides[key] = value
+
         calibration_cfg = resolve_bnb_calibration_kwargs(
-            profile="opacus_strict",
-            overrides=kwargs,
+            overrides=resolved_overrides,
         )
 
         num_samples = int(calibration_cfg["bnb_num_samples"])
