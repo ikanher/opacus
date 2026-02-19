@@ -634,8 +634,15 @@ def _mixture_logpdf(points: torch.Tensor, gm: GaussianMixture, sigma: float) -> 
         raise ValueError("points dimension must match mixture modes")
 
     sigma_sq = sigma * sigma
-    centered = points[:, None, :] - gm.modes[None, :, :]  # [n, k, d]
-    sq_dist = torch.sum(centered * centered, dim=2)  # [n, k]
+
+    # Compute squared distances without materializing [n, k, d]:
+    # ||x - m||^2 = ||x||^2 + ||m||^2 - 2 x m^T
+    points_sq = torch.sum(points * points, dim=1, keepdim=True)  # [n, 1]
+    modes_sq = torch.sum(gm.modes * gm.modes, dim=1).unsqueeze(0)  # [1, k]
+    cross = points @ gm.modes.T  # [n, k]
+    sq_dist = points_sq + modes_sq - 2.0 * cross
+    sq_dist = torch.clamp(sq_dist, min=0.0)
+
     component_log_probs = torch.log(gm.probs)[None, :] - 0.5 * sq_dist / sigma_sq
 
     return torch.logsumexp(component_log_probs, dim=1)
