@@ -36,6 +36,7 @@ from opacus.accountants import (
 from opacus.accountants.analysis.bsr import (
     bsr_cyclic_poisson_epsilon_upper_bound,
     bsr_fixed_batch_epsilon_upper_bound,
+    compute_bsr_kappa_from_coeffs,
     compute_bsr_mf_sensitivity_from_coeffs,
 )
 from opacus.accountants.utils import get_noise_multiplier
@@ -557,6 +558,21 @@ class AccountingTest(unittest.TestCase):
         )
         self.assertAlmostEqual(actual * actual, float(expected_sq), places=10)
 
+    def test_bsr_mf_sensitivity_identity_formula_general_b(self) -> None:
+        # Lean cross-check (Mf/DP/Sensitivity): for coeffs=[1], sensitivity^2
+        # equals k_eff = min(k, floor((n-1)/b)+1).
+        n = 17
+        k = 7
+        b = 3
+        expected_sq = min(k, (n - 1) // b + 1)
+        actual = compute_bsr_mf_sensitivity_from_coeffs(
+            coeffs=[1.0],
+            steps=n,
+            max_participations=k,
+            min_separation=b,
+        )
+        self.assertAlmostEqual(actual * actual, float(expected_sq), places=10)
+
     def test_bsr_mf_sensitivity_rejects_bad_input(self) -> None:
         with self.assertRaisesRegex(ValueError, "coeffs must be non-empty"):
             compute_bsr_mf_sensitivity_from_coeffs(
@@ -665,6 +681,68 @@ class AccountingTest(unittest.TestCase):
                 min_separation=min_sep,
             )
             self.assertAlmostEqual(actual, expected, places=10)
+
+    def test_bsr_kappa_from_coeffs_identity_and_two_tap(self) -> None:
+        # Identity mechanism C=I has unit column norm at every finite horizon.
+        self.assertAlmostEqual(
+            compute_bsr_kappa_from_coeffs(coeffs=[1.0], steps=32),
+            1.0,
+            places=12,
+        )
+
+        # For coeffs=[1, 2], finite-horizon kappa is sqrt(1^2 + 2^2).
+        self.assertAlmostEqual(
+            compute_bsr_kappa_from_coeffs(coeffs=[1.0, 2.0], steps=32),
+            math.sqrt(5.0),
+            places=12,
+        )
+
+    def test_bsr_kappa_matches_direct_toeplitz_column_norm(self) -> None:
+        # Lean/definition cross-check: kappa = max_i ||C e_i||_2.
+        coeffs = [1.0, 0.6, -0.2]
+        steps = 7
+        c = torch.zeros((steps, steps), dtype=torch.float64)
+        for i in range(steps):
+            for j in range(i + 1):
+                lag = i - j
+                if lag < len(coeffs):
+                    c[i, j] = float(coeffs[lag])
+
+        expected = float(torch.linalg.norm(c, ord=2, dim=0).max().item())
+        actual = compute_bsr_kappa_from_coeffs(coeffs=coeffs, steps=steps)
+        self.assertAlmostEqual(actual, expected, places=12)
+
+    def test_bsr_kappa_from_coeffs_rejects_bad_input(self) -> None:
+        with self.assertRaisesRegex(ValueError, "coeffs must be non-empty"):
+            compute_bsr_kappa_from_coeffs(coeffs=[], steps=4)
+
+        with self.assertRaisesRegex(ValueError, "coeffs must be finite"):
+            compute_bsr_kappa_from_coeffs(coeffs=[1.0, float("nan")], steps=4)
+
+        with self.assertRaisesRegex(ValueError, "steps must be >= 1"):
+            compute_bsr_kappa_from_coeffs(coeffs=[1.0], steps=0)
+
+    def test_bsr_accountant_cyclic_poisson_respects_sensitivity_scale_override(self) -> None:
+        delta = 1e-5
+        accountant = BSRAccountant()
+        accountant.history = [(1.0, 0.01, 100)]
+        sampling_semantics = SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 10},
+        )
+
+        eps_unit = accountant.get_epsilon(
+            delta=delta,
+            sampling_semantics=sampling_semantics,
+            bsr_sensitivity_scale=1.0,
+        )
+        eps_larger_scale = accountant.get_epsilon(
+            delta=delta,
+            sampling_semantics=sampling_semantics,
+            bsr_sensitivity_scale=2.0,
+        )
+
+        self.assertGreater(eps_larger_scale, eps_unit)
 
     def test_rdp_accountant(self) -> None:
         noise_multiplier = 1.5

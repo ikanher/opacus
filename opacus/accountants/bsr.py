@@ -91,9 +91,18 @@ class BSRAccountant(IAccountant):
                     "cyclic_poisson sampling requires privacy_metadata['bands']"
                 )
 
+            state = mechanism_state if isinstance(mechanism_state, dict) else {}
+            sensitivity_scale = kwargs.get(
+                "bsr_sensitivity_scale",
+                metadata.get("sensitivity_scale", state.get("sensitivity_scale", 1.0)),
+            )
+            sensitivity_scale = float(sensitivity_scale)
+            if sensitivity_scale <= 0.0:
+                raise ValueError("bsr_sensitivity_scale must be > 0")
+
             return float(
                 bsr_cyclic_poisson_epsilon_upper_bound(
-                    noise_multiplier=float(noise_multiplier),
+                    noise_multiplier=float(noise_multiplier) / sensitivity_scale,
                     target_delta=float(delta),
                     steps=int(total_steps),
                     sample_rate=float(sample_rate),

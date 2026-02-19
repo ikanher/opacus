@@ -111,6 +111,32 @@ def compute_bsr_mf_sensitivity_from_coeffs(
     return math.sqrt(total_sq)
 
 
+def compute_bsr_kappa_from_coeffs(
+    *,
+    coeffs: Iterable[float],
+    steps: int,
+) -> float:
+    """
+    Computes finite-horizon kappa = max_i ||C e_i||_2 for lower-triangular Toeplitz C.
+
+    For Toeplitz coefficients ``coeffs`` and horizon ``steps``, this equals the
+    Euclidean norm of the longest visible prefix of coefficients:
+      sqrt(sum_{t=0}^{min(len(coeffs), steps)-1} coeffs[t]^2).
+    """
+    coeff_list = [float(c) for c in coeffs]
+    if len(coeff_list) == 0:
+        raise ValueError("coeffs must be non-empty")
+
+    if not all(math.isfinite(c) for c in coeff_list):
+        raise ValueError("coeffs must be finite")
+
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+
+    visible = min(len(coeff_list), int(steps))
+    return math.sqrt(sum(c * c for c in coeff_list[:visible]))
+
+
 def calibrate_bsr_z_std(
     *,
     noise_multiplier_ref: float,

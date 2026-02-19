@@ -70,15 +70,15 @@ def test_bsr_dp_training_smoke_loop() -> None:
         max_grad_norm=max_grad_norm,
         poisson_sampling=False,
         noise_generator=torch.Generator().manual_seed(7),
-            noise_mechanism_config=NoiseMechanismConfig(
-                mechanism="bsr",
-                accounting_mode="bsr_accountant",
-                mechanism_state={
-                    "coeffs": [1.0, 0.2],
-                    "mf_sensitivity": 1.0,
-                    "z_std": noise_multiplier * max_grad_norm / float(batch_size),
-                },
-            ),
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={
+                "coeffs": [1.0, 0.2],
+                "mf_sensitivity": 1.0,
+                "z_std": noise_multiplier * max_grad_norm / float(batch_size),
+            },
+        ),
     )
 
     initial = [p.detach().clone() for p in private_model.parameters() if p.requires_grad]

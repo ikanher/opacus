@@ -15,7 +15,6 @@
 
 import logging
 import os
-import time
 import warnings
 import copy
 from itertools import chain
@@ -27,6 +26,7 @@ from opacus.accountants import create_accountant
 from opacus.accountants.utils import get_noise_multiplier
 from opacus.accountants.analysis.bsr import (
     calibrate_bsr_z_std,
+    compute_bsr_kappa_from_coeffs,
     compute_bsr_mf_sensitivity_from_coeffs,
 )
 from opacus.accountants.analysis.bnb import (
@@ -258,23 +258,48 @@ class PrivacyEngine:
     def _bsr_calibration_denominator(
         *,
         loss_reduction: str,
-        sampling_semantics: Optional[SamplingSemantics],
-        data_loader: DataLoader,
+        expected_batch_size: int,
     ) -> float:
         if loss_reduction == "sum":
             return 1.0
 
-        if (
-            sampling_semantics is not None
-            and "expected_batch_size" in sampling_semantics.privacy_metadata
-        ):
-            return float(sampling_semantics.privacy_metadata["expected_batch_size"])
-
-        if data_loader.batch_size is None:
+        if expected_batch_size <= 0:
             raise ValueError(
                 "bsr calibration requires expected batch size under loss_reduction='mean'"
             )
-        return float(data_loader.batch_size)
+        return float(expected_batch_size)
+
+    @staticmethod
+    def _resolve_sample_rate_and_expected_batch_size(
+        *,
+        poisson_sampling: bool,
+        sampling_semantics: Optional[SamplingSemantics],
+        mechanism: str,
+        batch_size: int,
+        dataset_size: int,
+        data_loader_len: int,
+        total_steps: Optional[int],
+        distributed: bool,
+    ) -> Tuple[float, int]:
+        if total_steps:
+            sample_rate = PrivacyEngine._resolve_total_steps_sample_rate(
+                poisson_sampling=poisson_sampling,
+                sampling_semantics=sampling_semantics,
+                mechanism=mechanism,
+                batch_size=batch_size,
+                dataset_size=dataset_size,
+            )
+        else:
+            sample_rate = 1 / data_loader_len
+
+        expected_batch_size = int(dataset_size * sample_rate)
+
+        # expected_batch_size is the *per worker* batch size
+        if distributed:
+            world_size = torch.distributed.get_world_size()
+            expected_batch_size = int(expected_batch_size / world_size)
+
+        return float(sample_rate), int(expected_batch_size)
 
     @staticmethod
     def _resolve_bsr_mf_sensitivity_for_fixed_batch(
@@ -336,6 +361,54 @@ class PrivacyEngine:
                 steps=sensitivity_steps,
                 max_participations=int(max_participations),
                 min_separation=int(min_separation),
+            )
+        )
+
+    @staticmethod
+    def _resolve_bsr_sensitivity_scale_for_cyclic(
+        *,
+        mechanism_state: Dict[str, Any],
+        sampling_semantics: Optional[SamplingSemantics],
+        steps: int,
+        kwargs: Dict[str, Any],
+    ) -> float:
+        metadata = (
+            sampling_semantics.privacy_metadata
+            if sampling_semantics is not None
+            else {}
+        )
+        explicit_scale = kwargs.get(
+            "bsr_sensitivity_scale",
+            metadata.get("sensitivity_scale", mechanism_state.get("sensitivity_scale")),
+        )
+        if explicit_scale is not None:
+            scale = float(explicit_scale)
+            if scale <= 0.0:
+                raise ValueError("bsr_sensitivity_scale must be > 0")
+            return scale
+
+        coeffs = mechanism_state.get("coeffs")
+        if coeffs is None:
+            raise ValueError(
+                "cyclic-poisson bsr accounting requires either `bsr_sensitivity_scale` "
+                "or `mechanism_state['coeffs']`"
+            )
+
+        scale_steps = kwargs.get(
+            "bsr_iterations_number",
+            metadata.get("iterations_number", mechanism_state.get("iterations_number")),
+        )
+        if scale_steps is None:
+            scale_steps = steps
+
+        scale_steps = int(scale_steps)
+        if scale_steps < 1:
+            raise ValueError("bsr_iterations_number must be >= 1")
+
+        return float(
+            compute_bsr_kappa_from_coeffs(
+                coeffs=coeffs,
+                steps=scale_steps,
             )
         )
 
@@ -619,6 +692,7 @@ class PrivacyEngine:
         *,
         poisson_sampling: bool,
         sampling_semantics: Optional[SamplingSemantics],
+        mechanism: str = "gaussian",
         batch_size: int,
         dataset_size: int,
     ) -> float:
@@ -628,6 +702,9 @@ class PrivacyEngine:
             else None
         )
         if not poisson_sampling and sampling_mode in (None, "torch_sampler"):
+            if mechanism == "bsr":
+                return batch_size / dataset_size
+
             raise ValueError(
                 "Setting total_steps with non-Poisson sampling requires "
                 "explicit sampling_semantics in {'cyclic_poisson', 'b_min_sep', 'balls_in_bins'}"
@@ -639,17 +716,20 @@ class PrivacyEngine:
                 raise ValueError(
                     "b_min_sep sampling requires privacy_metadata['p']"
                 )
+
             return float(p)
 
         if not poisson_sampling and sampling_mode == "balls_in_bins":
             bins = sampling_semantics.privacy_metadata.get("bins")
             if bins is None:
                 bins = sampling_semantics.privacy_metadata.get("b")
+
             if bins is None:
                 raise ValueError(
                     "balls_in_bins sampling requires privacy_metadata['bins'] "
                     "(or legacy key 'b')"
                 )
+
             return 1.0 / float(int(bins))
 
         # For Poisson and cyclic_poisson, q follows the batch-size ratio.
@@ -713,7 +793,188 @@ class PrivacyEngine:
             bands=int(bnb_bands),
             c_matrix_contract=bnb_c_matrix_contract,
         )
+
         return bnb_c_matrix, int(bnb_bands), bnb_c_matrix_contract
+
+    def _resolve_non_bnb_noise_multiplier_for_target_epsilon(
+        self,
+        *,
+        mechanism_config: NoiseMechanismConfig,
+        active_accountant,
+        target_epsilon: float,
+        target_delta: float,
+        total_steps: Optional[int],
+        epochs: Optional[int],
+        poisson_sampling: bool,
+        data_loader: DataLoader,
+        sampling_semantics: Optional[SamplingSemantics],
+        kwargs: Dict[str, Any],
+        nm_kwargs: Dict[str, Any],
+    ) -> Tuple[float, float]:
+        if total_steps:
+            if epochs is not None:
+                raise ValueError(
+                    "make_private_with_epsilon takes as input EITHER a number of steps or a number of epochs"
+                )
+
+            sample_rate = self._resolve_total_steps_sample_rate(
+                poisson_sampling=poisson_sampling,
+                sampling_semantics=sampling_semantics,
+                mechanism=mechanism_config.mechanism,
+                batch_size=data_loader.batch_size,
+                dataset_size=len(data_loader.dataset),
+            )
+
+            bsr_mf_sensitivity = None
+            if (
+                mechanism_config.mechanism == "bsr"
+                and sampling_semantics is not None
+                and sampling_semantics.sampling_mode == "cyclic_poisson"
+            ):
+                nm_kwargs["bsr_sensitivity_scale"] = self._resolve_bsr_sensitivity_scale_for_cyclic(
+                    mechanism_state=mechanism_config.mechanism_state,
+                    sampling_semantics=sampling_semantics,
+                    steps=int(total_steps),
+                    kwargs=kwargs,
+                )
+            if (
+                mechanism_config.mechanism == "bsr"
+                and sampling_semantics is not None
+                and sampling_semantics.sampling_mode == "torch_sampler"
+            ):
+                bsr_mf_sensitivity = self._resolve_bsr_mf_sensitivity_for_fixed_batch(
+                    mechanism_state=mechanism_config.mechanism_state,
+                    sampling_semantics=sampling_semantics,
+                    steps=int(total_steps),
+                    kwargs=kwargs,
+                )
+
+            noise_multiplier = get_noise_multiplier(
+                target_epsilon=target_epsilon,
+                target_delta=target_delta,
+                sample_rate=sample_rate,
+                steps=total_steps,
+                accountant=active_accountant.mechanism(),
+                mechanism_state=mechanism_config.mechanism_state,
+                sampling_semantics=sampling_semantics,
+                bsr_mf_sensitivity=bsr_mf_sensitivity,
+                **nm_kwargs,
+            )
+            return float(noise_multiplier), float(sample_rate)
+
+        sample_rate = 1 / len(data_loader)
+        bsr_mf_sensitivity = None
+        if (
+            mechanism_config.mechanism == "bsr"
+            and sampling_semantics is not None
+            and sampling_semantics.sampling_mode == "cyclic_poisson"
+        ):
+            implied_steps = int(epochs / sample_rate)
+            nm_kwargs["bsr_sensitivity_scale"] = self._resolve_bsr_sensitivity_scale_for_cyclic(
+                mechanism_state=mechanism_config.mechanism_state,
+                sampling_semantics=sampling_semantics,
+                steps=implied_steps,
+                kwargs=kwargs,
+            )
+        if (
+            mechanism_config.mechanism == "bsr"
+            and sampling_semantics is not None
+            and sampling_semantics.sampling_mode == "torch_sampler"
+        ):
+            implied_steps = int(epochs / sample_rate)
+            bsr_mf_sensitivity = self._resolve_bsr_mf_sensitivity_for_fixed_batch(
+                mechanism_state=mechanism_config.mechanism_state,
+                sampling_semantics=sampling_semantics,
+                steps=implied_steps,
+                kwargs=kwargs,
+            )
+
+        noise_multiplier = get_noise_multiplier(
+            target_epsilon=target_epsilon,
+            target_delta=target_delta,
+            sample_rate=sample_rate,
+            epochs=epochs,
+            accountant=active_accountant.mechanism(),
+            mechanism_state=mechanism_config.mechanism_state,
+            sampling_semantics=sampling_semantics,
+            bsr_mf_sensitivity=bsr_mf_sensitivity,
+            **nm_kwargs,
+        )
+        return float(noise_multiplier), float(sample_rate)
+
+    def _resolve_bnb_noise_multiplier_for_target_epsilon(
+        self,
+        *,
+        mechanism_config: NoiseMechanismConfig,
+        target_epsilon: float,
+        target_delta: float,
+        total_steps: Optional[int],
+        epochs: Optional[int],
+        poisson_sampling: bool,
+        data_loader: DataLoader,
+        sampling_semantics: Optional[SamplingSemantics],
+        bnb_c_matrix: Optional[torch.Tensor],
+        bnb_bands: Optional[int],
+        kwargs: Dict[str, Any],
+    ) -> Tuple[float, float]:
+        if bnb_c_matrix is None or bnb_bands is None:
+            raise ValueError(
+                "bnb calibration requires resolved runtime inputs (`c_matrix`, `bands`)"
+            )
+
+        if total_steps:
+            if epochs is not None:
+                raise ValueError(
+                    "make_private_with_epsilon takes as input EITHER a number of steps or a number of epochs"
+                )
+
+            sample_rate = self._resolve_total_steps_sample_rate(
+                poisson_sampling=poisson_sampling,
+                sampling_semantics=sampling_semantics,
+                mechanism=mechanism_config.mechanism,
+                batch_size=data_loader.batch_size,
+                dataset_size=len(data_loader.dataset),
+            )
+            logger.info(
+                "bnb init: starting get_noise_multiplier (steps=%s, sample_rate=%.6g, eps=%.6g, delta=%.6g)",
+                int(total_steps),
+                float(sample_rate),
+                float(target_epsilon),
+                float(target_delta),
+            )
+        else:
+            sample_rate = 1 / len(data_loader)
+            logger.info(
+                "bnb init: starting get_noise_multiplier (epochs=%s, sample_rate=%.6g, eps=%.6g, delta=%.6g)",
+                int(epochs),
+                float(sample_rate),
+                float(target_epsilon),
+                float(target_delta),
+            )
+
+        calibration_cfg = resolve_bnb_calibration_kwargs(
+            profile="opacus_strict",
+            overrides=kwargs,
+        )
+        noise_multiplier = calibrate_b_min_sep_noise_multiplier_monte_carlo(
+            c_matrix=bnb_c_matrix,
+            bands=int(bnb_bands),
+            target_epsilon=float(target_epsilon),
+            target_delta=float(target_delta),
+            num_samples=int(calibration_cfg["bnb_num_samples"]),
+            seed=int(calibration_cfg["bnb_seed"]),
+            reduce_dimensionality=bool(calibration_cfg["bnb_reduce_dimensionality"]),
+            sigma_low=float(kwargs.get("bnb_sigma_low", 1e-7)),
+            sigma_high=float(kwargs.get("bnb_sigma_high", 100.0)),
+            tolerance=float(calibration_cfg["bnb_tolerance"]),
+            max_iterations=int(calibration_cfg["bnb_max_iterations"]),
+            max_sigma=float(kwargs.get("bnb_max_sigma", 1e6)),
+        )
+        logger.info(
+            "bnb init: get_noise_multiplier done -> sigma=%.6g",
+            float(noise_multiplier),
+        )
+        return float(noise_multiplier), float(sample_rate)
 
     def _resolve_noise_multiplier_for_target_epsilon(
         self,
@@ -735,158 +996,33 @@ class PrivacyEngine:
         nm_kwargs.pop("bsr_mf_sensitivity", None)
 
         if mechanism_config.mechanism == "bnb":
-            if bnb_c_matrix is None or bnb_bands is None:
-                raise ValueError(
-                    "bnb calibration requires resolved runtime inputs (`c_matrix`, `bands`)"
-                )
-
-            if total_steps:
-                if epochs is not None:
-                    raise ValueError(
-                        "make_private_with_epsilon takes as input EITHER a number of steps or a number of epochs"
-                    )
-                sample_rate = self._resolve_total_steps_sample_rate(
-                    poisson_sampling=poisson_sampling,
-                    sampling_semantics=sampling_semantics,
-                    batch_size=data_loader.batch_size,
-                    dataset_size=len(data_loader.dataset),
-                )
-                logger.info(
-                    "bnb init: starting get_noise_multiplier (steps=%s, sample_rate=%.6g, eps=%.6g, delta=%.6g)",
-                    int(total_steps),
-                    float(sample_rate),
-                    float(target_epsilon),
-                    float(target_delta),
-                )
-            else:
-                sample_rate = 1 / len(data_loader)
-                logger.info(
-                    "bnb init: starting get_noise_multiplier (epochs=%s, sample_rate=%.6g, eps=%.6g, delta=%.6g)",
-                    int(epochs),
-                    float(sample_rate),
-                    float(target_epsilon),
-                    float(target_delta),
-                )
-
-            calibration_cfg = resolve_bnb_calibration_kwargs(
-                profile="opacus_strict",
-                overrides=kwargs,
-            )
-            noise_multiplier = calibrate_b_min_sep_noise_multiplier_monte_carlo(
-                c_matrix=bnb_c_matrix,
-                bands=int(bnb_bands),
-                target_epsilon=float(target_epsilon),
-                target_delta=float(target_delta),
-                num_samples=int(calibration_cfg["bnb_num_samples"]),
-                seed=int(calibration_cfg["bnb_seed"]),
-                reduce_dimensionality=bool(calibration_cfg["bnb_reduce_dimensionality"]),
-                sigma_low=float(kwargs.get("bnb_sigma_low", 1e-7)),
-                sigma_high=float(kwargs.get("bnb_sigma_high", 100.0)),
-                tolerance=float(calibration_cfg["bnb_tolerance"]),
-                max_iterations=int(calibration_cfg["bnb_max_iterations"]),
-                max_sigma=float(kwargs.get("bnb_max_sigma", 1e6)),
-            )
-            logger.info(
-                "bnb init: get_noise_multiplier done -> sigma=%.6g",
-                float(noise_multiplier),
-            )
-            return float(noise_multiplier), float(sample_rate)
-
-        if total_steps:
-            if epochs is not None:
-                raise ValueError(
-                    "make_private_with_epsilon takes as input EITHER a number of steps or a number of epochs"
-                )
-
-            sample_rate = self._resolve_total_steps_sample_rate(
-                poisson_sampling=poisson_sampling,
-                sampling_semantics=sampling_semantics,
-                batch_size=data_loader.batch_size,
-                dataset_size=len(data_loader.dataset),
-            )
-
-            bsr_mf_sensitivity = None
-            if (
-                mechanism_config.mechanism == "bsr"
-                and sampling_semantics is not None
-                and sampling_semantics.sampling_mode == "torch_sampler"
-            ):
-                bsr_mf_sensitivity = self._resolve_bsr_mf_sensitivity_for_fixed_batch(
-                    mechanism_state=mechanism_config.mechanism_state,
-                    sampling_semantics=sampling_semantics,
-                    steps=int(total_steps),
-                    kwargs=kwargs,
-                )
-
-            if mechanism_config.mechanism == "bnb":
-                logger.info(
-                    "bnb init: starting get_noise_multiplier (steps=%s, sample_rate=%.6g, eps=%.6g, delta=%.6g)",
-                    int(total_steps),
-                    float(sample_rate),
-                    float(target_epsilon),
-                    float(target_delta),
-                )
-
-            noise_multiplier = get_noise_multiplier(
+            return self._resolve_bnb_noise_multiplier_for_target_epsilon(
+                mechanism_config=mechanism_config,
                 target_epsilon=target_epsilon,
                 target_delta=target_delta,
-                sample_rate=sample_rate,
-                steps=total_steps,
-                accountant=active_accountant.mechanism(),
-                mechanism_state=mechanism_config.mechanism_state,
+                total_steps=total_steps,
+                epochs=epochs,
+                poisson_sampling=poisson_sampling,
+                data_loader=data_loader,
                 sampling_semantics=sampling_semantics,
-                bsr_mf_sensitivity=bsr_mf_sensitivity,
-                **nm_kwargs,
-            )
-
-            if mechanism_config.mechanism == "bnb":
-                logger.info(
-                    "bnb init: get_noise_multiplier done -> sigma=%.6g",
-                    float(noise_multiplier),
-                )
-            return float(noise_multiplier), float(sample_rate)
-
-        sample_rate = 1 / len(data_loader)
-        bsr_mf_sensitivity = None
-        if (
-            mechanism_config.mechanism == "bsr"
-            and sampling_semantics is not None
-            and sampling_semantics.sampling_mode == "torch_sampler"
-        ):
-            implied_steps = int(epochs / sample_rate)
-            bsr_mf_sensitivity = self._resolve_bsr_mf_sensitivity_for_fixed_batch(
-                mechanism_state=mechanism_config.mechanism_state,
-                sampling_semantics=sampling_semantics,
-                steps=implied_steps,
+                bnb_c_matrix=bnb_c_matrix,
+                bnb_bands=bnb_bands,
                 kwargs=kwargs,
             )
 
-        if mechanism_config.mechanism == "bnb":
-            logger.info(
-                "bnb init: starting get_noise_multiplier (epochs=%s, sample_rate=%.6g, eps=%.6g, delta=%.6g)",
-                int(epochs),
-                float(sample_rate),
-                float(target_epsilon),
-                float(target_delta),
-            )
-        noise_multiplier = get_noise_multiplier(
+        return self._resolve_non_bnb_noise_multiplier_for_target_epsilon(
+            mechanism_config=mechanism_config,
+            active_accountant=active_accountant,
             target_epsilon=target_epsilon,
             target_delta=target_delta,
-            sample_rate=sample_rate,
+            total_steps=total_steps,
             epochs=epochs,
-            accountant=active_accountant.mechanism(),
-            mechanism_state=mechanism_config.mechanism_state,
+            poisson_sampling=poisson_sampling,
+            data_loader=data_loader,
             sampling_semantics=sampling_semantics,
-            bsr_mf_sensitivity=bsr_mf_sensitivity,
-            **nm_kwargs,
+            kwargs=kwargs,
+            nm_kwargs=nm_kwargs,
         )
-        if mechanism_config.mechanism == "bnb":
-            logger.info(
-                "bnb init: get_noise_multiplier done -> sigma=%.6g",
-                float(noise_multiplier),
-            )
-
-        return float(noise_multiplier), float(sample_rate)
 
     def _build_bnb_calibration_report(
         self,
@@ -1366,22 +1502,16 @@ class PrivacyEngine:
             total_steps=total_steps,
         )
 
-        if total_steps:
-            sample_rate = self._resolve_total_steps_sample_rate(
-                poisson_sampling=poisson_sampling,
-                sampling_semantics=sampling_semantics,
-                batch_size=batch_size,
-                dataset_size=len(data_loader.dataset),
-            )
-        else:
-            sample_rate = 1 / len(data_loader)
-
-        expected_batch_size = int(len(data_loader.dataset) * sample_rate)
-
-        # expected_batch_size is the *per worker* batch size
-        if distributed:
-            world_size = torch.distributed.get_world_size()
-            expected_batch_size /= world_size
+        sample_rate, expected_batch_size = self._resolve_sample_rate_and_expected_batch_size(
+            poisson_sampling=poisson_sampling,
+            sampling_semantics=sampling_semantics,
+            mechanism=mechanism_config.mechanism,
+            batch_size=batch_size,
+            dataset_size=len(data_loader.dataset),
+            data_loader_len=len(data_loader),
+            total_steps=total_steps,
+            distributed=distributed,
+        )
 
         optimizer_prepare_kwargs = dict(kwargs)
         if configured_noise_mechanism is not None:
@@ -1541,12 +1671,26 @@ class PrivacyEngine:
             data_loader=data_loader,
         )
 
+        is_dpddp = isinstance(module, DPDDP)
+        is_ddp = isinstance(module, DDP)
+        is_fsdp = isinstance(module, FSDPModule)
+        distributed = is_dpddp or is_ddp or is_fsdp
+
         correlated_denominator = None
         if mechanism_config.mechanism in ("bsr", "bnb"):
+            _, calibration_expected_batch_size = self._resolve_sample_rate_and_expected_batch_size(
+                poisson_sampling=poisson_sampling,
+                sampling_semantics=local_sampling_semantics,
+                mechanism=mechanism_config.mechanism,
+                batch_size=int(data_loader.batch_size),
+                dataset_size=len(data_loader.dataset),
+                data_loader_len=len(data_loader),
+                total_steps=total_steps,
+                distributed=distributed,
+            )
             correlated_denominator = self._bsr_calibration_denominator(
                 loss_reduction=loss_reduction,
-                sampling_semantics=local_sampling_semantics,
-                data_loader=data_loader,
+                expected_batch_size=int(calibration_expected_batch_size),
             )
 
         bnb_c_matrix, bnb_bands, _ = self._resolve_bnb_runtime_inputs_for_epsilon(
@@ -1569,6 +1713,31 @@ class PrivacyEngine:
             bnb_bands=bnb_bands,
             kwargs=kwargs,
         )
+
+        if (
+            mechanism_config.mechanism == "bsr"
+            and local_sampling_semantics is not None
+            and local_sampling_semantics.sampling_mode == "cyclic_poisson"
+        ):
+            if total_steps is not None:
+                scale_steps = int(total_steps)
+            else:
+                sample_rate = 1.0 / len(data_loader)
+                scale_steps = int(epochs / sample_rate)
+
+            resolved_scale = self._resolve_bsr_sensitivity_scale_for_cyclic(
+                mechanism_state=mechanism_config.mechanism_state,
+                sampling_semantics=local_sampling_semantics,
+                steps=scale_steps,
+                kwargs=kwargs,
+            )
+            state = copy.deepcopy(mechanism_config.mechanism_state)
+            state["sensitivity_scale"] = float(resolved_scale)
+            mechanism_config = NoiseMechanismConfig(
+                mechanism=mechanism_config.mechanism,
+                accounting_mode=mechanism_config.accounting_mode,
+                mechanism_state=state,
+            )
 
         bnb_calibration_report = self._build_bnb_calibration_report(
             mechanism=mechanism_config.mechanism,
