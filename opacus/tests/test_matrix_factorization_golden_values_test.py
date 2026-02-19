@@ -89,6 +89,47 @@ def test_bsr_sensitivity_matches_jax_golden_cases() -> None:
         )
 
 
+def test_bsr_sensitivity_matches_lean_identity_vectors() -> None:
+    # Lean/Sensitivity.lean identity-Toeplitz closed form:
+    # sensitivity^2 = min(k, floor((T-1)/b)+1) for coeffs=[1].
+    cases = [
+        {
+            "coeffs": [1.0],
+            "steps": 10,
+            "max_participations": 100,
+            "min_separation": 3,
+            "expected_sensitivity": 2.0,  # sqrt(min(100, floor(9/3)+1)) = sqrt(4)
+        },
+        {
+            "coeffs": [1.0],
+            "steps": 5,
+            "max_participations": 2,
+            "min_separation": 10,
+            "expected_sensitivity": 1.0,  # sqrt(min(2, floor(4/10)+1)) = sqrt(1)
+        },
+        {
+            "coeffs": [1.0],
+            "steps": 8,
+            "max_participations": 3,
+            "min_separation": 2,
+            "expected_sensitivity": 1.7320508075688772,  # sqrt(min(3, floor(7/2)+1)) = sqrt(3)
+        },
+    ]
+    for case in cases:
+        got = compute_bsr_mf_sensitivity_from_coeffs(
+            coeffs=case["coeffs"],
+            steps=case["steps"],
+            max_participations=case["max_participations"],
+            min_separation=case["min_separation"],
+        )
+        _assert_close(
+            got,
+            float(case["expected_sensitivity"]),
+            rtol=RTOL,
+            atol=ATOL,
+        )
+
+
 def test_bsr_fixed_batch_epsilon_matches_jax_golden_cases() -> None:
     # Values below were computed in the JAX stack using dp_accounting RDP
     # accountant over a single Gaussian event with sigma_eff = nm / sensitivity.

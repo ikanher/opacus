@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from collections import deque
 from collections import defaultdict
 from typing import Any, Callable, Deque, List, Mapping, Optional, Sequence, Union
@@ -219,7 +220,13 @@ class CorrelatedNoiseMechanism(NoiseMechanism):
     computes ``u`` from ``C u = z`` via forward substitution and injects ``u``.
     """
 
-    def __init__(self, *, coeffs: Sequence[float], z_std: float):
+    def __init__(
+        self,
+        *,
+        coeffs: Sequence[float],
+        z_std: float,
+        debug_non_finite: bool = False,
+    ):
         if not math.isfinite(z_std) or z_std < 0.0:
             raise ValueError("z_std must be finite and >= 0")
 
@@ -240,6 +247,11 @@ class CorrelatedNoiseMechanism(NoiseMechanism):
         self.last_flat_z: Optional[torch.Tensor] = None
         self.last_flat_u: Optional[torch.Tensor] = None
         self.steps_with_noise: int = 0
+        self.debug_non_finite: bool = bool(debug_non_finite) or (
+            os.getenv("OPACUS_BSR_DEBUG_FINITE", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.first_non_finite_event: Optional[dict[str, Any]] = None
 
     @property
     def bandwidth(self) -> int:
@@ -262,6 +274,43 @@ class CorrelatedNoiseMechanism(NoiseMechanism):
         self.last_flat_z = None
         self.last_flat_u = None
         self.steps_with_noise = 0
+        self.first_non_finite_event = None
+
+    def _describe_tensor(self, *, name: str, tensor: torch.Tensor, step: int) -> str:
+        numel = int(tensor.numel())
+        finite_mask = torch.isfinite(tensor)
+        n_non_finite = int((~finite_mask).sum().item())
+        message = (
+            f"non-finite correlated-noise tensor detected: {name} at step={step}; "
+            f"numel={numel}, non_finite={n_non_finite}"
+        )
+        if not self.debug_non_finite:
+            return message
+
+        finite_values = tensor[finite_mask]
+        if finite_values.numel() == 0:
+            return f"{message}, finite_min=nan, finite_max=nan, finite_l2=nan"
+
+        finite_min = float(finite_values.min().item())
+        finite_max = float(finite_values.max().item())
+        finite_l2 = float(torch.linalg.vector_norm(finite_values).item())
+        return (
+            f"{message}, finite_min={finite_min:.6g}, "
+            f"finite_max={finite_max:.6g}, finite_l2={finite_l2:.6g}"
+        )
+
+    def _assert_finite(self, *, name: str, tensor: torch.Tensor, step: int) -> None:
+        if torch.isfinite(tensor).all():
+            return
+
+        if self.first_non_finite_event is None:
+            self.first_non_finite_event = {
+                "step": int(step),
+                "tensor": str(name),
+                "numel": int(tensor.numel()),
+                "non_finite": int((~torch.isfinite(tensor)).sum().item()),
+            }
+        raise ValueError(self._describe_tensor(name=name, tensor=tensor, step=step))
 
     def _pre_scale_noise_std(self, optimizer: "DPOptimizer") -> float:
         if optimizer.loss_reduction == "sum":
@@ -313,12 +362,22 @@ class CorrelatedNoiseMechanism(NoiseMechanism):
         return torch.cat(chunks, dim=0)
 
     def _solve_correlated_noise(self, z_flat: torch.Tensor) -> torch.Tensor:
+        self._assert_finite(
+            name="z_flat",
+            tensor=z_flat,
+            step=self.steps_with_noise,
+        )
         rhs = z_flat
         max_lag = min(len(self._history), self.bandwidth - 1)
         for lag in range(1, max_lag + 1):
             rhs = rhs - self.coeffs[lag] * self._history[lag - 1]
 
         u_flat = rhs / self.c0
+        self._assert_finite(
+            name="u_flat",
+            tensor=u_flat,
+            step=self.steps_with_noise,
+        )
         if self._history.maxlen:
             self._history.appendleft(u_flat.detach().clone())
 
@@ -351,6 +410,11 @@ class CorrelatedNoiseMechanism(NoiseMechanism):
             return
 
         summed_flat = self._flatten_summed_grads(specs)
+        self._assert_finite(
+            name="summed_flat",
+            tensor=summed_flat,
+            step=self.steps_with_noise,
+        )
         u_flat = self._solve_correlated_noise(z_flat)
 
         self._assign_noised_grads(specs, summed_flat=summed_flat, u_flat=u_flat)

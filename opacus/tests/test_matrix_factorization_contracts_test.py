@@ -258,42 +258,70 @@ def test_bnb_mechanism_requires_explicit_sampling_semantics() -> None:
         )
 
 
-def test_sampling_semantics_b_min_sep_switches_sampler_for_bnb() -> None:
+def test_sampling_semantics_b_min_sep_is_disabled_for_bnb() -> None:
     model = nn.Linear(4, 3)
-    _, _dp_optimizer, private_loader = _make_private(
-        model,
-        poisson_sampling=False,
-        noise_seed=116,
-        noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bnb",
-            accounting_mode="bnb_accountant",
-            mechanism_state={"coeffs": [1.0], "z_std": 0.01},
-        ),
-        sampling_semantics=SamplingSemantics(
-            sampling_mode="b_min_sep",
-            privacy_metadata={"b": 2, "p": 0.1},
-        ),
-    )
-    assert isinstance(private_loader.batch_sampler, BMinSepSampler)
+    with pytest.raises(
+        ValueError,
+        match="b_min_sep sampling is temporarily disabled",
+    ):
+        _make_private(
+            model,
+            poisson_sampling=False,
+            noise_seed=116,
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bnb",
+                accounting_mode="bnb_accountant",
+                mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+            ),
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="b_min_sep",
+                privacy_metadata={"b": 2, "p": 0.1},
+            ),
+        )
 
 
-def test_sampling_semantics_b_min_sep_switches_sampler_for_bnb_alt() -> None:
+def test_sampling_semantics_b_min_sep_is_disabled() -> None:
     model = nn.Linear(4, 3)
-    _, _dp_optimizer, private_loader = _make_private(
-        model,
-        poisson_sampling=False,
-        noise_seed=117,
-        noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bnb",
-            accounting_mode="bnb_accountant",
-            mechanism_state={"coeffs": [1.0], "z_std": 0.01},
-        ),
-        sampling_semantics=SamplingSemantics(
-            sampling_mode="b_min_sep",
-            privacy_metadata={"b": 2, "p": 0.2},
-        ),
-    )
-    assert isinstance(private_loader.batch_sampler, BMinSepSampler)
+    with pytest.raises(
+        ValueError,
+        match="b_min_sep sampling is temporarily disabled",
+    ):
+        _make_private(
+            model,
+            poisson_sampling=False,
+            noise_seed=116,
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bnb",
+                accounting_mode="bnb_accountant",
+                mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+            ),
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="b_min_sep",
+                privacy_metadata={"b": 2, "p": 0.1},
+            ),
+        )
+
+
+def test_sampling_semantics_b_min_sep_is_disabled_for_bnb_alt() -> None:
+    model = nn.Linear(4, 3)
+    with pytest.raises(
+        ValueError,
+        match="b_min_sep sampling is temporarily disabled",
+    ):
+        _make_private(
+            model,
+            poisson_sampling=False,
+            noise_seed=117,
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bnb",
+                accounting_mode="bnb_accountant",
+                mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+            ),
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="b_min_sep",
+                privacy_metadata={"b": 2, "p": 0.2},
+            ),
+        )
 
 
 def test_sampling_semantics_balls_in_bins_switches_sampler_for_bnb() -> None:
@@ -525,6 +553,50 @@ def test_make_private_with_epsilon_bsr_derives_mf_sensitivity_from_constraints()
     assert getattr(dp_optimizer, "accounting_mode") == "bsr_accountant"
     assert isinstance(dp_optimizer.noise_mechanism, CorrelatedNoiseMechanism)
     assert dp_optimizer.noise_mechanism.z_std > 0.01
+
+
+def test_make_private_with_epsilon_bsr_fixed_persists_mf_sensitivity_for_get_epsilon() -> None:
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    pe = PrivacyEngine()
+
+    _, dp_optimizer, _ = pe.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        target_epsilon=3.0,
+        target_delta=1e-5,
+        total_steps=100,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={
+                "coeffs": [1.0, 0.2],
+                "z_std": 0.01,
+                "max_participations": 1,
+                "min_separation": 1,
+            },
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="torch_sampler",
+            privacy_metadata={},
+        ),
+        bsr_iterations_number=40,
+    )
+
+    assert float(dp_optimizer.noise_multiplier) > 0.0
+    state = pe.noise_mechanism_config.mechanism_state
+    assert "mf_sensitivity" in state
+    assert float(state["mf_sensitivity"]) > 0.0
+
+    eps_default = pe.get_epsilon(1e-5)
+    eps_override = pe.get_epsilon(
+        1e-5,
+        bsr_mf_sensitivity=float(state["mf_sensitivity"]),
+    )
+    assert eps_default == pytest.approx(eps_override, rel=0.0, abs=1e-12)
 
 
 def test_make_private_with_epsilon_bsr_requires_torch_sampler() -> None:

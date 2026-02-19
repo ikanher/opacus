@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn.functional as F
 from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
@@ -316,3 +317,79 @@ def test_target_epsilon_sampler_paths_smoke() -> None:
         loss.backward()
         dp_optimizer.step()
         assert torch.isfinite(loss)
+
+
+@pytest.mark.parametrize(
+    "sampling_semantics,coeffs,seed,epochs",
+    [
+        (SamplingSemantics(sampling_mode="torch_sampler", privacy_metadata={}), [1.0, 0.2], 41, 2),
+        (SamplingSemantics(sampling_mode="torch_sampler", privacy_metadata={}), [1.0, 0.4, 0.1], 43, 2),
+        (
+            SamplingSemantics(sampling_mode="cyclic_poisson", privacy_metadata={"bands": 2}),
+            [1.0, 0.2],
+            47,
+            2,
+        ),
+        (
+            SamplingSemantics(sampling_mode="cyclic_poisson", privacy_metadata={"bands": 3}),
+            [1.0, 0.3, 0.1],
+            53,
+            2,
+        ),
+    ],
+)
+def test_bsr_short_stability_no_nans_across_representative_settings(
+    sampling_semantics: SamplingSemantics,
+    coeffs: list[float],
+    seed: int,
+    epochs: int,
+) -> None:
+    model = nn.Sequential(nn.Linear(4, 20), nn.Tanh(), nn.Linear(20, 3))
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.03)
+    loader = _build_loader()
+    pe = PrivacyEngine()
+
+    noise_multiplier = 0.65
+    max_grad_norm = 1.0
+    batch_size = loader.batch_size
+    assert batch_size is not None
+
+    mechanism_state = {
+        "coeffs": coeffs,
+        "z_std": noise_multiplier * max_grad_norm / float(batch_size),
+    }
+    if sampling_semantics.sampling_mode == "torch_sampler":
+        mechanism_state["mf_sensitivity"] = 1.0
+
+    private_model, dp_optimizer, private_loader = pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=loader,
+        noise_multiplier=noise_multiplier,
+        max_grad_norm=max_grad_norm,
+        poisson_sampling=False,
+        noise_generator=torch.Generator().manual_seed(seed),
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state=mechanism_state,
+        ),
+        sampling_semantics=sampling_semantics,
+    )
+
+    losses = []
+    for _ in range(epochs):
+        for xb, yb in private_loader:
+            dp_optimizer.zero_grad()
+            logits = private_model(xb)
+            loss = F.cross_entropy(logits, yb)
+            assert torch.isfinite(loss)
+            loss.backward()
+            for p in private_model.parameters():
+                if p.grad is not None:
+                    assert torch.isfinite(p.grad).all()
+            dp_optimizer.step()
+            losses.append(float(loss.detach()))
+
+    assert losses
+    assert torch.isfinite(torch.tensor(losses)).all()

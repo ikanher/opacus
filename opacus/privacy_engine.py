@@ -17,6 +17,8 @@ import logging
 import os
 import warnings
 import copy
+import json
+import math
 from itertools import chain
 from typing import IO, Any, BinaryIO, Dict, List, Optional, Tuple, Union
 
@@ -92,6 +94,72 @@ class PrivacyEngine:
         ... )
         >>> # continue training as normal
     """
+
+    @staticmethod
+    def _summarize_bsr_state(mechanism_state: Dict[str, Any]) -> Dict[str, Any]:
+        coeffs = mechanism_state.get("coeffs")
+        coeff_count = len(coeffs) if isinstance(coeffs, (list, tuple)) else None
+        coeff_head = list(coeffs[:5]) if isinstance(coeffs, (list, tuple)) else None
+        return {
+            "coeff_count": coeff_count,
+            "coeff_head": coeff_head,
+            "z_std": mechanism_state.get("z_std"),
+            "sensitivity_scale": mechanism_state.get("sensitivity_scale"),
+            "mf_sensitivity": mechanism_state.get("mf_sensitivity"),
+            "min_separation": mechanism_state.get("min_separation"),
+            "max_participations": mechanism_state.get("max_participations"),
+            "iterations_number": mechanism_state.get("iterations_number"),
+            "bands": mechanism_state.get("bands"),
+        }
+
+    @staticmethod
+    def _log_bsr_trace(
+        *,
+        stage: str,
+        mechanism_config: NoiseMechanismConfig,
+        sampling_semantics: Optional[SamplingSemantics],
+        sample_rate: Optional[float],
+        expected_batch_size: Optional[int],
+        noise_multiplier: Optional[float],
+        target_epsilon: Optional[float],
+        target_delta: Optional[float],
+        total_steps: Optional[int],
+        epochs: Optional[int],
+        loss_reduction: Optional[str],
+        correlated_denominator: Optional[float],
+    ) -> None:
+        if mechanism_config.mechanism != "bsr":
+            return
+
+        metadata = (
+            dict(sampling_semantics.privacy_metadata)
+            if sampling_semantics is not None
+            else None
+        )
+        payload = {
+            "stage": stage,
+            "mechanism": mechanism_config.mechanism,
+            "accounting_mode": mechanism_config.accounting_mode,
+            "sampling_mode": (
+                sampling_semantics.sampling_mode
+                if sampling_semantics is not None
+                else None
+            ),
+            "sampling_metadata": metadata,
+            "sample_rate": sample_rate,
+            "expected_batch_size": expected_batch_size,
+            "noise_multiplier": noise_multiplier,
+            "target_epsilon": target_epsilon,
+            "target_delta": target_delta,
+            "total_steps": total_steps,
+            "epochs": epochs,
+            "loss_reduction": loss_reduction,
+            "calibration_denominator": correlated_denominator,
+            "mechanism_state": PrivacyEngine._summarize_bsr_state(
+                mechanism_config.mechanism_state
+            ),
+        }
+        logger.info("BSR_TRACE %s", json.dumps(payload, sort_keys=True))
 
     def __init__(self, *, accountant: str = "prv", secure_mode: bool = False):
         """
@@ -320,7 +388,10 @@ class PrivacyEngine:
             metadata.get("mf_sensitivity", mechanism_state.get("mf_sensitivity")),
         )
         if mf_sensitivity is not None:
-            return float(mf_sensitivity)
+            resolved = float(mf_sensitivity)
+            if not math.isfinite(resolved) or resolved <= 0.0:
+                raise ValueError("bsr_mf_sensitivity must be finite and > 0")
+            return resolved
 
         coeffs = mechanism_state.get("coeffs")
         max_participations = kwargs.get(
@@ -355,7 +426,7 @@ class PrivacyEngine:
                 "`max_participations`, `min_separation`"
             )
 
-        return float(
+        resolved = float(
             compute_bsr_mf_sensitivity_from_coeffs(
                 coeffs=coeffs,
                 steps=sensitivity_steps,
@@ -363,6 +434,9 @@ class PrivacyEngine:
                 min_separation=int(min_separation),
             )
         )
+        if not math.isfinite(resolved) or resolved <= 0.0:
+            raise ValueError("resolved bsr_mf_sensitivity must be finite and > 0")
+        return resolved
 
     @staticmethod
     def _resolve_bsr_sensitivity_scale_for_cyclic(
@@ -383,8 +457,8 @@ class PrivacyEngine:
         )
         if explicit_scale is not None:
             scale = float(explicit_scale)
-            if scale <= 0.0:
-                raise ValueError("bsr_sensitivity_scale must be > 0")
+            if (not math.isfinite(scale)) or scale <= 0.0:
+                raise ValueError("bsr_sensitivity_scale must be finite and > 0")
             return scale
 
         coeffs = mechanism_state.get("coeffs")
@@ -405,12 +479,15 @@ class PrivacyEngine:
         if scale_steps < 1:
             raise ValueError("bsr_iterations_number must be >= 1")
 
-        return float(
+        scale = float(
             compute_bsr_kappa_from_coeffs(
                 coeffs=coeffs,
                 steps=scale_steps,
             )
         )
+        if (not math.isfinite(scale)) or scale <= 0.0:
+            raise ValueError("resolved bsr_sensitivity_scale must be finite and > 0")
+        return scale
 
     @staticmethod
     def _resolve_bnb_b_min_sep_inputs(
@@ -621,10 +698,16 @@ class PrivacyEngine:
             return
 
         mode = sampling_semantics.sampling_mode
-        if mode not in ("b_min_sep", "balls_in_bins"):
+        if mode == "b_min_sep":
+            raise ValueError(
+                "b_min_sep sampling is temporarily disabled pending p-aware BNB accounting; "
+                "use sampling_mode='balls_in_bins'"
+            )
+
+        if mode not in ("balls_in_bins",):
             raise ValueError(
                 "bnb mechanism requires sampling_semantics in "
-                "{'b_min_sep', 'balls_in_bins'}"
+                "{'balls_in_bins'}"
             )
 
     def _validate_mechanism_sampling_compatibility(
@@ -662,10 +745,9 @@ class PrivacyEngine:
         if (
             sampling_semantics is not None
             and sampling_semantics.sampling_mode == "b_min_sep"
-            and mechanism != "bnb"
         ):
             raise ValueError(
-                "b_min_sep sampling is supported only for mechanism='bnb'"
+                "b_min_sep sampling is temporarily disabled pending p-aware BNB accounting"
             )
 
         if (
@@ -711,13 +793,9 @@ class PrivacyEngine:
             )
 
         if not poisson_sampling and sampling_mode == "b_min_sep":
-            p = sampling_semantics.privacy_metadata.get("p")
-            if p is None:
-                raise ValueError(
-                    "b_min_sep sampling requires privacy_metadata['p']"
-                )
-
-            return float(p)
+            raise ValueError(
+                "b_min_sep sampling is temporarily disabled pending p-aware BNB accounting"
+            )
 
         if not poisson_sampling and sampling_mode == "balls_in_bins":
             bins = sampling_semantics.privacy_metadata.get("bins")
@@ -773,11 +851,11 @@ class PrivacyEngine:
 
         if (
             sampling_semantics is None
-            or sampling_semantics.sampling_mode not in ("b_min_sep", "balls_in_bins")
+            or sampling_semantics.sampling_mode not in ("balls_in_bins",)
         ):
             raise ValueError(
                 "bnb calibration requires sampling_semantics with "
-                "sampling_mode in {'b_min_sep', 'balls_in_bins'}"
+                "sampling_mode in {'balls_in_bins'}"
             )
 
         bnb_c_matrix, bnb_bands, bnb_c_matrix_contract = self._resolve_bnb_b_min_sep_inputs(
@@ -1158,24 +1236,9 @@ class PrivacyEngine:
             return self._rebuild_data_loader_with_batch_sampler(data_loader, sampler)
 
         if sampling_semantics is not None and sampling_semantics.sampling_mode == "b_min_sep":
-            b = sampling_semantics.privacy_metadata.get("b")
-            p = sampling_semantics.privacy_metadata.get("p")
-
-            if b is None or p is None:
-                raise ValueError(
-                    "b_min_sep sampling requires privacy_metadata['b'] and "
-                    "privacy_metadata['p']"
-                )
-
-            sampler = self._build_b_min_sep_sampler(
-                data_loader=data_loader,
-                distributed=distributed,
-                b=int(b),
-                p=float(p),
-                total_steps=total_steps,
+            raise ValueError(
+                "b_min_sep sampling is temporarily disabled pending p-aware BNB accounting"
             )
-
-            return self._rebuild_data_loader_with_batch_sampler(data_loader, sampler)
 
         if sampling_semantics is not None and sampling_semantics.sampling_mode == "balls_in_bins":
             bins = sampling_semantics.privacy_metadata.get("bins")
@@ -1538,6 +1601,20 @@ class PrivacyEngine:
             distributed=distributed,
             explicit_sampling_semantics=sampling_semantics,
         )
+        self._log_bsr_trace(
+            stage="make_private",
+            mechanism_config=mechanism_config,
+            sampling_semantics=semantics,
+            sample_rate=float(sample_rate),
+            expected_batch_size=int(expected_batch_size),
+            noise_multiplier=float(noise_multiplier),
+            target_epsilon=None,
+            target_delta=None,
+            total_steps=int(total_steps) if total_steps is not None else None,
+            epochs=None,
+            loss_reduction=loss_reduction,
+            correlated_denominator=None,
+        )
 
         self.noise_mechanism_config = mechanism_config
         self.sampling_semantics = semantics
@@ -1692,6 +1769,20 @@ class PrivacyEngine:
                 loss_reduction=loss_reduction,
                 expected_batch_size=int(calibration_expected_batch_size),
             )
+            self._log_bsr_trace(
+                stage="make_private_with_epsilon_pre_calibration",
+                mechanism_config=mechanism_config,
+                sampling_semantics=local_sampling_semantics,
+                sample_rate=None,
+                expected_batch_size=int(calibration_expected_batch_size),
+                noise_multiplier=None,
+                target_epsilon=float(target_epsilon),
+                target_delta=float(target_delta),
+                total_steps=int(total_steps) if total_steps is not None else None,
+                epochs=int(epochs) if epochs is not None else None,
+                loss_reduction=loss_reduction,
+                correlated_denominator=float(correlated_denominator),
+            )
 
         bnb_c_matrix, bnb_bands, _ = self._resolve_bnb_runtime_inputs_for_epsilon(
             mechanism_config=mechanism_config,
@@ -1738,6 +1829,32 @@ class PrivacyEngine:
                 accounting_mode=mechanism_config.accounting_mode,
                 mechanism_state=state,
             )
+        elif (
+            mechanism_config.mechanism == "bsr"
+            and (
+                local_sampling_semantics is None
+                or local_sampling_semantics.sampling_mode == "torch_sampler"
+            )
+        ):
+            if total_steps is not None:
+                mf_steps = int(total_steps)
+            else:
+                sample_rate = 1.0 / len(data_loader)
+                mf_steps = int(epochs / sample_rate)
+
+            resolved_mf_sensitivity = self._resolve_bsr_mf_sensitivity_for_fixed_batch(
+                mechanism_state=mechanism_config.mechanism_state,
+                sampling_semantics=local_sampling_semantics,
+                steps=mf_steps,
+                kwargs=kwargs,
+            )
+            state = copy.deepcopy(mechanism_config.mechanism_state)
+            state["mf_sensitivity"] = float(resolved_mf_sensitivity)
+            mechanism_config = NoiseMechanismConfig(
+                mechanism=mechanism_config.mechanism,
+                accounting_mode=mechanism_config.accounting_mode,
+                mechanism_state=state,
+            )
 
         bnb_calibration_report = self._build_bnb_calibration_report(
             mechanism=mechanism_config.mechanism,
@@ -1755,6 +1872,24 @@ class PrivacyEngine:
             noise_multiplier=float(noise_multiplier),
             correlated_denominator=correlated_denominator,
             bnb_calibration_report=bnb_calibration_report,
+        )
+        self._log_bsr_trace(
+            stage="make_private_with_epsilon_post_calibration",
+            mechanism_config=mechanism_config,
+            sampling_semantics=local_sampling_semantics,
+            sample_rate=None,
+            expected_batch_size=None,
+            noise_multiplier=float(noise_multiplier),
+            target_epsilon=float(target_epsilon),
+            target_delta=float(target_delta),
+            total_steps=int(total_steps) if total_steps is not None else None,
+            epochs=int(epochs) if epochs is not None else None,
+            loss_reduction=loss_reduction,
+            correlated_denominator=(
+                float(correlated_denominator)
+                if correlated_denominator is not None
+                else None
+            ),
         )
 
         if len(active_accountant) > 0:

@@ -289,3 +289,44 @@ def test_rejects_non_finite_z_std() -> None:
 
     with pytest.raises(ValueError, match="finite"):
         CorrelatedNoiseMechanism(coeffs=[1.0], z_std=float("inf"))
+
+
+def test_solver_fail_fast_on_non_finite_runtime_input_records_origin() -> None:
+    mechanism = CorrelatedNoiseMechanism(
+        coeffs=[1.1, 0.2],
+        z_std=0.0,
+        debug_non_finite=True,
+    )
+    z = torch.tensor([1.0, float("nan"), 2.0], dtype=torch.float64)
+
+    with pytest.raises(ValueError, match="non-finite correlated-noise tensor detected: z_flat"):
+        mechanism._solve_correlated_noise(z)
+
+    assert mechanism.first_non_finite_event is not None
+    assert mechanism.first_non_finite_event["tensor"] == "z_flat"
+    assert mechanism.first_non_finite_event["non_finite"] == 1
+
+
+def test_add_noise_fail_fast_on_non_finite_summed_grad(monkeypatch) -> None:
+    model = nn.Linear(4, 3)
+    mechanism = CorrelatedNoiseMechanism(coeffs=[1.0], z_std=0.01)
+    private_model, dp_optimizer, private_loader = _make_private(
+        model,
+        noise_seed=46,
+        noise_multiplier=0.0,
+        max_grad_norm=1.0,
+        noise_mechanism=mechanism,
+    )
+    x, y = next(iter(private_loader))
+    dp_optimizer.zero_grad()
+    loss = F.cross_entropy(private_model(x), y)
+    loss.backward()
+
+    monkeypatch.setattr(
+        mechanism,
+        "_flatten_summed_grads",
+        lambda _specs: torch.tensor([float("nan")], dtype=torch.float64),
+    )
+
+    with pytest.raises(ValueError, match="non-finite correlated-noise tensor detected: summed_flat"):
+        dp_optimizer.pre_step()
