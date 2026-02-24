@@ -50,10 +50,12 @@ class DistributedCyclicPoissonSamplerTest(unittest.TestCase):
         for sampler in self.samplers:
             self.assertEqual(len(sampler), self.steps)
 
-    def test_local_batches_are_fixed_size(self) -> None:
+    def test_local_batches_follow_cyclic_band_membership(self) -> None:
         for sampler in self.samplers:
-            for batch in sampler:
-                self.assertEqual(len(batch), self.local_batch_size)
+            for step, batch in enumerate(sampler):
+                active_band = step % self.bands
+                global_part = set(sampler._global_partitions[active_band])
+                self.assertTrue(set(batch).issubset(global_part))
 
     def test_per_step_cross_rank_indices_are_disjoint(self) -> None:
         rank_batches = [list(sampler) for sampler in self.samplers]
@@ -61,4 +63,3 @@ class DistributedCyclicPoissonSamplerTest(unittest.TestCase):
             b0 = set(rank_batches[0][step])
             b1 = set(rank_batches[1][step])
             self.assertEqual(len(b0 & b1), 0)
-

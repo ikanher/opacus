@@ -458,13 +458,13 @@ class DistributedBallsInBinsSampler(Sampler[List[int]]):
 
 class CyclicPoissonSampler(Sampler[List[int]]):
     r"""
-    Cyclic partitioned fixed-size sampler.
+    Cyclic Poisson-in-band sampler.
 
     Implements the Banded-MF cyclic sampling pattern:
     - partition dataset indices into ``bands`` disjoint subsets of equal size
       (extra tail indices are discarded);
-    - at step ``t`` sample a uniform-size ``batch_size`` subset from partition
-      ``t % bands``.
+    - at step ``t`` include each element of partition ``t % bands``
+      independently with probability ``q = batch_size / partition_size``.
 
     Reference:
     "(Amplified) Banded Matrix Factorization: A unified approach to private
@@ -503,12 +503,10 @@ class CyclicPoissonSampler(Sampler[List[int]]):
             raise ValueError(
                 "bands is too large for dataset size: partition_size is zero"
             )
-
         if self.batch_size > self.partition_size:
             raise ValueError(
                 "batch_size must be <= partition size in cyclic_poisson sampler"
             )
-
         self.usable_size = self.partition_size * self.bands
         self.steps = int(steps) if steps is not None else int(self.num_samples / self.batch_size)
 
@@ -526,15 +524,15 @@ class CyclicPoissonSampler(Sampler[List[int]]):
     def __iter__(self):
         for step in range(self.steps):
             partition = self._partitions[step % self.bands]
-            perm = torch.randperm(self.partition_size, generator=self.generator)
-            selected = perm[: self.batch_size].tolist()
-
+            sampling_prob = float(self.batch_size) / float(len(partition))
+            draws = torch.rand(len(partition), generator=self.generator) < sampling_prob
+            selected = draws.nonzero(as_tuple=False).reshape(-1).tolist()
             yield [partition[i] for i in selected]
 
 
 class DistributedCyclicPoissonSampler(Sampler[List[int]]):
     r"""
-    Distributed cyclic partitioned fixed-size sampler.
+    Distributed cyclic Poisson-in-band sampler.
 
     At each step, every rank samples from the same active cyclic partition,
     but only from its local shard of that partition (sharded by rank).
@@ -608,7 +606,10 @@ class DistributedCyclicPoissonSampler(Sampler[List[int]]):
     def __iter__(self):
         for step in range(self.steps):
             local_partition = self._local_partitions[step % self.bands]
-            perm = torch.randperm(len(local_partition), generator=self.generator)
-            selected = perm[: self.batch_size].tolist()
-
+            sampling_prob = float(self.batch_size) / float(len(local_partition))
+            draws = (
+                torch.rand(len(local_partition), generator=self.generator)
+                < sampling_prob
+            )
+            selected = draws.nonzero(as_tuple=False).reshape(-1).tolist()
             yield [local_partition[i] for i in selected]

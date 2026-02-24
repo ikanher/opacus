@@ -10,11 +10,7 @@ from opacus.privacy_engine import PrivacyEngine
 
 def test_fixed_batch_mf_sensitivity_precedence_kwargs_over_metadata_and_state() -> None:
     mechanism_state = {
-        "coeffs": [1.0, 0.5],
         "mf_sensitivity": 7.0,
-        "max_participations": 10,
-        "min_separation": 2,
-        "iterations_number": 100,
     }
     sampling_semantics = SamplingSemantics(
         sampling_mode="torch_sampler",
@@ -32,11 +28,7 @@ def test_fixed_batch_mf_sensitivity_precedence_kwargs_over_metadata_and_state() 
 
 def test_fixed_batch_mf_sensitivity_precedence_metadata_over_state() -> None:
     mechanism_state = {
-        "coeffs": [1.0, 0.5],
         "mf_sensitivity": 7.0,
-        "max_participations": 10,
-        "min_separation": 2,
-        "iterations_number": 100,
     }
     sampling_semantics = SamplingSemantics(
         sampling_mode="torch_sampler",
@@ -73,6 +65,23 @@ def test_fixed_batch_mf_sensitivity_horizon_override_changes_result() -> None:
         kwargs={"bsr_iterations_number": 10},
     )
     assert eps_long > eps_short
+
+
+def test_fixed_batch_mf_sensitivity_rejects_inconsistent_explicit_value() -> None:
+    mechanism_state = {
+        "coeffs": [1.0, 1.0],
+        "max_participations": 10,
+        "min_separation": 1,
+        "iterations_number": 10,
+    }
+
+    with pytest.raises(ValueError, match="provided bsr_mf_sensitivity is inconsistent"):
+        PrivacyEngine._resolve_bsr_mf_sensitivity_for_fixed_batch(
+            mechanism_state=mechanism_state,
+            sampling_semantics=None,
+            steps=10,
+            kwargs={"bsr_mf_sensitivity": 1.0},
+        )
 
 
 def test_fixed_batch_mf_sensitivity_requires_derivation_inputs_when_no_override() -> None:

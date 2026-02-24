@@ -35,7 +35,7 @@ class CyclicPoissonSamplerTest(unittest.TestCase):
         sampler = self._init_sampler(seed=7)
         self.assertEqual(len(sampler), 8)
 
-    def test_cyclic_band_membership_and_fixed_batch_size(self) -> None:
+    def test_cyclic_band_membership(self) -> None:
         sampler = self._init_sampler(seed=7)
 
         band_size = 20 // 4
@@ -45,9 +45,19 @@ class CyclicPoissonSamplerTest(unittest.TestCase):
             partitions.append(set(range(start, start + band_size)))
 
         for step, batch in enumerate(sampler):
-            self.assertEqual(len(batch), 2)
             active_band = step % 4
             self.assertTrue(set(batch).issubset(partitions[active_band]))
+    
+    def test_batch_size_is_not_forced_fixed(self) -> None:
+        sampler = CyclicPoissonSampler(
+            num_samples=40,
+            batch_size=5,
+            bands=4,
+            steps=20,
+            generator=torch.Generator().manual_seed(11),
+        )
+        sizes = [len(b) for b in sampler]
+        self.assertGreater(len(set(sizes)), 1)
 
     def test_same_seed(self) -> None:
         sampler1 = self._init_sampler(seed=7)
@@ -58,4 +68,3 @@ class CyclicPoissonSamplerTest(unittest.TestCase):
         sampler1 = self._init_sampler(seed=7)
         sampler2 = self._init_sampler(seed=8)
         self.assertNotEqual(list(sampler1), list(sampler2))
-

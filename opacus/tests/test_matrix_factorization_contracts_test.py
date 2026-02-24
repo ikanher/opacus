@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 
 import pytest
 import torch
@@ -25,7 +26,6 @@ from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
 from opacus.optimizers import CorrelatedNoiseMechanism, GaussianNoiseMechanism
 from opacus.utils.uniform_sampler import (
     BallsInBinsSampler,
-    BMinSepSampler,
     CyclicPoissonSampler,
 )
 from torch import nn
@@ -205,7 +205,7 @@ def test_non_bnb_mechanism_rejects_bnb_sampling_modes() -> None:
     model = nn.Linear(4, 3)
     with pytest.raises(
         ValueError,
-        match="b_min_sep sampling is supported only for mechanism='bnb'",
+        match="balls_in_bins sampling is supported only for mechanism='bnb'",
     ):
         _make_private(
             model,
@@ -216,14 +216,14 @@ def test_non_bnb_mechanism_rejects_bnb_sampling_modes() -> None:
                 accounting_mode="standard_step_accountant",
             ),
             sampling_semantics=SamplingSemantics(
-                sampling_mode="b_min_sep",
-                privacy_metadata={},
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 4},
             ),
         )
 
     with pytest.raises(
         ValueError,
-        match="b_min_sep sampling is supported only for mechanism='bnb'",
+        match="balls_in_bins sampling is supported only for mechanism='bnb'",
     ):
         _make_private(
             model,
@@ -235,8 +235,8 @@ def test_non_bnb_mechanism_rejects_bnb_sampling_modes() -> None:
                 mechanism_state={"coeffs": [1.0], "z_std": 0.01},
             ),
             sampling_semantics=SamplingSemantics(
-                sampling_mode="b_min_sep",
-                privacy_metadata={},
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 4},
             ),
             
         )
@@ -394,7 +394,7 @@ def test_make_private_total_steps_supports_cyclic_poisson_sampler() -> None:
     assert len(private_loader) == 5
 
 
-def test_make_private_total_steps_supports_b_min_sep_sampler() -> None:
+def test_make_private_total_steps_supports_balls_in_bins_sampler_for_bnb() -> None:
     model = nn.Linear(4, 3)
     _, _, private_loader = _make_private(
         model,
@@ -407,11 +407,11 @@ def test_make_private_total_steps_supports_b_min_sep_sampler() -> None:
             mechanism_state={"coeffs": [1.0], "z_std": 0.01},
         ),
         sampling_semantics=SamplingSemantics(
-            sampling_mode="b_min_sep",
-            privacy_metadata={"b": 2, "p": 0.2},
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 5},
         ),
     )
-    assert isinstance(private_loader.batch_sampler, BMinSepSampler)
+    assert isinstance(private_loader.batch_sampler, BallsInBinsSampler)
     assert len(private_loader) == 7
 
 
@@ -737,6 +737,275 @@ def test_make_private_with_epsilon_bsr_cyclic_persists_sensitivity_scale() -> No
     assert eps_default == pytest.approx(eps_override, rel=0.0, abs=1e-12)
 
 
+def test_make_private_with_epsilon_bsr_cyclic_epochs_total_steps_sample_rate_parity() -> None:
+    """
+    Equivalent cyclic-poisson runs (same effective step horizon) should resolve
+    to the same calibrated noise when only expressed via epochs vs total_steps.
+
+    This is especially important for non-divisible batch sizes where
+    batch_size / dataset_size differs from 1 / len(data_loader).
+    """
+    dataset_size = 10
+    batch_size = 4  # non-divisible -> len(loader)=3, 1/len≈0.333 vs B/N=0.4
+    steps = math.ceil(dataset_size / batch_size)
+
+    x = torch.randn(dataset_size, 4)
+    y = torch.randint(0, 3, (dataset_size,))
+    loader = DataLoader(TensorDataset(x, y), batch_size=batch_size, shuffle=False)
+
+    model_epochs = nn.Linear(4, 3)
+    model_steps = nn.Linear(4, 3)
+    optimizer_epochs = torch.optim.SGD(model_epochs.parameters(), lr=0.05)
+    optimizer_steps = torch.optim.SGD(model_steps.parameters(), lr=0.05)
+    pe_epochs = PrivacyEngine()
+    pe_steps = PrivacyEngine()
+
+    _, dp_opt_epochs, _ = pe_epochs.make_private_with_epsilon(
+        module=model_epochs,
+        optimizer=optimizer_epochs,
+        data_loader=loader,
+        target_epsilon=1.0,
+        target_delta=1e-5,
+        epochs=1,
+        total_steps=None,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 2},
+        ),
+    )
+
+    _, dp_opt_steps, _ = pe_steps.make_private_with_epsilon(
+        module=model_steps,
+        optimizer=optimizer_steps,
+        data_loader=loader,
+        target_epsilon=1.0,
+        target_delta=1e-5,
+        epochs=None,
+        total_steps=steps,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 2},
+        ),
+    )
+
+    assert float(dp_opt_epochs.noise_multiplier) == pytest.approx(
+        float(dp_opt_steps.noise_multiplier), rel=0.0, abs=1e-12
+    )
+
+
+def test_make_private_with_epsilon_bsr_cyclic_epochs_total_steps_get_epsilon_parity() -> None:
+    dataset_size = 10
+    batch_size = 4
+    steps = math.ceil(dataset_size / batch_size)
+
+    x = torch.randn(dataset_size, 4)
+    y = torch.randint(0, 3, (dataset_size,))
+    loader = DataLoader(TensorDataset(x, y), batch_size=batch_size, shuffle=False)
+
+    model_epochs = nn.Linear(4, 3)
+    model_steps = nn.Linear(4, 3)
+    optimizer_epochs = torch.optim.SGD(model_epochs.parameters(), lr=0.05)
+    optimizer_steps = torch.optim.SGD(model_steps.parameters(), lr=0.05)
+    pe_epochs = PrivacyEngine()
+    pe_steps = PrivacyEngine()
+
+    private_epochs, dp_opt_epochs, private_loader_epochs = pe_epochs.make_private_with_epsilon(
+        module=model_epochs,
+        optimizer=optimizer_epochs,
+        data_loader=loader,
+        target_epsilon=1.0,
+        target_delta=1e-5,
+        epochs=1,
+        total_steps=None,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 2},
+        ),
+    )
+
+    private_steps, dp_opt_steps, private_loader_steps = pe_steps.make_private_with_epsilon(
+        module=model_steps,
+        optimizer=optimizer_steps,
+        data_loader=loader,
+        target_epsilon=1.0,
+        target_delta=1e-5,
+        epochs=None,
+        total_steps=steps,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 2},
+        ),
+    )
+
+    for _ in range(steps):
+        _single_pre_step(private_epochs, dp_opt_epochs, private_loader_epochs)
+        _single_pre_step(private_steps, dp_opt_steps, private_loader_steps)
+
+    eps_epochs = pe_epochs.get_epsilon(1e-5)
+    eps_steps = pe_steps.get_epsilon(1e-5)
+    assert float(eps_epochs) == pytest.approx(float(eps_steps), rel=0.0, abs=1e-12)
+
+
+def test_make_private_with_epsilon_bsr_cyclic_fractional_epochs_total_steps_sample_rate_parity() -> None:
+    dataset_size = 40
+    batch_size = 4
+    epochs = 1.5
+    steps = int(float(epochs) * math.ceil(dataset_size / batch_size))
+
+    x = torch.randn(dataset_size, 4)
+    y = torch.randint(0, 3, (dataset_size,))
+    loader = DataLoader(TensorDataset(x, y), batch_size=batch_size, shuffle=False)
+
+    model_epochs = nn.Linear(4, 3)
+    model_steps = nn.Linear(4, 3)
+    optimizer_epochs = torch.optim.SGD(model_epochs.parameters(), lr=0.05)
+    optimizer_steps = torch.optim.SGD(model_steps.parameters(), lr=0.05)
+    pe_epochs = PrivacyEngine()
+    pe_steps = PrivacyEngine()
+
+    _, dp_opt_epochs, _ = pe_epochs.make_private_with_epsilon(
+        module=model_epochs,
+        optimizer=optimizer_epochs,
+        data_loader=loader,
+        target_epsilon=8.0,
+        target_delta=1e-5,
+        epochs=epochs,
+        total_steps=None,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 2},
+        ),
+    )
+
+    _, dp_opt_steps, _ = pe_steps.make_private_with_epsilon(
+        module=model_steps,
+        optimizer=optimizer_steps,
+        data_loader=loader,
+        target_epsilon=8.0,
+        target_delta=1e-5,
+        epochs=None,
+        total_steps=steps,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 2},
+        ),
+    )
+
+    assert float(dp_opt_epochs.noise_multiplier) == pytest.approx(
+        float(dp_opt_steps.noise_multiplier), rel=0.0, abs=1e-12
+    )
+
+
+def test_make_private_with_epsilon_bsr_cyclic_fractional_epochs_total_steps_get_epsilon_parity() -> None:
+    dataset_size = 40
+    batch_size = 4
+    epochs = 1.5
+    steps = int(float(epochs) * math.ceil(dataset_size / batch_size))
+
+    x = torch.randn(dataset_size, 4)
+    y = torch.randint(0, 3, (dataset_size,))
+    loader = DataLoader(TensorDataset(x, y), batch_size=batch_size, shuffle=False)
+
+    model_epochs = nn.Linear(4, 3)
+    model_steps = nn.Linear(4, 3)
+    optimizer_epochs = torch.optim.SGD(model_epochs.parameters(), lr=0.05)
+    optimizer_steps = torch.optim.SGD(model_steps.parameters(), lr=0.05)
+    pe_epochs = PrivacyEngine()
+    pe_steps = PrivacyEngine()
+
+    private_epochs, dp_opt_epochs, private_loader_epochs = pe_epochs.make_private_with_epsilon(
+        module=model_epochs,
+        optimizer=optimizer_epochs,
+        data_loader=loader,
+        target_epsilon=8.0,
+        target_delta=1e-5,
+        epochs=epochs,
+        total_steps=None,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 2},
+        ),
+    )
+
+    private_steps, dp_opt_steps, private_loader_steps = pe_steps.make_private_with_epsilon(
+        module=model_steps,
+        optimizer=optimizer_steps,
+        data_loader=loader,
+        target_epsilon=8.0,
+        target_delta=1e-5,
+        epochs=None,
+        total_steps=steps,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 2},
+        ),
+    )
+
+    for _ in range(steps):
+        _single_pre_step(private_epochs, dp_opt_epochs, private_loader_epochs)
+        _single_pre_step(private_steps, dp_opt_steps, private_loader_steps)
+
+    eps_epochs = pe_epochs.get_epsilon(1e-5)
+    eps_steps = pe_steps.get_epsilon(1e-5)
+    assert float(eps_epochs) == pytest.approx(float(eps_steps), rel=0.0, abs=1e-12)
+
+
 def test_make_private_with_epsilon_bnb_persists_accounting_kwargs_for_get_epsilon() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
@@ -872,14 +1141,6 @@ def test_make_private_with_epsilon_total_steps_nonpoisson_allows_bsr_torch_sampl
         (
             False,
             SamplingSemantics(
-                sampling_mode="b_min_sep",
-                privacy_metadata={"p": 0.3},
-            ),
-            0.3,
-        ),
-        (
-            False,
-            SamplingSemantics(
                 sampling_mode="balls_in_bins",
                 privacy_metadata={"bins": 5},
             ),
@@ -891,7 +1152,7 @@ def test_make_private_with_epsilon_total_steps_nonpoisson_allows_bsr_torch_sampl
                 sampling_mode="cyclic_poisson",
                 privacy_metadata={"bands": 3},
             ),
-            0.125,
+            8.0 / 63.0,
         ),
         (
             False,
@@ -917,18 +1178,20 @@ def test_resolve_calibration_sample_rate_by_sampling_mode(
     assert abs(float(got) - float(expected_rate)) < 1e-12
 
 
-def test_resolve_total_steps_sample_rate_uses_semantics_and_requires_explicit_custom_nonpoisson() -> None:
-    b_min_sep_rate = PrivacyEngine._resolve_total_steps_sample_rate(
-        poisson_sampling=False,
-        sampling_semantics=SamplingSemantics(
-            sampling_mode="b_min_sep",
-            privacy_metadata={"p": 0.25},
-        ),
-        batch_size=8,
-        dataset_size=64,
-    )
-    assert abs(float(b_min_sep_rate) - 0.25) < 1e-12
+def test_resolve_total_steps_sample_rate_rejects_b_min_sep() -> None:
+    with pytest.raises(ValueError, match="b_min_sep sampling is temporarily disabled"):
+        PrivacyEngine._resolve_total_steps_sample_rate(
+            poisson_sampling=False,
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="b_min_sep",
+                privacy_metadata={"p": 0.25},
+            ),
+            batch_size=8,
+            dataset_size=64,
+        )
 
+
+def test_resolve_total_steps_sample_rate_uses_semantics_and_requires_explicit_custom_nonpoisson() -> None:
     balls_in_bins_rate = PrivacyEngine._resolve_total_steps_sample_rate(
         poisson_sampling=False,
         sampling_semantics=SamplingSemantics(
@@ -952,6 +1215,18 @@ def test_resolve_total_steps_sample_rate_uses_semantics_and_requires_explicit_cu
     )
     assert abs(float(bsr_torch_sampler_rate) - 0.125) < 1e-12
 
+    cyclic_rate = PrivacyEngine._resolve_total_steps_sample_rate(
+        poisson_sampling=False,
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 3},
+        ),
+        batch_size=8,
+        dataset_size=64,
+        mechanism="bsr",
+    )
+    assert abs(float(cyclic_rate) - (8.0 / 63.0)) < 1e-12
+
     with pytest.raises(ValueError, match="requires explicit sampling_semantics"):
         PrivacyEngine._resolve_total_steps_sample_rate(
             poisson_sampling=False,
@@ -974,7 +1249,86 @@ def test_resolve_total_steps_sample_rate_uses_semantics_and_requires_explicit_cu
         )
 
 
-def test_make_private_with_epsilon_total_steps_uses_b_min_sep_rate() -> None:
+def test_cyclic_nondivisible_accountant_q_matches_sampler_implied_q() -> None:
+    dataset_size = 64
+    batch_size = 8
+    bands = 3
+    usable_size = (dataset_size // bands) * bands  # 63
+    expected_q = float(batch_size) / float(usable_size)
+
+    sample_rate = PrivacyEngine._resolve_total_steps_sample_rate(
+        poisson_sampling=False,
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": bands},
+        ),
+        batch_size=batch_size,
+        dataset_size=dataset_size,
+        mechanism="bsr",
+    )
+    accountant_q = float(sample_rate) * float(bands)
+    sampler_implied_q = expected_q * float(bands)
+    assert accountant_q == pytest.approx(sampler_implied_q, rel=0.0, abs=1e-12)
+
+
+def test_make_private_default_gaussian_uses_loader_rate_without_total_steps() -> None:
+    dataset_size = 10
+    batch_size = 4  # 1/len(loader)=1/3; batch_size/dataset_size=0.4
+    loader = DataLoader(
+        TensorDataset(torch.randn(dataset_size, 4), torch.randint(0, 3, (dataset_size,))),
+        batch_size=batch_size,
+        shuffle=False,
+    )
+
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    pe = PrivacyEngine(accountant="rdp")
+
+    private_model, private_optimizer, private_loader = pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=loader,
+        noise_multiplier=1.0,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        total_steps=None,
+    )
+
+    _single_pre_step(private_model, private_optimizer, private_loader)
+    _, sample_rate, _ = pe.accountant.history[-1]
+    assert float(sample_rate) == pytest.approx(1.0 / len(loader), rel=0.0, abs=1e-12)
+    assert float(sample_rate) != pytest.approx(batch_size / dataset_size, rel=0.0, abs=1e-12)
+
+
+def test_make_private_default_gaussian_uses_batch_ratio_with_total_steps() -> None:
+    dataset_size = 10
+    batch_size = 4
+    loader = DataLoader(
+        TensorDataset(torch.randn(dataset_size, 4), torch.randint(0, 3, (dataset_size,))),
+        batch_size=batch_size,
+        shuffle=False,
+    )
+
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    pe = PrivacyEngine(accountant="rdp")
+
+    private_model, private_optimizer, private_loader = pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=loader,
+        noise_multiplier=1.0,
+        max_grad_norm=1.0,
+        poisson_sampling=True,
+        total_steps=5,
+    )
+
+    _single_pre_step(private_model, private_optimizer, private_loader)
+    _, sample_rate, _ = pe.accountant.history[-1]
+    assert float(sample_rate) == pytest.approx(batch_size / dataset_size, rel=0.0, abs=1e-12)
+
+
+def test_make_private_with_epsilon_total_steps_uses_balls_in_bins_rate() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
@@ -1000,8 +1354,8 @@ def test_make_private_with_epsilon_total_steps_uses_b_min_sep_rate() -> None:
             },
         ),
         sampling_semantics=SamplingSemantics(
-            sampling_mode="b_min_sep",
-            privacy_metadata={"b": 2, "p": 0.2, "bands": 1},
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 5, "bands": 1},
         ),
     )
     assert float(dp_optimizer.noise_multiplier) > 0.0
@@ -1034,8 +1388,8 @@ def test_make_private_with_epsilon_logs_sample_rate_resolution_context_total_ste
             },
         ),
         sampling_semantics=SamplingSemantics(
-            sampling_mode="b_min_sep",
-            privacy_metadata={"b": 2, "p": 0.2, "bands": 1},
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 5, "bands": 1},
         ),
     )
 
@@ -1043,7 +1397,7 @@ def test_make_private_with_epsilon_logs_sample_rate_resolution_context_total_ste
     assert any("bnb init: starting get_noise_multiplier (steps=" in m for m in messages)
 
 
-def test_make_private_with_epsilon_epochs_uses_b_min_sep_rate() -> None:
+def test_make_private_with_epsilon_epochs_uses_balls_in_bins_rate() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
@@ -1069,8 +1423,8 @@ def test_make_private_with_epsilon_epochs_uses_b_min_sep_rate() -> None:
             },
         ),
         sampling_semantics=SamplingSemantics(
-            sampling_mode="b_min_sep",
-            privacy_metadata={"b": 2, "p": 0.2, "bands": 1},
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 5, "bands": 1},
         ),
     )
     assert float(dp_optimizer.noise_multiplier) > 0.0
@@ -1177,8 +1531,8 @@ def test_make_private_with_epsilon_bnb_calibrates_with_default_accounting() -> N
             },
         ),
         sampling_semantics=SamplingSemantics(
-            sampling_mode="b_min_sep",
-            privacy_metadata={"b": 2, "p": 0.1, "bands": 2},
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 10, "bands": 2},
         ),
     )
     assert float(dp_optimizer.noise_multiplier) > 0.0
@@ -1219,8 +1573,8 @@ def test_make_private_with_epsilon_bnb_zstd_uses_optimizer_expected_batch_size()
             },
         ),
         sampling_semantics=SamplingSemantics(
-            sampling_mode="b_min_sep",
-            privacy_metadata={"b": 2, "p": 0.1, "bands": 2},
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 10, "bands": 2},
         ),
     )
 
@@ -1252,14 +1606,14 @@ def test_make_private_with_epsilon_bnb_requires_mc_inputs() -> None:
                 mechanism_state={"coeffs": [1.0], "z_std": 0.01},
             ),
             sampling_semantics=SamplingSemantics(
-                sampling_mode="b_min_sep",
-                privacy_metadata={"b": 2, "p": 0.1, "bands": 2},
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 10, "bands": 2},
             ),
             
         )
 
 
-def test_make_private_with_epsilon_bnb_b_min_sep_succeeds() -> None:
+def test_make_private_with_epsilon_bnb_balls_in_bins_reports_status() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
@@ -1291,8 +1645,8 @@ def test_make_private_with_epsilon_bnb_b_min_sep_succeeds() -> None:
             },
         ),
         sampling_semantics=SamplingSemantics(
-            sampling_mode="b_min_sep",
-            privacy_metadata={"b": 2, "p": 0.1, "bands": 2},
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 10, "bands": 2},
         ),
             
         bnb_num_samples=10_000,
@@ -1322,7 +1676,7 @@ def test_make_private_with_epsilon_bnb_b_min_sep_succeeds() -> None:
     assert status is not None
     assert status.mechanism == "bnb"
     assert status.accounting_mode == "bnb_accountant"
-    assert status.sampling_mode == "b_min_sep"
+    assert status.sampling_mode == "balls_in_bins"
     assert status.report.version == 2
     status_dict = status.to_dict()
     assert status_dict["report"]["version"] == 2
@@ -1342,7 +1696,7 @@ def test_make_private_with_epsilon_bnb_requires_supported_sampling_mode() -> Non
 
     with pytest.raises(
         ValueError,
-        match="requires sampling_semantics in \\{'b_min_sep', 'balls_in_bins'\\}",
+        match="requires sampling_semantics in \\{'balls_in_bins'\\}",
     ):
         pe.make_private_with_epsilon(
             module=model,
@@ -1485,8 +1839,8 @@ def test_make_private_with_epsilon_bnb_rejects_bands_coeffs_mismatch() -> None:
                 },
             ),
             sampling_semantics=SamplingSemantics(
-                sampling_mode="b_min_sep",
-                privacy_metadata={"b": 2, "p": 0.1, "bands": 2},
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 10, "bands": 2},
             ),
             
             bnb_num_samples=2_000,
@@ -1527,8 +1881,8 @@ def test_make_private_with_epsilon_bnb_rejects_metadata_bands_mismatch() -> None
                 },
             ),
             sampling_semantics=SamplingSemantics(
-                sampling_mode="b_min_sep",
-                privacy_metadata={"b": 2, "p": 0.1, "bands": 3},
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 10, "bands": 3},
             ),
             
             bnb_num_samples=2_000,
@@ -1572,8 +1926,8 @@ def test_make_private_with_epsilon_bnb_rejects_contract_mismatch() -> None:
                 },
             ),
             sampling_semantics=SamplingSemantics(
-                sampling_mode="b_min_sep",
-                privacy_metadata={"b": 2, "p": 0.1, "bands": 2},
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 10, "bands": 2},
             ),
             
             bnb_num_samples=2_000,
@@ -1614,8 +1968,8 @@ def test_make_private_with_epsilon_bnb_rejects_toeplitz_derivation_mismatch() ->
                 },
             ),
             sampling_semantics=SamplingSemantics(
-                sampling_mode="b_min_sep",
-                privacy_metadata={"b": 2, "p": 0.1, "bands": 2},
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 10, "bands": 2},
             ),
             
             bnb_num_samples=2_000,
@@ -1656,8 +2010,8 @@ def test_make_private_with_epsilon_bnb_fails_on_verification_reject() -> None:
                 },
             ),
             sampling_semantics=SamplingSemantics(
-                sampling_mode="b_min_sep",
-                privacy_metadata={"b": 2, "p": 0.1, "bands": 2},
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 10, "bands": 2},
             ),
             
             bnb_num_samples=100,
@@ -1699,8 +2053,8 @@ def test_make_private_with_epsilon_bnb_allows_verification_reject_when_disabled(
             },
         ),
         sampling_semantics=SamplingSemantics(
-            sampling_mode="b_min_sep",
-            privacy_metadata={"b": 2, "p": 0.1, "bands": 2},
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 10, "bands": 2},
         ),
             
         bnb_num_samples=100,

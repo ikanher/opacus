@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import math
+
 from opacus.accountants.analysis.bsr import (
     bsr_cyclic_poisson_epsilon_upper_bound,
     compute_bsr_mf_sensitivity_from_coeffs,
@@ -115,34 +117,34 @@ class BSRAccountant(IAccountant):
             "bsr_mf_sensitivity",
             metadata.get("mf_sensitivity", state.get("mf_sensitivity")),
         )
+        coeffs = state.get("coeffs")
+        max_participations = kwargs.get(
+            "bsr_max_participations",
+            metadata.get(
+                "max_participations",
+                state.get("max_participations"),
+            ),
+        )
+        min_separation = kwargs.get(
+            "bsr_min_separation",
+            metadata.get(
+                "min_separation",
+                state.get("min_separation", metadata.get("bands")),
+            ),
+        )
+        sensitivity_steps = kwargs.get(
+            "bsr_iterations_number",
+            metadata.get("iterations_number", state.get("iterations_number")),
+        )
+
+        if sensitivity_steps is None:
+            sensitivity_steps = total_steps
+
+        sensitivity_steps = int(sensitivity_steps)
+        if sensitivity_steps < 1:
+            raise ValueError("bsr_iterations_number must be >= 1")
 
         if mf_sensitivity is None:
-            coeffs = state.get("coeffs")
-            max_participations = kwargs.get(
-                "bsr_max_participations",
-                metadata.get(
-                    "max_participations",
-                    state.get("max_participations"),
-                ),
-            )
-            min_separation = kwargs.get(
-                "bsr_min_separation",
-                metadata.get(
-                    "min_separation",
-                    state.get("min_separation", metadata.get("bands")),
-                ),
-            )
-            sensitivity_steps = kwargs.get(
-                "bsr_iterations_number",
-                metadata.get("iterations_number", state.get("iterations_number")),
-            )
-
-            if sensitivity_steps is None:
-                sensitivity_steps = total_steps
-
-            sensitivity_steps = int(sensitivity_steps)
-            if sensitivity_steps < 1:
-                raise ValueError("bsr_iterations_number must be >= 1")
             if (
                 coeffs is None
                 or max_participations is None
@@ -160,6 +162,36 @@ class BSRAccountant(IAccountant):
                 max_participations=int(max_participations),
                 min_separation=int(min_separation),
             )
+        else:
+            mf_sensitivity = float(mf_sensitivity)
+            if not math.isfinite(mf_sensitivity) or mf_sensitivity <= 0.0:
+                raise ValueError("bsr_mf_sensitivity must be finite and > 0")
+            if (
+                coeffs is not None
+                and max_participations is not None
+                and min_separation is not None
+            ):
+                derived = float(
+                    compute_bsr_mf_sensitivity_from_coeffs(
+                        coeffs=coeffs,
+                        steps=sensitivity_steps,
+                        max_participations=int(max_participations),
+                        min_separation=int(min_separation),
+                    )
+                )
+                if not math.isfinite(derived) or derived <= 0.0:
+                    raise ValueError(
+                        "derived bsr_mf_sensitivity must be finite and > 0 "
+                        "when validating explicit bsr_mf_sensitivity"
+                    )
+                if not math.isclose(
+                    mf_sensitivity, derived, rel_tol=1e-9, abs_tol=1e-12
+                ):
+                    raise ValueError(
+                        "provided bsr_mf_sensitivity is inconsistent with "
+                        "coeffs/max_participations/min_separation for the resolved "
+                        "bsr_iterations_number"
+                    )
 
         return float(
             bsr_fixed_batch_epsilon_upper_bound(

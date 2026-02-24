@@ -358,7 +358,24 @@ class PrivacyEngine:
                 dataset_size=dataset_size,
             )
         else:
-            sample_rate = 1 / data_loader_len
+            sampling_mode = (
+                sampling_semantics.sampling_mode
+                if sampling_semantics is not None
+                else None
+            )
+            if (
+                not poisson_sampling
+                and sampling_mode in ("cyclic_poisson", "balls_in_bins", "b_min_sep")
+            ):
+                sample_rate = PrivacyEngine._resolve_total_steps_sample_rate(
+                    poisson_sampling=poisson_sampling,
+                    sampling_semantics=sampling_semantics,
+                    mechanism=mechanism,
+                    batch_size=batch_size,
+                    dataset_size=dataset_size,
+                )
+            else:
+                sample_rate = 1 / data_loader_len
 
         expected_batch_size = int(dataset_size * sample_rate)
 
@@ -382,17 +399,6 @@ class PrivacyEngine:
             if sampling_semantics is not None
             else {}
         )
-
-        mf_sensitivity = kwargs.get(
-            "bsr_mf_sensitivity",
-            metadata.get("mf_sensitivity", mechanism_state.get("mf_sensitivity")),
-        )
-        if mf_sensitivity is not None:
-            resolved = float(mf_sensitivity)
-            if not math.isfinite(resolved) or resolved <= 0.0:
-                raise ValueError("bsr_mf_sensitivity must be finite and > 0")
-            return resolved
-
         coeffs = mechanism_state.get("coeffs")
         max_participations = kwargs.get(
             "bsr_max_participations",
@@ -409,14 +415,48 @@ class PrivacyEngine:
             "bsr_iterations_number",
             metadata.get("iterations_number", mechanism_state.get("iterations_number")),
         )
-
-        # XXX: Should this really default to steps??
         if sensitivity_steps is None:
             sensitivity_steps = steps
 
         sensitivity_steps = int(sensitivity_steps)
         if sensitivity_steps < 1:
             raise ValueError("bsr_iterations_number must be >= 1")
+
+        mf_sensitivity = kwargs.get(
+            "bsr_mf_sensitivity",
+            metadata.get("mf_sensitivity", mechanism_state.get("mf_sensitivity")),
+        )
+        if mf_sensitivity is not None:
+            resolved = float(mf_sensitivity)
+            if not math.isfinite(resolved) or resolved <= 0.0:
+                raise ValueError("bsr_mf_sensitivity must be finite and > 0")
+            if (
+                coeffs is not None
+                and max_participations is not None
+                and min_separation is not None
+            ):
+                derived = float(
+                    compute_bsr_mf_sensitivity_from_coeffs(
+                        coeffs=coeffs,
+                        steps=sensitivity_steps,
+                        max_participations=int(max_participations),
+                        min_separation=int(min_separation),
+                    )
+                )
+                if not math.isfinite(derived) or derived <= 0.0:
+                    raise ValueError(
+                        "derived bsr_mf_sensitivity must be finite and > 0 "
+                        "when validating explicit bsr_mf_sensitivity"
+                    )
+                if not math.isclose(
+                    resolved, derived, rel_tol=1e-9, abs_tol=1e-12
+                ):
+                    raise ValueError(
+                        "provided bsr_mf_sensitivity is inconsistent with "
+                        "coeffs/max_participations/min_separation for the resolved "
+                        "bsr_iterations_number"
+                    )
+            return resolved
 
         if coeffs is None or max_participations is None or min_separation is None:
             raise ValueError(
@@ -600,6 +640,7 @@ class PrivacyEngine:
     ):
         if isinstance(data_loader.dataset, torch.utils.data.IterableDataset):
             raise ValueError("cyclic_poisson sampling is not supported for IterableDataset")
+
         if data_loader.batch_size is None:
             raise ValueError("cyclic_poisson sampling requires data_loader.batch_size")
 
@@ -810,6 +851,23 @@ class PrivacyEngine:
 
             return 1.0 / float(int(bins))
 
+        if not poisson_sampling and sampling_mode == "cyclic_poisson":
+            bands = sampling_semantics.privacy_metadata.get("bands")
+            if bands is None:
+                raise ValueError(
+                    "cyclic_poisson sampling requires privacy_metadata['bands']"
+                )
+            bands = int(bands)
+            if bands <= 0:
+                raise ValueError("cyclic_poisson bands must be > 0")
+            partition_size = int(dataset_size) // bands
+            if partition_size <= 0:
+                raise ValueError(
+                    "cyclic_poisson requires dataset_size // bands >= 1"
+                )
+            usable_size = partition_size * bands
+            return float(batch_size) / float(usable_size)
+
         # For Poisson and cyclic_poisson, q follows the batch-size ratio.
         return batch_size / dataset_size
 
@@ -940,14 +998,20 @@ class PrivacyEngine:
             )
             return float(noise_multiplier), float(sample_rate)
 
-        sample_rate = 1 / len(data_loader)
+        sample_rate = self._resolve_total_steps_sample_rate(
+            poisson_sampling=poisson_sampling,
+            sampling_semantics=sampling_semantics,
+            mechanism=mechanism_config.mechanism,
+            batch_size=data_loader.batch_size,
+            dataset_size=len(data_loader.dataset),
+        )
+        implied_steps = int(float(epochs) * float(len(data_loader)))
         bsr_mf_sensitivity = None
         if (
             mechanism_config.mechanism == "bsr"
             and sampling_semantics is not None
             and sampling_semantics.sampling_mode == "cyclic_poisson"
         ):
-            implied_steps = int(epochs / sample_rate)
             nm_kwargs["bsr_sensitivity_scale"] = self._resolve_bsr_sensitivity_scale_for_cyclic(
                 mechanism_state=mechanism_config.mechanism_state,
                 sampling_semantics=sampling_semantics,
@@ -959,7 +1023,6 @@ class PrivacyEngine:
             and sampling_semantics is not None
             and sampling_semantics.sampling_mode == "torch_sampler"
         ):
-            implied_steps = int(epochs / sample_rate)
             bsr_mf_sensitivity = self._resolve_bsr_mf_sensitivity_for_fixed_batch(
                 mechanism_state=mechanism_config.mechanism_state,
                 sampling_semantics=sampling_semantics,
@@ -971,7 +1034,7 @@ class PrivacyEngine:
             target_epsilon=target_epsilon,
             target_delta=target_delta,
             sample_rate=sample_rate,
-            epochs=epochs,
+            steps=implied_steps,
             accountant=active_accountant.mechanism(),
             mechanism_state=mechanism_config.mechanism_state,
             sampling_semantics=sampling_semantics,
@@ -1021,7 +1084,13 @@ class PrivacyEngine:
                 float(target_delta),
             )
         else:
-            sample_rate = 1 / len(data_loader)
+            sample_rate = self._resolve_total_steps_sample_rate(
+                poisson_sampling=poisson_sampling,
+                sampling_semantics=sampling_semantics,
+                mechanism=mechanism_config.mechanism,
+                batch_size=data_loader.batch_size,
+                dataset_size=len(data_loader.dataset),
+            )
             logger.info(
                 "bnb init: starting get_noise_multiplier (epochs=%s, sample_rate=%.6g, eps=%.6g, delta=%.6g)",
                 int(epochs),
@@ -1848,6 +1917,7 @@ class PrivacyEngine:
             )
             state = copy.deepcopy(mechanism_config.mechanism_state)
             state["sensitivity_scale"] = float(resolved_scale)
+
             mechanism_config = NoiseMechanismConfig(
                 mechanism=mechanism_config.mechanism,
                 accounting_mode=mechanism_config.accounting_mode,
@@ -1872,8 +1942,10 @@ class PrivacyEngine:
                 steps=mf_steps,
                 kwargs=kwargs,
             )
+
             state = copy.deepcopy(mechanism_config.mechanism_state)
             state["mf_sensitivity"] = float(resolved_mf_sensitivity)
+
             mechanism_config = NoiseMechanismConfig(
                 mechanism=mechanism_config.mechanism,
                 accounting_mode=mechanism_config.accounting_mode,
@@ -1889,6 +1961,7 @@ class PrivacyEngine:
             target_delta=target_delta,
             kwargs=kwargs,
         )
+
         bnb_accounting_kwargs = self._build_bnb_accounting_kwargs_for_state(
             mechanism=mechanism_config.mechanism,
             kwargs=kwargs,
@@ -1902,6 +1975,7 @@ class PrivacyEngine:
             bnb_calibration_report=bnb_calibration_report,
             bnb_accounting_kwargs=bnb_accounting_kwargs,
         )
+
         self._log_bsr_trace(
             stage="make_private_with_epsilon_post_calibration",
             mechanism_config=mechanism_config,
