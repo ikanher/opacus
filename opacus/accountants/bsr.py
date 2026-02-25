@@ -94,6 +94,31 @@ class BSRAccountant(IAccountant):
                 )
 
             state = mechanism_state if isinstance(mechanism_state, dict) else {}
+            fixed_only_params = []
+            if kwargs.get("bsr_mf_sensitivity") is not None:
+                fixed_only_params.append("bsr_mf_sensitivity")
+            if kwargs.get("bsr_max_participations") is not None:
+                fixed_only_params.append("bsr_max_participations")
+            if kwargs.get("bsr_min_separation") is not None:
+                fixed_only_params.append("bsr_min_separation")
+            if metadata.get("mf_sensitivity") is not None:
+                fixed_only_params.append("privacy_metadata['mf_sensitivity']")
+            if metadata.get("max_participations") is not None:
+                fixed_only_params.append("privacy_metadata['max_participations']")
+            if metadata.get("min_separation") is not None:
+                fixed_only_params.append("privacy_metadata['min_separation']")
+            if state.get("mf_sensitivity") is not None:
+                fixed_only_params.append("mechanism_state['mf_sensitivity']")
+            if state.get("max_participations") is not None:
+                fixed_only_params.append("mechanism_state['max_participations']")
+            if state.get("min_separation") is not None:
+                fixed_only_params.append("mechanism_state['min_separation']")
+            if fixed_only_params:
+                raise ValueError(
+                    "cyclic-poisson bsr accounting received fixed-batch-only parameters: "
+                    + ", ".join(fixed_only_params)
+                )
+
             sensitivity_scale = kwargs.get(
                 "bsr_sensitivity_scale",
                 metadata.get("sensitivity_scale", state.get("sensitivity_scale", 1.0)),
@@ -117,6 +142,7 @@ class BSRAccountant(IAccountant):
             "bsr_mf_sensitivity",
             metadata.get("mf_sensitivity", state.get("mf_sensitivity")),
         )
+        explicit_mf_sensitivity_override = "bsr_mf_sensitivity" in kwargs
         coeffs = state.get("coeffs")
         max_participations = kwargs.get(
             "bsr_max_participations",
@@ -167,6 +193,8 @@ class BSRAccountant(IAccountant):
             if not math.isfinite(mf_sensitivity) or mf_sensitivity <= 0.0:
                 raise ValueError("bsr_mf_sensitivity must be finite and > 0")
             if (
+                explicit_mf_sensitivity_override
+                and
                 coeffs is not None
                 and max_participations is not None
                 and min_separation is not None

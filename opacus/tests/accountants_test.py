@@ -1016,7 +1016,7 @@ class AccountingTest(unittest.TestCase):
         )
         cyclic_eps = accountant.get_epsilon(
             delta=delta,
-            mechanism_state={"mf_sensitivity": 1.0},
+            mechanism_state={},
             sampling_semantics=SamplingSemantics(
                 sampling_mode="cyclic_poisson",
                 privacy_metadata={"bands": 10},
@@ -1024,6 +1024,60 @@ class AccountingTest(unittest.TestCase):
         )
 
         self.assertNotAlmostEqual(fixed_eps, cyclic_eps, places=6)
+
+    def test_bsr_accountant_cyclic_poisson_rejects_fixed_batch_only_kwargs(self) -> None:
+        accountant = BSRAccountant()
+        accountant.history = [(1.0, 0.01, 100)]
+        with self.assertRaisesRegex(
+            ValueError,
+            "cyclic-poisson bsr accounting received fixed-batch-only parameters",
+        ):
+            accountant.get_epsilon(
+                delta=1e-5,
+                mechanism_state={},
+                sampling_semantics=SamplingSemantics(
+                    sampling_mode="cyclic_poisson",
+                    privacy_metadata={"bands": 10},
+                ),
+                bsr_mf_sensitivity=1.0,
+            )
+
+    def test_bsr_cyclic_poisson_epsilon_invariant_within_same_round_bucket(self) -> None:
+        # With fixed (q, noise, delta, bands), epsilon depends on rounds=ceil(steps/bands).
+        eps_a = bsr_cyclic_poisson_epsilon_upper_bound(
+            noise_multiplier=1.1,
+            target_delta=1e-5,
+            steps=11,
+            sample_rate=0.02,
+            bands=10,
+        )
+        eps_b = bsr_cyclic_poisson_epsilon_upper_bound(
+            noise_multiplier=1.1,
+            target_delta=1e-5,
+            steps=20,
+            sample_rate=0.02,
+            bands=10,
+        )
+        self.assertAlmostEqual(eps_a, eps_b, places=12)
+
+    def test_bsr_cyclic_poisson_epsilon_depends_on_q_and_rounds(self) -> None:
+        # Pair 1: q=0.1, rounds=10
+        eps_a = bsr_cyclic_poisson_epsilon_upper_bound(
+            noise_multiplier=1.1,
+            target_delta=1e-5,
+            steps=100,
+            sample_rate=0.01,
+            bands=10,
+        )
+        # Pair 2: q=0.1, rounds=10
+        eps_b = bsr_cyclic_poisson_epsilon_upper_bound(
+            noise_multiplier=1.1,
+            target_delta=1e-5,
+            steps=50,
+            sample_rate=0.02,
+            bands=5,
+        )
+        self.assertAlmostEqual(eps_a, eps_b, places=12)
 
     def test_bsr_cyclic_poisson_no_amplification_boundary_matches_gaussian(self) -> None:
         # No amplification boundary from JAX tests:
@@ -1153,6 +1207,46 @@ class AccountingTest(unittest.TestCase):
         )
 
         self.assertNotAlmostEqual(eps_default, eps_override, places=10)
+
+    def test_bsr_get_epsilon_fixed_batch_uses_calibrated_sensitivity_under_partial_progress(
+        self,
+    ) -> None:
+        coeffs = [1.0, 0.8, 0.4, 0.1]
+        calibration_steps = 16
+        executed_steps = 4
+        noise_multiplier = 1.3
+        delta = 1e-5
+
+        calibrated_mf_sensitivity = compute_bsr_mf_sensitivity_from_coeffs(
+            coeffs=coeffs,
+            steps=calibration_steps,
+            max_participations=4,
+            min_separation=2,
+        )
+
+        accountant = BSRAccountant()
+        accountant.history = [(noise_multiplier, 0.125, executed_steps)]
+
+        eps = accountant.get_epsilon(
+            delta=delta,
+            mechanism_state={
+                "coeffs": coeffs,
+                "max_participations": 4,
+                "min_separation": 2,
+                "mf_sensitivity": calibrated_mf_sensitivity,
+            },
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="torch_sampler",
+                privacy_metadata={},
+            ),
+        )
+
+        expected = bsr_fixed_batch_epsilon_upper_bound(
+            noise_multiplier=noise_multiplier,
+            target_delta=delta,
+            mf_sensitivity=calibrated_mf_sensitivity,
+        )
+        self.assertAlmostEqual(eps, expected, places=12)
 
     def test_get_noise_multiplier_accepts_bsr_iterations_number_override(self) -> None:
         noise = get_noise_multiplier(

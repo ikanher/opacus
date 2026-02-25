@@ -399,6 +399,19 @@ class PrivacyEngine:
             if sampling_semantics is not None
             else {}
         )
+        cyclic_only_params = []
+        if kwargs.get("bsr_sensitivity_scale") is not None:
+            cyclic_only_params.append("bsr_sensitivity_scale")
+        if metadata.get("sensitivity_scale") is not None:
+            cyclic_only_params.append("privacy_metadata['sensitivity_scale']")
+        if mechanism_state.get("sensitivity_scale") is not None:
+            cyclic_only_params.append("mechanism_state['sensitivity_scale']")
+        if cyclic_only_params:
+            raise ValueError(
+                "fixed-batch bsr accounting received cyclic-only parameters: "
+                + ", ".join(cyclic_only_params)
+            )
+
         coeffs = mechanism_state.get("coeffs")
         max_participations = kwargs.get(
             "bsr_max_participations",
@@ -491,6 +504,31 @@ class PrivacyEngine:
             if sampling_semantics is not None
             else {}
         )
+        fixed_only_params = []
+        if kwargs.get("bsr_mf_sensitivity") is not None:
+            fixed_only_params.append("bsr_mf_sensitivity")
+        if kwargs.get("bsr_max_participations") is not None:
+            fixed_only_params.append("bsr_max_participations")
+        if kwargs.get("bsr_min_separation") is not None:
+            fixed_only_params.append("bsr_min_separation")
+        if metadata.get("mf_sensitivity") is not None:
+            fixed_only_params.append("privacy_metadata['mf_sensitivity']")
+        if metadata.get("max_participations") is not None:
+            fixed_only_params.append("privacy_metadata['max_participations']")
+        if metadata.get("min_separation") is not None:
+            fixed_only_params.append("privacy_metadata['min_separation']")
+        if mechanism_state.get("mf_sensitivity") is not None:
+            fixed_only_params.append("mechanism_state['mf_sensitivity']")
+        if mechanism_state.get("max_participations") is not None:
+            fixed_only_params.append("mechanism_state['max_participations']")
+        if mechanism_state.get("min_separation") is not None:
+            fixed_only_params.append("mechanism_state['min_separation']")
+        if fixed_only_params:
+            raise ValueError(
+                "cyclic-poisson bsr accounting received fixed-batch-only parameters: "
+                + ", ".join(fixed_only_params)
+            )
+
         explicit_scale = kwargs.get(
             "bsr_sensitivity_scale",
             metadata.get("sensitivity_scale", mechanism_state.get("sensitivity_scale")),

@@ -178,3 +178,35 @@ def test_cyclic_scale_rejects_invalid_horizon_override() -> None:
             steps=10,
             kwargs={"bsr_iterations_number": 0},
         )
+
+
+def test_cyclic_scale_rejects_fixed_batch_only_kwargs() -> None:
+    with pytest.raises(
+        ValueError,
+        match="cyclic-poisson bsr accounting received fixed-batch-only parameters",
+    ):
+        PrivacyEngine._resolve_bsr_sensitivity_scale_for_cyclic(
+            mechanism_state={"coeffs": [1.0, 0.2]},
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="cyclic_poisson",
+                privacy_metadata={"bands": 2},
+            ),
+            steps=10,
+            kwargs={"bsr_mf_sensitivity": 1.0},
+        )
+
+
+def test_fixed_batch_mf_sensitivity_rejects_cyclic_only_kwargs() -> None:
+    with pytest.raises(
+        ValueError,
+        match="fixed-batch bsr accounting received cyclic-only parameters",
+    ):
+        PrivacyEngine._resolve_bsr_mf_sensitivity_for_fixed_batch(
+            mechanism_state={"coeffs": [1.0], "max_participations": 1, "min_separation": 1},
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="torch_sampler",
+                privacy_metadata={},
+            ),
+            steps=10,
+            kwargs={"bsr_sensitivity_scale": 1.0},
+        )
