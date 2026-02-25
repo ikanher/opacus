@@ -41,7 +41,8 @@ class DistributedCyclicPoissonSamplerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.world_size = 2
         self.total_size = 24
-        self.local_batch_size = 2
+        # partition_size = 24 // 3 = 8, local shard size = 4, choose q=1.
+        self.local_batch_size = 4
         self.bands = 3
         self.steps = 6
         self.samplers = self._init_samplers(seed=7)
@@ -51,11 +52,14 @@ class DistributedCyclicPoissonSamplerTest(unittest.TestCase):
             self.assertEqual(len(sampler), self.steps)
 
     def test_local_batches_follow_cyclic_band_membership(self) -> None:
+        # With q=1 every local shard member appears whenever its band is active.
         for sampler in self.samplers:
+            residue_by_index = {}
             for step, batch in enumerate(sampler):
-                active_band = step % self.bands
-                global_part = set(sampler._global_partitions[active_band])
-                self.assertTrue(set(batch).issubset(global_part))
+                residue = step % self.bands
+                for idx in batch:
+                    previous = residue_by_index.setdefault(idx, residue)
+                    self.assertEqual(previous, residue)
 
     def test_per_step_cross_rank_indices_are_disjoint(self) -> None:
         rank_batches = [list(sampler) for sampler in self.samplers]

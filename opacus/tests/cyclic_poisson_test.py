@@ -14,7 +14,10 @@
 # limitations under the License.
 
 import unittest
+from unittest import mock
 
+import math
+import numpy as np
 import torch
 from opacus.utils.uniform_sampler import CyclicPoissonSampler
 
@@ -36,17 +39,25 @@ class CyclicPoissonSamplerTest(unittest.TestCase):
         self.assertEqual(len(sampler), 8)
 
     def test_cyclic_band_membership(self) -> None:
-        sampler = self._init_sampler(seed=7)
+        # Use q=1 so every partition member appears whenever its band is active.
+        sampler = CyclicPoissonSampler(
+            num_samples=20,
+            batch_size=5,  # partition_size = 20 // 4 = 5 => q=1
+            bands=4,
+            steps=8,
+            generator=torch.Generator().manual_seed(7),
+            shuffle=True,
+            shuffle_seed=123,
+        )
 
-        band_size = 20 // 4
-        partitions = []
-        for j in range(4):
-            start = j * band_size
-            partitions.append(set(range(start, start + band_size)))
-
+        residue_by_index = {}
         for step, batch in enumerate(sampler):
-            active_band = step % 4
-            self.assertTrue(set(batch).issubset(partitions[active_band]))
+            residue = step % 4
+            for idx in batch:
+                previous = residue_by_index.setdefault(idx, residue)
+                self.assertEqual(previous, residue)
+
+        self.assertEqual(len(residue_by_index), 20)
     
     def test_batch_size_is_not_forced_fixed(self) -> None:
         sampler = CyclicPoissonSampler(
@@ -68,3 +79,18 @@ class CyclicPoissonSamplerTest(unittest.TestCase):
         sampler1 = self._init_sampler(seed=7)
         sampler2 = self._init_sampler(seed=8)
         self.assertNotEqual(list(sampler1), list(sampler2))
+
+    def test_set_epoch_changes_partition(self) -> None:
+        sampler = CyclicPoissonSampler(
+            num_samples=20,
+            batch_size=5,  # q=1
+            bands=4,
+            steps=4,
+            generator=torch.Generator().manual_seed(9),
+            shuffle=True,
+            shuffle_seed=42,
+        )
+        epoch0 = list(sampler)
+        sampler.set_epoch(1)
+        epoch1 = list(sampler)
+        self.assertNotEqual(epoch0, epoch1)
