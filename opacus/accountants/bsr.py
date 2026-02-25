@@ -169,13 +169,14 @@ class BSRAccountant(IAccountant):
         sensitivity_steps = int(sensitivity_steps)
         if sensitivity_steps < 1:
             raise ValueError("bsr_iterations_number must be >= 1")
+        if max_participations is None:
+            max_participations = int(math.ceil(float(sample_rate) * float(sensitivity_steps)))
+            max_participations = max(1, int(max_participations))
+        if min_separation is None:
+            min_separation = 1
 
         if mf_sensitivity is None:
-            if (
-                coeffs is None
-                or max_participations is None
-                or min_separation is None
-            ):
+            if coeffs is None:
                 raise ValueError(
                     "fixed-batch bsr accounting requires MF sensitivity or "
                     "enough data to derive it: "

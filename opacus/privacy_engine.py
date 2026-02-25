@@ -392,6 +392,7 @@ class PrivacyEngine:
         mechanism_state: Dict[str, Any],
         sampling_semantics: Optional[SamplingSemantics],
         steps: int,
+        sample_rate: Optional[float],
         kwargs: Dict[str, Any],
     ) -> float:
         metadata = (
@@ -434,6 +435,12 @@ class PrivacyEngine:
         sensitivity_steps = int(sensitivity_steps)
         if sensitivity_steps < 1:
             raise ValueError("bsr_iterations_number must be >= 1")
+        if max_participations is None and sample_rate is not None:
+            max_participations = int(math.ceil(float(sample_rate) * float(sensitivity_steps)))
+            max_participations = max(1, int(max_participations))
+        if min_separation is None:
+            # Conservative default for fixed-batch schedule when no stronger contract is provided.
+            min_separation = 1
 
         mf_sensitivity = kwargs.get(
             "bsr_mf_sensitivity",
@@ -1020,6 +1027,7 @@ class PrivacyEngine:
                     mechanism_state=mechanism_config.mechanism_state,
                     sampling_semantics=sampling_semantics,
                     steps=int(total_steps),
+                    sample_rate=sample_rate,
                     kwargs=kwargs,
                 )
 
@@ -1065,6 +1073,7 @@ class PrivacyEngine:
                 mechanism_state=mechanism_config.mechanism_state,
                 sampling_semantics=sampling_semantics,
                 steps=implied_steps,
+                sample_rate=sample_rate,
                 kwargs=kwargs,
             )
 
@@ -1968,16 +1977,23 @@ class PrivacyEngine:
                 or local_sampling_semantics.sampling_mode == "torch_sampler"
             )
         ):
+            sample_rate = self._resolve_total_steps_sample_rate(
+                poisson_sampling=poisson_sampling,
+                sampling_semantics=local_sampling_semantics,
+                mechanism=mechanism_config.mechanism,
+                batch_size=data_loader.batch_size,
+                dataset_size=len(data_loader.dataset),
+            )
             if total_steps is not None:
                 mf_steps = int(total_steps)
             else:
-                sample_rate = 1.0 / len(data_loader)
                 mf_steps = int(epochs / sample_rate)
 
             resolved_mf_sensitivity = self._resolve_bsr_mf_sensitivity_for_fixed_batch(
                 mechanism_state=mechanism_config.mechanism_state,
                 sampling_semantics=local_sampling_semantics,
                 steps=mf_steps,
+                sample_rate=sample_rate,
                 kwargs=kwargs,
             )
 

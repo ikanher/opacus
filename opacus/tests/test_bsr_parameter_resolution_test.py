@@ -21,6 +21,7 @@ def test_fixed_batch_mf_sensitivity_precedence_kwargs_over_metadata_and_state() 
         mechanism_state=mechanism_state,
         sampling_semantics=sampling_semantics,
         steps=200,
+        sample_rate=0.01,
         kwargs={"bsr_mf_sensitivity": 3.0},
     )
     assert got == pytest.approx(3.0, rel=0.0, abs=1e-12)
@@ -39,6 +40,7 @@ def test_fixed_batch_mf_sensitivity_precedence_metadata_over_state() -> None:
         mechanism_state=mechanism_state,
         sampling_semantics=sampling_semantics,
         steps=200,
+        sample_rate=0.01,
         kwargs={},
     )
     assert got == pytest.approx(5.0, rel=0.0, abs=1e-12)
@@ -56,12 +58,14 @@ def test_fixed_batch_mf_sensitivity_horizon_override_changes_result() -> None:
         mechanism_state=mechanism_state,
         sampling_semantics=None,
         steps=2,
+        sample_rate=0.5,
         kwargs={},
     )
     eps_long = PrivacyEngine._resolve_bsr_mf_sensitivity_for_fixed_batch(
         mechanism_state=mechanism_state,
         sampling_semantics=None,
         steps=2,
+        sample_rate=0.5,
         kwargs={"bsr_iterations_number": 10},
     )
     assert eps_long > eps_short
@@ -80,18 +84,20 @@ def test_fixed_batch_mf_sensitivity_rejects_inconsistent_explicit_value() -> Non
             mechanism_state=mechanism_state,
             sampling_semantics=None,
             steps=10,
+            sample_rate=0.5,
             kwargs={"bsr_mf_sensitivity": 1.0},
         )
 
 
-def test_fixed_batch_mf_sensitivity_requires_derivation_inputs_when_no_override() -> None:
-    with pytest.raises(ValueError, match="fixed-batch bsr accounting requires MF sensitivity"):
-        PrivacyEngine._resolve_bsr_mf_sensitivity_for_fixed_batch(
-            mechanism_state={"coeffs": [1.0, 0.5]},
-            sampling_semantics=None,
-            steps=100,
-            kwargs={},
-        )
+def test_fixed_batch_mf_sensitivity_derives_from_sample_rate_when_metadata_missing() -> None:
+    got = PrivacyEngine._resolve_bsr_mf_sensitivity_for_fixed_batch(
+        mechanism_state={"coeffs": [1.0, 0.5]},
+        sampling_semantics=None,
+        steps=100,
+        sample_rate=0.01,
+        kwargs={},
+    )
+    assert got > 0.0
 
 
 def test_cyclic_scale_precedence_kwargs_over_metadata_and_state() -> None:
@@ -146,6 +152,7 @@ def test_fixed_batch_mf_sensitivity_rejects_non_finite_override() -> None:
             mechanism_state={"coeffs": [1.0], "max_participations": 1, "min_separation": 1},
             sampling_semantics=None,
             steps=10,
+            sample_rate=0.1,
             kwargs={"bsr_mf_sensitivity": float("nan")},
         )
 
@@ -156,6 +163,7 @@ def test_fixed_batch_mf_sensitivity_rejects_invalid_horizon_override() -> None:
             mechanism_state={"coeffs": [1.0], "max_participations": 1, "min_separation": 1},
             sampling_semantics=None,
             steps=10,
+            sample_rate=0.1,
             kwargs={"bsr_iterations_number": 0},
         )
 
@@ -208,5 +216,6 @@ def test_fixed_batch_mf_sensitivity_rejects_cyclic_only_kwargs() -> None:
                 privacy_metadata={},
             ),
             steps=10,
+            sample_rate=0.1,
             kwargs={"bsr_sensitivity_scale": 1.0},
         )
