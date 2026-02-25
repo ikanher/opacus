@@ -479,11 +479,16 @@ class CyclicPoissonSampler(Sampler[List[int]]):
         bands: int,
         generator=None,
         steps: int = None,
+        shuffle: bool = True,
+        shuffle_seed: int = 0,
     ):
         self.num_samples = int(num_samples)
         self.batch_size = int(batch_size)
         self.bands = int(bands)
         self.generator = generator
+        self.shuffle = bool(shuffle)
+        self.shuffle_seed = int(shuffle_seed)
+        self.epoch = 0
 
         if self.num_samples <= 0:
             raise ValueError(
@@ -513,21 +518,38 @@ class CyclicPoissonSampler(Sampler[List[int]]):
         if self.steps <= 0:
             raise ValueError(f"steps should be positive, got {self.steps}")
 
-        self._partitions = [
-            list(range(j * self.partition_size, (j + 1) * self.partition_size))
-            for j in range(self.bands)
-        ]
+    def _build_partitions(self) -> list[list[int]]:
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.shuffle_seed + self.epoch)
+            indices = torch.randperm(self.num_samples, generator=g)
+        else:
+            indices = torch.arange(self.num_samples)
+
+        usable = indices[: self.usable_size]
+        partitions: list[list[int]] = []
+        for j in range(self.bands):
+            start = j * self.partition_size
+            end = (j + 1) * self.partition_size
+            partitions.append(usable[start:end].tolist())
+
+        return partitions
 
     def __len__(self):
         return self.steps
 
     def __iter__(self):
+        partitions = self._build_partitions()
         for step in range(self.steps):
-            partition = self._partitions[step % self.bands]
+            partition = partitions[step % self.bands]
             sampling_prob = float(self.batch_size) / float(len(partition))
             draws = torch.rand(len(partition), generator=self.generator) < sampling_prob
             selected = draws.nonzero(as_tuple=False).reshape(-1).tolist()
+
             yield [partition[i] for i in selected]
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
 
 
 class DistributedCyclicPoissonSampler(Sampler[List[int]]):
@@ -546,11 +568,16 @@ class DistributedCyclicPoissonSampler(Sampler[List[int]]):
         bands: int,
         generator=None,
         steps: int = None,
+        shuffle: bool = True,
+        shuffle_seed: int = 0,
     ):
         self.total_size = int(total_size)
         self.batch_size = int(batch_size)
         self.bands = int(bands)
         self.generator = generator
+        self.shuffle = bool(shuffle)
+        self.shuffle_seed = int(shuffle_seed)
+        self.epoch = 0
         self.num_replicas = torch.distributed.get_world_size()
         self.rank = torch.distributed.get_rank()
 
@@ -579,16 +606,8 @@ class DistributedCyclicPoissonSampler(Sampler[List[int]]):
                 "bands is too large for dataset size: partition_size is zero"
             )
 
-        self._global_partitions = [
-            list(range(j * self.partition_size, (j + 1) * self.partition_size))
-            for j in range(self.bands)
-        ]
-
-        self._local_partitions = [
-            part[self.rank :: self.num_replicas] for part in self._global_partitions
-        ]
-
-        min_local = min(len(part) for part in self._local_partitions)
+        # Lower bound from equal-split partitioning + rank sharding.
+        min_local = self.partition_size // self.num_replicas
         if self.batch_size > min_local:
             raise ValueError(
                 "batch_size must be <= local shard size for every cyclic partition"
@@ -604,12 +623,34 @@ class DistributedCyclicPoissonSampler(Sampler[List[int]]):
         return self.steps
 
     def __iter__(self):
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.shuffle_seed + self.epoch)
+            indices = torch.randperm(self.total_size, generator=g)
+        else:
+            indices = torch.arange(self.total_size)
+
+        usable = indices[: self.partition_size * self.bands]
+        global_partitions = [
+            usable[j * self.partition_size : (j + 1) * self.partition_size].tolist()
+            for j in range(self.bands)
+        ]
+
+        local_partitions = [
+            part[self.rank :: self.num_replicas] for part in global_partitions
+        ]
+
         for step in range(self.steps):
-            local_partition = self._local_partitions[step % self.bands]
+            local_partition = local_partitions[step % self.bands]
             sampling_prob = float(self.batch_size) / float(len(local_partition))
+
             draws = (
                 torch.rand(len(local_partition), generator=self.generator)
                 < sampling_prob
             )
             selected = draws.nonzero(as_tuple=False).reshape(-1).tolist()
+
             yield [local_partition[i] for i in selected]
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
