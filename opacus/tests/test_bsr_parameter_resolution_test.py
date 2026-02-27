@@ -119,21 +119,21 @@ def test_cyclic_scale_precedence_kwargs_over_metadata_and_state() -> None:
     assert got == pytest.approx(2.0, rel=0.0, abs=1e-12)
 
 
-def test_cyclic_scale_horizon_override_changes_result() -> None:
+def test_cyclic_scale_horizon_override_is_stable_when_both_horizons_are_valid() -> None:
     mechanism_state = {"coeffs": [1.0, 2.0, 3.0]}
     short = PrivacyEngine._resolve_bsr_sensitivity_scale_for_cyclic(
         mechanism_state=mechanism_state,
         sampling_semantics=None,
-        steps=1,
+        steps=3,
         kwargs={},
     )
     long = PrivacyEngine._resolve_bsr_sensitivity_scale_for_cyclic(
         mechanism_state=mechanism_state,
         sampling_semantics=None,
-        steps=1,
-        kwargs={"bsr_iterations_number": 3},
+        steps=3,
+        kwargs={"bsr_iterations_number": 6},
     )
-    assert long > short
+    assert long == pytest.approx(short, rel=0.0, abs=1e-12)
 
 
 def test_cyclic_scale_rejects_non_positive_override() -> None:
@@ -185,6 +185,19 @@ def test_cyclic_scale_rejects_invalid_horizon_override() -> None:
             sampling_semantics=None,
             steps=10,
             kwargs={"bsr_iterations_number": 0},
+        )
+
+
+def test_cyclic_scale_rejects_steps_below_bands() -> None:
+    with pytest.raises(ValueError, match="steps >= bands"):
+        PrivacyEngine._resolve_bsr_sensitivity_scale_for_cyclic(
+            mechanism_state={"coeffs": [1.0, 0.2, 0.1]},
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="cyclic_poisson",
+                privacy_metadata={"bands": 3},
+            ),
+            steps=2,
+            kwargs={},
         )
 
 

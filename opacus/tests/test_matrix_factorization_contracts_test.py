@@ -170,6 +170,26 @@ def test_sampling_semantics_cyclic_poisson_requires_bands_metadata() -> None:
         )
 
 
+def test_sampling_semantics_cyclic_poisson_rejects_steps_below_bands() -> None:
+    model = nn.Linear(4, 3)
+    with pytest.raises(ValueError, match="steps >= bands"):
+        _make_private(
+            model,
+            poisson_sampling=False,
+            noise_seed=102,
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bsr",
+                accounting_mode="bsr_accountant",
+                mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+            ),
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="cyclic_poisson",
+                privacy_metadata={"bands": 8},
+            ),
+            total_steps=5,
+        )
+
+
 def test_bsr_mechanism_requires_torch_sampler() -> None:
     model = nn.Linear(4, 3)
     with pytest.raises(ValueError, match="fixed-batch semantics"):
@@ -735,6 +755,38 @@ def test_make_private_with_epsilon_bsr_cyclic_persists_sensitivity_scale() -> No
         bsr_sensitivity_scale=float(state["sensitivity_scale"]),
     )
     assert eps_default == pytest.approx(eps_override, rel=0.0, abs=1e-12)
+
+
+def test_make_private_with_epsilon_bsr_cyclic_autoresolves_coeffs_from_bands() -> None:
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    pe = PrivacyEngine()
+
+    _, dp_optimizer, _ = pe.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        target_epsilon=1.0,
+        target_delta=1e-5,
+        total_steps=32,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 8},
+        ),
+    )
+
+    state = dp_optimizer.noise_mechanism_config.mechanism_state
+    assert "coeffs" in state
+    assert isinstance(state["coeffs"], list)
+    assert len(state["coeffs"]) == 8
+    assert float(state["coeffs"][0]) > 0.0
 
 
 def test_make_private_with_epsilon_bsr_cyclic_epochs_total_steps_sample_rate_parity() -> None:

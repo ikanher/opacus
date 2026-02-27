@@ -96,6 +96,117 @@ class PrivacyEngine:
     """
 
     @staticmethod
+    def _optimize_bsr_cyclic_coeffs(
+        *,
+        bands: int,
+        steps: int,
+        max_optimizer_steps: int = 250,
+    ) -> list[float]:
+        if bands < 1:
+            raise ValueError("cyclic_poisson bands must be > 0")
+        if steps < 1:
+            raise ValueError("cyclic_poisson steps must be >= 1")
+        if steps < bands:
+            raise ValueError(
+                "cyclic_poisson BSR requires steps >= bands; "
+                f"got steps={steps}, bands={bands}"
+            )
+
+        dtype = torch.float64
+        k = torch.arange(int(bands), dtype=dtype)
+        init = torch.cumprod(
+            torch.where(k == 0, torch.ones_like(k), (2 * k - 1) / (2 * k)),
+            dim=0,
+        )
+        params = torch.nn.Parameter(init.clone())
+        opt = torch.optim.LBFGS(
+            [params],
+            max_iter=int(max_optimizer_steps),
+            line_search_fn="strong_wolfe",
+        )
+
+        def _reconcile(c: torch.Tensor, n: int) -> torch.Tensor:
+            if c.numel() >= n:
+                return c[:n]
+            return torch.cat(
+                [c, torch.zeros((n - c.numel(),), dtype=c.dtype, device=c.device)],
+                dim=0,
+            )
+
+        def _mean_error_from_strategy(c: torch.Tensor, n: int) -> torch.Tensor:
+            rhs_val = torch.ones((), dtype=c.dtype, device=c.device)
+            b_vals: list[torch.Tensor] = []
+            for t in range(n):
+                acc = rhs_val
+                max_lag = min(t, c.numel() - 1)
+                for lag in range(1, max_lag + 1):
+                    acc = acc - c[lag] * b_vals[t - lag]
+                b_vals.append(acc / c[0])
+            b = torch.stack(b_vals)
+            return torch.cumsum(b * b, dim=0).mean()
+
+        def _loss(v: torch.Tensor) -> torch.Tensor:
+            c = _reconcile(v, int(steps))
+            penalty = torch.relu(torch.tensor(1e-9, dtype=c.dtype, device=c.device) - c[0]) * 1e9
+            return _mean_error_from_strategy(c, int(steps)) * torch.sum(c * c) + penalty
+
+        def closure() -> torch.Tensor:
+            opt.zero_grad(set_to_none=True)
+            loss = _loss(params)
+            loss.backward()
+            return loss
+
+        opt.step(closure)
+        with torch.no_grad():
+            c = params.detach() / (torch.linalg.norm(params.detach()) + 1e-24)
+            if c[0] < 0:
+                c = -c
+        return [float(x) for x in c.tolist()]
+
+    @staticmethod
+    def _ensure_bsr_cyclic_coeffs(
+        *,
+        mechanism_config: NoiseMechanismConfig,
+        sampling_semantics: Optional[SamplingSemantics],
+        steps: int,
+        kwargs: Dict[str, Any],
+    ) -> NoiseMechanismConfig:
+        if mechanism_config.mechanism != "bsr":
+            return mechanism_config
+
+        if (
+            sampling_semantics is None
+            or sampling_semantics.sampling_mode != "cyclic_poisson"
+        ):
+            return mechanism_config
+
+        state = copy.deepcopy(mechanism_config.mechanism_state)
+        coeffs = state.get("coeffs")
+        if isinstance(coeffs, (list, tuple)) and len(coeffs) > 0:
+            return mechanism_config
+
+        metadata = sampling_semantics.privacy_metadata or {}
+        bands = metadata.get("bands", state.get("bands"))
+        if bands is None:
+            raise ValueError(
+                "cyclic_poisson sampling requires privacy_metadata['bands']"
+            )
+        bands = int(bands)
+
+        max_optimizer_steps = int(kwargs.get("bsr_strategy_max_optimizer_steps", 250))
+        state["coeffs"] = PrivacyEngine._optimize_bsr_cyclic_coeffs(
+            bands=bands,
+            steps=int(steps),
+            max_optimizer_steps=max_optimizer_steps,
+        )
+
+        return NoiseMechanismConfig(
+            mechanism=mechanism_config.mechanism,
+            accounting_mode=mechanism_config.accounting_mode,
+            mechanism_state=state,
+        )
+
+    @staticmethod
     def _summarize_bsr_state(mechanism_state: Dict[str, Any]) -> Dict[str, Any]:
         coeffs = mechanism_state.get("coeffs")
         coeff_count = len(coeffs) if isinstance(coeffs, (list, tuple)) else None
@@ -564,6 +675,21 @@ class PrivacyEngine:
         if scale_steps < 1:
             raise ValueError("bsr_iterations_number must be >= 1")
 
+        bands = metadata.get("bands", mechanism_state.get("bands"))
+        if bands is None and coeffs is not None:
+            bands = len(coeffs)
+
+        if bands is not None:
+            resolved_bands = int(bands)
+            if resolved_bands <= 0:
+                raise ValueError("cyclic_poisson bands must be > 0")
+
+            if scale_steps < resolved_bands:
+                raise ValueError(
+                    "cyclic_poisson BSR requires steps >= bands; "
+                    f"got steps={scale_steps}, bands={resolved_bands}"
+                )
+
         scale = float(
             compute_bsr_kappa_from_coeffs(
                 coeffs=coeffs,
@@ -572,6 +698,7 @@ class PrivacyEngine:
         )
         if (not math.isfinite(scale)) or scale <= 0.0:
             raise ValueError("resolved bsr_sensitivity_scale must be finite and > 0")
+
         return scale
 
     @staticmethod
@@ -690,6 +817,11 @@ class PrivacyEngine:
             raise ValueError("cyclic_poisson sampling requires data_loader.batch_size")
 
         steps = total_steps if total_steps is not None else len(data_loader)
+        if int(steps) < int(bands):
+            raise ValueError(
+                "cyclic_poisson BSR requires steps >= bands; "
+                f"got steps={int(steps)}, bands={int(bands)}"
+            )
         generator = self._sampler_generator(data_loader)
         if distributed:
             world_size = torch.distributed.get_world_size()
@@ -1646,9 +1778,6 @@ class PrivacyEngine:
                 "pass either noise_mechanism_config or noise_mechanism, not both"
             )
 
-        configured_noise_mechanism = self._build_noise_mechanism_from_config(
-            mechanism_config
-        )
         active_accountant = self._accountant_for_mechanism(
             mechanism=mechanism_config.mechanism,
             default_accountant=self.default_accountant,
@@ -1669,13 +1798,11 @@ class PrivacyEngine:
         is_fsdp = isinstance(module, FSDPModule)
         distributed = is_dpddp or is_ddp or is_fsdp
 
-        requested_noise_mechanism = (
-            configured_noise_mechanism
-            if configured_noise_mechanism is not None
-            else kwargs.get("noise_mechanism")
-        )
-
-        if distributed and isinstance(requested_noise_mechanism, CorrelatedNoiseMechanism):
+        requested_noise_mechanism = kwargs.get("noise_mechanism")
+        if distributed and (
+            mechanism_config.mechanism in ("bsr", "bnb")
+            or isinstance(requested_noise_mechanism, CorrelatedNoiseMechanism)
+        ):
             self._validate_distributed_correlated_support(
                 mechanism=mechanism_config.mechanism,
                 clipping=clipping,
@@ -1714,6 +1841,23 @@ class PrivacyEngine:
             data_loader_len=len(data_loader),
             total_steps=total_steps,
             distributed=distributed,
+        )
+
+        if (
+            mechanism_config.mechanism == "bsr"
+            and sampling_semantics is not None
+            and sampling_semantics.sampling_mode == "cyclic_poisson"
+        ):
+            strategy_steps = int(total_steps) if total_steps is not None else int(len(data_loader))
+            mechanism_config = self._ensure_bsr_cyclic_coeffs(
+                mechanism_config=mechanism_config,
+                sampling_semantics=sampling_semantics,
+                steps=strategy_steps,
+                kwargs=kwargs,
+            )
+
+        configured_noise_mechanism = self._build_noise_mechanism_from_config(
+            mechanism_config
         )
 
         optimizer_prepare_kwargs = dict(kwargs)
@@ -1929,6 +2073,22 @@ class PrivacyEngine:
             sampling_semantics=local_sampling_semantics,
             kwargs=kwargs,
         )
+
+        if (
+            mechanism_config.mechanism == "bsr"
+            and local_sampling_semantics is not None
+            and local_sampling_semantics.sampling_mode == "cyclic_poisson"
+        ):
+            if total_steps is not None:
+                strategy_steps = int(total_steps)
+            else:
+                strategy_steps = int(float(epochs) * float(len(data_loader)))
+            mechanism_config = self._ensure_bsr_cyclic_coeffs(
+                mechanism_config=mechanism_config,
+                sampling_semantics=local_sampling_semantics,
+                steps=strategy_steps,
+                kwargs=kwargs,
+            )
 
         noise_multiplier, _ = self._resolve_noise_multiplier_for_target_epsilon(
             mechanism_config=mechanism_config,

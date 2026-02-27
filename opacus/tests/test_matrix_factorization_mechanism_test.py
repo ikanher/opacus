@@ -217,6 +217,56 @@ def test_distributed_bsr_supports_cyclic_poisson_sampling(monkeypatch) -> None:
     assert isinstance(private_loader.batch_sampler, DistributedCyclicPoissonSampler)
 
 
+def test_distributed_dpoptimizer_rank0_noise_and_global_mean_semantics(
+    monkeypatch,
+) -> None:
+    world_size = 2
+
+    def _make_optimizer(*, rank: int, seed: int):
+        _patch_distributed_primitives(monkeypatch, rank=rank, world_size=world_size)
+        model = nn.Linear(2, 1, bias=False)
+        base_optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        dp_optimizer = DistributedDPOptimizer(
+            base_optimizer,
+            noise_multiplier=1.0,
+            max_grad_norm=1.0,
+            expected_batch_size=4,
+            loss_reduction="mean",
+            generator=torch.Generator().manual_seed(seed),
+        )
+        param = dp_optimizer.params[0]
+        return dp_optimizer, param
+
+    # Distinct per-rank clipped sums make the reduction semantics observable.
+    dp0, p0 = _make_optimizer(rank=0, seed=1337)
+    dp1, p1 = _make_optimizer(rank=1, seed=1337)
+    p0.summed_grad = torch.tensor([[1.0, -3.0]], dtype=p0.dtype)
+    p1.summed_grad = torch.tensor([[-2.0, 5.0]], dtype=p1.dtype)
+
+    dp0.add_noise()
+    dp1.add_noise()
+
+    # Noise is injected only on rank 0.
+    assert not torch.allclose(p0.grad, p0.summed_grad)
+    assert torch.allclose(p1.grad, p1.summed_grad)
+
+    g0_pre_reduce = p0.grad.detach().clone()
+    g1_pre_reduce = p1.grad.detach().clone()
+    reduced_sum = g0_pre_reduce + g1_pre_reduce
+
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda tensor, op=None: tensor.copy_(reduced_sum),
+    )
+    dp0.reduce_gradients()
+    dp1.reduce_gradients()
+
+    expected_global_mean = reduced_sum / world_size
+    assert torch.allclose(p0.grad, expected_global_mean, rtol=0.0, atol=1e-7)
+    assert torch.allclose(p1.grad, expected_global_mean, rtol=0.0, atol=1e-7)
+
+
 def test_distributed_bnb_supports_b_min_sep_sampling(monkeypatch) -> None:
     monkeypatch.setattr(pe_mod, "DDP", nn.Linear)
     _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
