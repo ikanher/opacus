@@ -31,6 +31,7 @@ from opacus.accountants.analysis.bsr import (
     calibrate_bsr_z_std,
     compute_bsr_kappa_from_coeffs,
     compute_bsr_mf_sensitivity_from_coeffs,
+    generate_bsr_coeffs_from_sgd_workload,
 )
 from opacus.accountants.analysis.bnb import (
     BNBCalibrationStatus,
@@ -155,6 +156,7 @@ class PrivacyEngine:
             opt.zero_grad(set_to_none=True)
             loss = _loss(params)
             loss.backward()
+
             return loss
 
         opt.step(closure)
@@ -162,6 +164,7 @@ class PrivacyEngine:
             c = params.detach() / (torch.linalg.norm(params.detach()) + 1e-24)
             if c[0] < 0:
                 c = -c
+
         return [float(x) for x in c.tolist()]
 
     @staticmethod
@@ -192,6 +195,7 @@ class PrivacyEngine:
             raise ValueError(
                 "cyclic_poisson sampling requires privacy_metadata['bands']"
             )
+
         bands = int(bands)
 
         max_optimizer_steps = int(kwargs.get("bsr_strategy_max_optimizer_steps", 250))
@@ -200,6 +204,85 @@ class PrivacyEngine:
             steps=int(steps),
             max_optimizer_steps=max_optimizer_steps,
         )
+
+        return NoiseMechanismConfig(
+            mechanism=mechanism_config.mechanism,
+            accounting_mode=mechanism_config.accounting_mode,
+            mechanism_state=state,
+        )
+
+    @staticmethod
+    def _resolve_uniform_sgd_workload_from_optimizer(
+        *,
+        optimizer: optim.Optimizer,
+    ) -> tuple[float, float]:
+        momenta: list[float] = []
+        decays: list[float] = []
+        for group in optimizer.param_groups:
+            momenta.append(float(group.get("momentum", 0.0)))
+            decays.append(float(group.get("weight_decay", 0.0)))
+
+        if len(momenta) == 0:
+            raise ValueError("optimizer must contain at least one parameter group")
+
+        m0 = float(momenta[0])
+        d0 = float(decays[0])
+        for m in momenta[1:]:
+            if not math.isclose(float(m), m0, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError(
+                    "bsr analytical auto-coeff generation requires uniform optimizer momentum "
+                    "across parameter groups"
+                )
+        for d in decays[1:]:
+            if not math.isclose(float(d), d0, rel_tol=0.0, abs_tol=1e-12):
+                raise ValueError(
+                    "bsr analytical auto-coeff generation requires uniform optimizer weight_decay "
+                    "across parameter groups"
+                )
+
+        return m0, d0
+
+    @staticmethod
+    def _ensure_bsr_fixed_analytical_coeffs(
+        *,
+        mechanism_config: NoiseMechanismConfig,
+        optimizer: optim.Optimizer,
+        sampling_semantics: Optional[SamplingSemantics],
+        kwargs: Dict[str, Any],
+    ) -> NoiseMechanismConfig:
+        # Contract split:
+        # - `bsr` fixed-batch path uses analytical workload coefficients.
+        # - `bandmf` cyclic path keeps optimizer-based strategy resolution.
+        if mechanism_config.mechanism != "bsr":
+            return mechanism_config
+
+        state = copy.deepcopy(mechanism_config.mechanism_state)
+        coeffs = state.get("coeffs")
+        if isinstance(coeffs, (list, tuple)) and len(coeffs) > 0:
+            return mechanism_config
+
+        metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
+        bands = kwargs.get("bsr_bands", metadata.get("bands", state.get("bands")))
+        if bands is None:
+            raise ValueError(
+                "bsr analytical auto-coeff generation requires bands via "
+                "`mechanism_state['bands']`, `sampling_semantics.privacy_metadata['bands']`, "
+                "or `bsr_bands`"
+            )
+
+        bands = int(bands)
+        if bands < 1:
+            raise ValueError("bsr bands must be >= 1")
+
+        momentum, weight_decay = PrivacyEngine._resolve_uniform_sgd_workload_from_optimizer(
+            optimizer=optimizer
+        )
+        state["coeffs"] = generate_bsr_coeffs_from_sgd_workload(
+            bands=bands,
+            momentum=momentum,
+            weight_decay=weight_decay,
+        )
+        state["bands"] = bands
 
         return NoiseMechanismConfig(
             mechanism=mechanism_config.mechanism,
@@ -1931,6 +2014,13 @@ class PrivacyEngine:
             distributed=distributed,
         )
 
+        mechanism_config = self._ensure_bsr_fixed_analytical_coeffs(
+            mechanism_config=mechanism_config,
+            optimizer=optimizer,
+            sampling_semantics=sampling_semantics,
+            kwargs=kwargs,
+        )
+
         if (
             mechanism_config.mechanism == "bandmf"
             and sampling_semantics is not None
@@ -2118,6 +2208,13 @@ class PrivacyEngine:
             poisson_sampling=poisson_sampling,
             total_steps=total_steps,
             data_loader=data_loader,
+        )
+
+        mechanism_config = self._ensure_bsr_fixed_analytical_coeffs(
+            mechanism_config=mechanism_config,
+            optimizer=optimizer,
+            sampling_semantics=local_sampling_semantics,
+            kwargs=kwargs,
         )
 
         is_dpddp = isinstance(module, DPDDP)

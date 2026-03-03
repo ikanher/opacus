@@ -20,6 +20,60 @@ from typing import Iterable
 from opacus.accountants.analysis import rdp as rdp_analysis
 
 
+def generate_bsr_coeffs_from_sgd_workload(
+    *,
+    bands: int,
+    momentum: float,
+    weight_decay: float,
+    atol: float = 1e-12,
+) -> list[float]:
+    """
+    Generate p-banded BSR coefficients for SGD workload A_{alpha,beta}.
+
+    Mapping:
+    - alpha := weight_decay (multiplicative), with weight_decay == 0 mapped to alpha = 1
+    - beta := momentum
+    """
+    if bands < 1:
+        raise ValueError("bands must be >= 1")
+
+    beta = float(momentum)
+    alpha = 1.0 if float(weight_decay) == 0.0 else float(weight_decay)
+
+    if not (0.0 <= beta < 1.0):
+        raise ValueError("momentum must satisfy 0 <= momentum < 1")
+
+    if not (0.0 < alpha <= 1.0):
+        raise ValueError(
+            "weight_decay must satisfy 0 < weight_decay <= 1 for BSR coefficient generation "
+            "(or be exactly 0 to represent no weight decay)"
+        )
+
+    if beta > alpha + atol:
+        raise ValueError("BSR generation requires momentum <= effective weight decay")
+
+    if abs(alpha - beta) <= atol:
+        return [alpha**j for j in range(bands)]
+
+    r = [0.0] * bands
+    r[0] = 1.0
+    for i in range(1, bands):
+        r[i] = r[i - 1] * ((2.0 * i - 1.0) / (2.0 * i))
+
+    coeffs = [0.0] * bands
+    for j in range(bands):
+        s = 0.0
+        for i in range(j + 1):
+            s += (alpha ** (j - i)) * r[j - i] * r[i] * (beta**i)
+
+        coeffs[j] = s
+
+    return [
+        0.0 if (c < 0.0 and math.isclose(c, 0.0, abs_tol=atol)) else c
+        for c in coeffs
+    ]
+
+
 def _resolve_rdp_orders(
     rdp_orders: Iterable[float] | None,
 ) -> list[float]:
@@ -27,6 +81,7 @@ def _resolve_rdp_orders(
         return list(rdp_orders)
 
     # Keep BSR defaults aligned with Opacus' canonical RDP accountant defaults.
+    # XXX: What if we are passed custom alphas?
     from opacus.accountants.rdp import RDPAccountant
 
     return list(RDPAccountant.DEFAULT_ALPHAS)

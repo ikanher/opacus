@@ -11,8 +11,8 @@ from opacus.accountants.analysis.bsr import (
     bsr_fixed_batch_epsilon_upper_bound,
     compute_bsr_kappa_from_coeffs,
     compute_bsr_mf_sensitivity_from_coeffs,
+    generate_bsr_coeffs_from_sgd_workload,
 )
-from dpdl.bsr import generate_bsr_coeffs_from_sgd_workload
 
 
 pytest.importorskip("jax_privacy")
