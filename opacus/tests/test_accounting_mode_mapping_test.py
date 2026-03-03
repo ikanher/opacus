@@ -11,6 +11,11 @@ def test_standard_accountants_map_to_standard_step_accounting_mode(accountant: s
     )
 
 
+@pytest.mark.parametrize("accountant", ["bandmf", "bandmf_accountant"])
+def test_bandmf_accountant_aliases_map_to_bandmf_accounting_mode(accountant: str) -> None:
+    assert resolve_accounting_mode_from_accountant(accountant) == "bandmf_accountant"
+
+
 @pytest.mark.parametrize("accountant", ["bsr", "bsr_accountant"])
 def test_bsr_accountant_aliases_map_to_bsr_accounting_mode(accountant: str) -> None:
     assert resolve_accounting_mode_from_accountant(accountant) == "bsr_accountant"

@@ -23,6 +23,7 @@ import torch
 from hypothesis import given, settings
 from opacus import SamplingSemantics
 from opacus.accountants import (
+    BandMFAccountant,
     BNBAccountant,
     GaussianAccountant,
     IAccountant,
@@ -138,6 +139,9 @@ class AccountantRegistryTest(unittest.TestCase):
 
     def test_create_bsr_accountant(self) -> None:
         self.assertIsInstance(create_accountant("bsr"), BSRAccountant)
+
+    def test_create_bandmf_accountant(self) -> None:
+        self.assertIsInstance(create_accountant("bandmf"), BandMFAccountant)
 
     def test_create_bnb_accountant(self) -> None:
         self.assertIsInstance(create_accountant("bnb"), BNBAccountant)
@@ -722,9 +726,9 @@ class AccountingTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "steps must be >= 1"):
             compute_bsr_kappa_from_coeffs(coeffs=[1.0], steps=0)
 
-    def test_bsr_accountant_cyclic_poisson_respects_sensitivity_scale_override(self) -> None:
+    def test_bandmf_accountant_cyclic_poisson_respects_sensitivity_scale_override(self) -> None:
         delta = 1e-5
-        accountant = BSRAccountant()
+        accountant = BandMFAccountant()
         accountant.history = [(1.0, 0.01, 100)]
         sampling_semantics = SamplingSemantics(
             sampling_mode="cyclic_poisson",
@@ -734,12 +738,12 @@ class AccountingTest(unittest.TestCase):
         eps_unit = accountant.get_epsilon(
             delta=delta,
             sampling_semantics=sampling_semantics,
-            bsr_sensitivity_scale=1.0,
+            sensitivity_scale=1.0,
         )
         eps_larger_scale = accountant.get_epsilon(
             delta=delta,
             sampling_semantics=sampling_semantics,
-            bsr_sensitivity_scale=2.0,
+            sensitivity_scale=2.0,
         )
 
         self.assertGreater(eps_larger_scale, eps_unit)
@@ -1001,36 +1005,12 @@ class AccountingTest(unittest.TestCase):
         )
         self.assertLess(abs(noise_a - noise_b), 1e-6)
 
-    def test_bsr_accountant_branches_torch_sampler_vs_cyclic_poisson(self) -> None:
-        delta = 1e-5
-        accountant = BSRAccountant()
-        accountant.history = [(1.0, 0.01, 100)]
-
-        fixed_eps = accountant.get_epsilon(
-            delta=delta,
-            mechanism_state={"mf_sensitivity": 1.0},
-            sampling_semantics=SamplingSemantics(
-                sampling_mode="torch_sampler",
-                privacy_metadata={},
-            ),
-        )
-        cyclic_eps = accountant.get_epsilon(
-            delta=delta,
-            mechanism_state={},
-            sampling_semantics=SamplingSemantics(
-                sampling_mode="cyclic_poisson",
-                privacy_metadata={"bands": 10},
-            ),
-        )
-
-        self.assertNotAlmostEqual(fixed_eps, cyclic_eps, places=6)
-
-    def test_bsr_accountant_cyclic_poisson_rejects_fixed_batch_only_kwargs(self) -> None:
+    def test_bsr_accountant_rejects_cyclic_poisson(self) -> None:
         accountant = BSRAccountant()
         accountant.history = [(1.0, 0.01, 100)]
         with self.assertRaisesRegex(
             ValueError,
-            "cyclic-poisson bsr accounting received fixed-batch-only parameters",
+            "does not support cyclic_poisson",
         ):
             accountant.get_epsilon(
                 delta=1e-5,
@@ -1039,7 +1019,6 @@ class AccountingTest(unittest.TestCase):
                     sampling_mode="cyclic_poisson",
                     privacy_metadata={"bands": 10},
                 ),
-                bsr_mf_sensitivity=1.0,
             )
 
     def test_bsr_cyclic_poisson_epsilon_invariant_within_same_round_bucket(self) -> None:
@@ -1103,7 +1082,7 @@ class AccountingTest(unittest.TestCase):
         )
         self.assertAlmostEqual(cyclic_eps, fixed_eps, places=10)
 
-    def test_bsr_cyclic_poisson_no_amplification_boundary_calibration_matches_gaussian(
+    def test_bandmf_cyclic_poisson_no_amplification_boundary_calibration_matches_gaussian(
         self,
     ) -> None:
         target_epsilon = 1.0
@@ -1117,7 +1096,7 @@ class AccountingTest(unittest.TestCase):
             target_delta=target_delta,
             sample_rate=sample_rate,
             steps=steps,
-            accountant="bsr",
+            accountant="bandmf",
             sampling_semantics=SamplingSemantics(
                 sampling_mode="cyclic_poisson",
                 privacy_metadata={"bands": bands},
@@ -1153,7 +1132,7 @@ class AccountingTest(unittest.TestCase):
         )
         self.assertAlmostEqual(eps, 5.218712005463466, places=12)
 
-    def test_bsr_cyclic_poisson_default_calibration(self) -> None:
+    def test_bandmf_cyclic_poisson_default_calibration(self) -> None:
         target_epsilon = 1.0
         target_delta = 1e-5
         steps = 100
@@ -1168,11 +1147,11 @@ class AccountingTest(unittest.TestCase):
             target_delta=target_delta,
             sample_rate=sample_rate,
             steps=steps,
-            accountant="bsr",
+            accountant="bandmf",
             sampling_semantics=sampling_semantics,
         )
 
-        accountant = BSRAccountant()
+        accountant = BandMFAccountant()
         accountant.history = [(noise_multiplier, sample_rate, steps)]
         actual_epsilon = accountant.get_epsilon(
             delta=target_delta,

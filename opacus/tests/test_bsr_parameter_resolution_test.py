@@ -114,7 +114,7 @@ def test_cyclic_scale_precedence_kwargs_over_metadata_and_state() -> None:
         mechanism_state=mechanism_state,
         sampling_semantics=sampling_semantics,
         steps=100,
-        kwargs={"bsr_sensitivity_scale": 2.0},
+        kwargs={"sensitivity_scale": 2.0},
     )
     assert got == pytest.approx(2.0, rel=0.0, abs=1e-12)
 
@@ -137,12 +137,12 @@ def test_cyclic_scale_horizon_override_is_stable_when_both_horizons_are_valid() 
 
 
 def test_cyclic_scale_rejects_non_positive_override() -> None:
-    with pytest.raises(ValueError, match="bsr_sensitivity_scale must be finite and > 0"):
+    with pytest.raises(ValueError, match="sensitivity_scale must be finite and > 0"):
         PrivacyEngine._resolve_bsr_sensitivity_scale_for_cyclic(
             mechanism_state={"coeffs": [1.0, 0.2]},
             sampling_semantics=None,
             steps=10,
-            kwargs={"bsr_sensitivity_scale": 0.0},
+            kwargs={"sensitivity_scale": 0.0},
         )
 
 
@@ -169,12 +169,12 @@ def test_fixed_batch_mf_sensitivity_rejects_invalid_horizon_override() -> None:
 
 
 def test_cyclic_scale_rejects_non_finite_override() -> None:
-    with pytest.raises(ValueError, match="bsr_sensitivity_scale must be finite and > 0"):
+    with pytest.raises(ValueError, match="sensitivity_scale must be finite and > 0"):
         PrivacyEngine._resolve_bsr_sensitivity_scale_for_cyclic(
             mechanism_state={"coeffs": [1.0, 0.2]},
             sampling_semantics=None,
             steps=10,
-            kwargs={"bsr_sensitivity_scale": float("nan")},
+            kwargs={"sensitivity_scale": float("nan")},
         )
 
 
@@ -204,7 +204,7 @@ def test_cyclic_scale_rejects_steps_below_bands() -> None:
 def test_cyclic_scale_rejects_fixed_batch_only_kwargs() -> None:
     with pytest.raises(
         ValueError,
-        match="cyclic-poisson bsr accounting received fixed-batch-only parameters",
+        match="cyclic-poisson bandmf accounting received fixed-batch-only parameters",
     ):
         PrivacyEngine._resolve_bsr_sensitivity_scale_for_cyclic(
             mechanism_state={"coeffs": [1.0, 0.2]},
@@ -230,5 +230,5 @@ def test_fixed_batch_mf_sensitivity_rejects_cyclic_only_kwargs() -> None:
             ),
             steps=10,
             sample_rate=0.1,
-            kwargs={"bsr_sensitivity_scale": 1.0},
+            kwargs={"sensitivity_scale": 1.0},
         )

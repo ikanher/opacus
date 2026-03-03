@@ -41,9 +41,9 @@ def test_log_bsr_trace_emits_json_payload_for_bsr(caplog) -> None:
             correlated_denominator=500.0,
         )
 
-    trace_records = [r.message for r in caplog.records if r.message.startswith("BSR_TRACE ")]
+    trace_records = [r.message for r in caplog.records if r.message.startswith("MF_TRACE ")]
     assert len(trace_records) == 1
-    payload = json.loads(trace_records[0][len("BSR_TRACE "):])
+    payload = json.loads(trace_records[0][len("MF_TRACE "):])
     assert payload["stage"] == "unit_test"
     assert payload["sampling_mode"] == "cyclic_poisson"
     assert payload["mechanism_state"]["coeff_count"] == 3
@@ -73,4 +73,4 @@ def test_log_bsr_trace_is_noop_for_non_bsr(caplog) -> None:
             correlated_denominator=None,
         )
 
-    assert not [r for r in caplog.records if r.message.startswith("BSR_TRACE ")]
+    assert not [r for r in caplog.records if r.message.startswith("MF_TRACE ")]

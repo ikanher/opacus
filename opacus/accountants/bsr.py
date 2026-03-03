@@ -17,7 +17,6 @@ from __future__ import annotations
 import math
 
 from opacus.accountants.analysis.bsr import (
-    bsr_cyclic_poisson_epsilon_upper_bound,
     compute_bsr_mf_sensitivity_from_coeffs,
     bsr_fixed_batch_epsilon_upper_bound,
 )
@@ -85,56 +84,10 @@ class BSRAccountant(IAccountant):
             if sampling_semantics is not None
             else "torch_sampler"
         )
-
         if sampling_mode == "cyclic_poisson":
-            bands = metadata.get("bands", None)
-            if bands is None:
-                raise ValueError(
-                    "cyclic_poisson sampling requires privacy_metadata['bands']"
-                )
-
-            state = mechanism_state if isinstance(mechanism_state, dict) else {}
-            fixed_only_params = []
-            if kwargs.get("bsr_mf_sensitivity") is not None:
-                fixed_only_params.append("bsr_mf_sensitivity")
-            if kwargs.get("bsr_max_participations") is not None:
-                fixed_only_params.append("bsr_max_participations")
-            if kwargs.get("bsr_min_separation") is not None:
-                fixed_only_params.append("bsr_min_separation")
-            if metadata.get("mf_sensitivity") is not None:
-                fixed_only_params.append("privacy_metadata['mf_sensitivity']")
-            if metadata.get("max_participations") is not None:
-                fixed_only_params.append("privacy_metadata['max_participations']")
-            if metadata.get("min_separation") is not None:
-                fixed_only_params.append("privacy_metadata['min_separation']")
-            if state.get("mf_sensitivity") is not None:
-                fixed_only_params.append("mechanism_state['mf_sensitivity']")
-            if state.get("max_participations") is not None:
-                fixed_only_params.append("mechanism_state['max_participations']")
-            if state.get("min_separation") is not None:
-                fixed_only_params.append("mechanism_state['min_separation']")
-            if fixed_only_params:
-                raise ValueError(
-                    "cyclic-poisson bsr accounting received fixed-batch-only parameters: "
-                    + ", ".join(fixed_only_params)
-                )
-
-            sensitivity_scale = kwargs.get(
-                "bsr_sensitivity_scale",
-                metadata.get("sensitivity_scale", state.get("sensitivity_scale", 1.0)),
-            )
-            sensitivity_scale = float(sensitivity_scale)
-            if sensitivity_scale <= 0.0:
-                raise ValueError("bsr_sensitivity_scale must be > 0")
-
-            return float(
-                bsr_cyclic_poisson_epsilon_upper_bound(
-                    noise_multiplier=float(noise_multiplier) / sensitivity_scale,
-                    target_delta=float(delta),
-                    steps=int(total_steps),
-                    sample_rate=float(sample_rate),
-                    bands=int(bands),
-                )
+            raise ValueError(
+                "bsr accountant does not support cyclic_poisson semantics in this phase; "
+                "use mechanism/accountant family 'bandmf' instead"
             )
 
         state = mechanism_state if isinstance(mechanism_state, dict) else {}

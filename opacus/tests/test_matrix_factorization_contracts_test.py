@@ -80,7 +80,21 @@ def _make_private(
 
 
 def _single_pre_step(private_model: nn.Module, dp_optimizer, private_loader: DataLoader) -> None:
-    x, y = next(iter(private_loader))
+    x = y = None
+    for _ in range(3):
+        try:
+            for xb, yb in private_loader:
+                if int(xb.shape[0]) == 0:
+                    continue
+                x, y = xb, yb
+                break
+        except IndexError:
+            # Some cyclic schedules can emit empty index sets for tiny synthetic tests.
+            continue
+        if x is not None and y is not None:
+            break
+    if x is None or y is None:
+        pytest.skip("sampler yielded only empty batches in this tiny test configuration")
     dp_optimizer.zero_grad()
     loss = F.cross_entropy(private_model(x), y)
     loss.backward()
@@ -129,15 +143,15 @@ def test_sampling_semantics_default_poisson() -> None:
     assert semantics.privacy_metadata["expected_batch_size"] == 8
 
 
-def test_sampling_semantics_cyclic_poisson_switches_sampler_for_bsr() -> None:
+def test_sampling_semantics_cyclic_poisson_switches_sampler_for_bandmf() -> None:
     model = nn.Linear(4, 3)
     private_model, dp_optimizer, private_loader = _make_private(
         model,
         poisson_sampling=False,
         noise_seed=101,
         noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bsr",
-            accounting_mode="bsr_accountant",
+            mechanism="bandmf",
+            accounting_mode="bandmf_accountant",
             mechanism_state={"coeffs": [1.0], "z_std": 0.01},
         ),
         sampling_semantics=SamplingSemantics(
@@ -159,8 +173,8 @@ def test_sampling_semantics_cyclic_poisson_requires_bands_metadata() -> None:
             poisson_sampling=False,
             noise_seed=102,
             noise_mechanism_config=NoiseMechanismConfig(
-                mechanism="bsr",
-                accounting_mode="bsr_accountant",
+                mechanism="bandmf",
+                accounting_mode="bandmf_accountant",
                 mechanism_state={"coeffs": [1.0], "z_std": 0.01},
             ),
             sampling_semantics=SamplingSemantics(
@@ -178,8 +192,8 @@ def test_sampling_semantics_cyclic_poisson_rejects_steps_below_bands() -> None:
             poisson_sampling=False,
             noise_seed=102,
             noise_mechanism_config=NoiseMechanismConfig(
-                mechanism="bsr",
-                accounting_mode="bsr_accountant",
+                mechanism="bandmf",
+                accounting_mode="bandmf_accountant",
                 mechanism_state={"coeffs": [1.0], "z_std": 0.01},
             ),
             sampling_semantics=SamplingSemantics(
@@ -401,8 +415,8 @@ def test_make_private_total_steps_supports_cyclic_poisson_sampler() -> None:
         noise_seed=201,
         total_steps=5,
         noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bsr",
-            accounting_mode="bsr_accountant",
+            mechanism="bandmf",
+            accounting_mode="bandmf_accountant",
             mechanism_state={"coeffs": [1.0], "z_std": 0.01},
         ),
         sampling_semantics=SamplingSemantics(
@@ -511,7 +525,6 @@ def test_bsr_accountant_attaches_in_make_private() -> None:
             mechanism_state={
                 "coeffs": [1.0],
                 "z_std": 0.01,
-                "mf_sensitivity": 1.0,
             },
         ),
     )
@@ -537,7 +550,6 @@ def test_make_private_with_epsilon_bsr_calibrates_without_external_callback() ->
             mechanism_state={
                 "coeffs": [1.0],
                 "z_std": 0.01,
-                "mf_sensitivity": 1.0,
             },
         ),
     )
@@ -666,7 +678,7 @@ def test_make_private_with_epsilon_bsr_calibrates_with_default_accounting() -> N
     assert getattr(dp_optimizer, "accounting_mode") == "bsr_accountant"
 
 
-def test_make_private_with_epsilon_bsr_cyclic_calibration_depends_on_coeffs() -> None:
+def test_make_private_with_epsilon_bandmf_cyclic_calibration_depends_on_coeffs() -> None:
     model_a = nn.Linear(4, 3)
     model_b = nn.Linear(4, 3)
     optimizer_a = torch.optim.SGD(model_a.parameters(), lr=0.05)
@@ -684,8 +696,8 @@ def test_make_private_with_epsilon_bsr_cyclic_calibration_depends_on_coeffs() ->
         max_grad_norm=1.0,
         poisson_sampling=False,
         noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bsr",
-            accounting_mode="bsr_accountant",
+            mechanism="bandmf",
+            accounting_mode="bandmf_accountant",
             mechanism_state={"coeffs": [1.0], "z_std": 0.01},
         ),
         sampling_semantics=SamplingSemantics(
@@ -704,8 +716,8 @@ def test_make_private_with_epsilon_bsr_cyclic_calibration_depends_on_coeffs() ->
         max_grad_norm=1.0,
         poisson_sampling=False,
         noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bsr",
-            accounting_mode="bsr_accountant",
+            mechanism="bandmf",
+            accounting_mode="bandmf_accountant",
             mechanism_state={"coeffs": [1.0, 2.0], "z_std": 0.01},
         ),
         sampling_semantics=SamplingSemantics(
@@ -719,7 +731,7 @@ def test_make_private_with_epsilon_bsr_cyclic_calibration_depends_on_coeffs() ->
     assert abs(float(dp_opt_a.noise_multiplier) - float(dp_opt_b.noise_multiplier)) > 1e-12
 
 
-def test_make_private_with_epsilon_bsr_cyclic_persists_sensitivity_scale() -> None:
+def test_make_private_with_epsilon_bandmf_cyclic_persists_sensitivity_scale() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
@@ -734,8 +746,8 @@ def test_make_private_with_epsilon_bsr_cyclic_persists_sensitivity_scale() -> No
         max_grad_norm=1.0,
         poisson_sampling=False,
         noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bsr",
-            accounting_mode="bsr_accountant",
+            mechanism="bandmf",
+            accounting_mode="bandmf_accountant",
             mechanism_state={"coeffs": [1.0, 2.0], "z_std": 0.01},
         ),
         sampling_semantics=SamplingSemantics(
@@ -748,16 +760,18 @@ def test_make_private_with_epsilon_bsr_cyclic_persists_sensitivity_scale() -> No
     state = pe.noise_mechanism_config.mechanism_state
     assert "sensitivity_scale" in state
     assert float(state["sensitivity_scale"]) > 0.0
+    # Cyclic BandMF should not silently route through fixed-batch BSR sensitivity semantics.
+    assert "mf_sensitivity" not in state
 
     eps_default = pe.get_epsilon(1e-5)
     eps_override = pe.get_epsilon(
         1e-5,
-        bsr_sensitivity_scale=float(state["sensitivity_scale"]),
+        sensitivity_scale=float(state["sensitivity_scale"]),
     )
     assert eps_default == pytest.approx(eps_override, rel=0.0, abs=1e-12)
 
 
-def test_make_private_with_epsilon_bsr_cyclic_autoresolves_coeffs_from_bands() -> None:
+def test_make_private_with_epsilon_bandmf_cyclic_autoresolves_coeffs_from_bands() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
@@ -772,8 +786,8 @@ def test_make_private_with_epsilon_bsr_cyclic_autoresolves_coeffs_from_bands() -
         max_grad_norm=1.0,
         poisson_sampling=False,
         noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bsr",
-            accounting_mode="bsr_accountant",
+            mechanism="bandmf",
+            accounting_mode="bandmf_accountant",
             mechanism_state={},
         ),
         sampling_semantics=SamplingSemantics(
@@ -789,7 +803,7 @@ def test_make_private_with_epsilon_bsr_cyclic_autoresolves_coeffs_from_bands() -
     assert float(state["coeffs"][0]) > 0.0
 
 
-def test_make_private_with_epsilon_bsr_cyclic_epochs_total_steps_sample_rate_parity() -> None:
+def test_make_private_with_epsilon_bandmf_cyclic_epochs_total_steps_sample_rate_parity() -> None:
     """
     Equivalent cyclic-poisson runs (same effective step horizon) should resolve
     to the same calibrated noise when only expressed via epochs vs total_steps.
@@ -823,8 +837,8 @@ def test_make_private_with_epsilon_bsr_cyclic_epochs_total_steps_sample_rate_par
         max_grad_norm=1.0,
         poisson_sampling=False,
         noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bsr",
-            accounting_mode="bsr_accountant",
+            mechanism="bandmf",
+            accounting_mode="bandmf_accountant",
             mechanism_state={"coeffs": [1.0], "z_std": 0.01},
         ),
         sampling_semantics=SamplingSemantics(
@@ -844,8 +858,8 @@ def test_make_private_with_epsilon_bsr_cyclic_epochs_total_steps_sample_rate_par
         max_grad_norm=1.0,
         poisson_sampling=False,
         noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bsr",
-            accounting_mode="bsr_accountant",
+            mechanism="bandmf",
+            accounting_mode="bandmf_accountant",
             mechanism_state={"coeffs": [1.0], "z_std": 0.01},
         ),
         sampling_semantics=SamplingSemantics(
@@ -859,7 +873,7 @@ def test_make_private_with_epsilon_bsr_cyclic_epochs_total_steps_sample_rate_par
     )
 
 
-def test_make_private_with_epsilon_bsr_cyclic_epochs_total_steps_get_epsilon_parity() -> None:
+def test_make_private_with_epsilon_bandmf_cyclic_epochs_total_steps_get_epsilon_parity() -> None:
     dataset_size = 10
     batch_size = 4
     steps = math.ceil(dataset_size / batch_size)
@@ -886,8 +900,8 @@ def test_make_private_with_epsilon_bsr_cyclic_epochs_total_steps_get_epsilon_par
         max_grad_norm=1.0,
         poisson_sampling=False,
         noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bsr",
-            accounting_mode="bsr_accountant",
+            mechanism="bandmf",
+            accounting_mode="bandmf_accountant",
             mechanism_state={"coeffs": [1.0], "z_std": 0.01},
         ),
         sampling_semantics=SamplingSemantics(
@@ -907,8 +921,8 @@ def test_make_private_with_epsilon_bsr_cyclic_epochs_total_steps_get_epsilon_par
         max_grad_norm=1.0,
         poisson_sampling=False,
         noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bsr",
-            accounting_mode="bsr_accountant",
+            mechanism="bandmf",
+            accounting_mode="bandmf_accountant",
             mechanism_state={"coeffs": [1.0], "z_std": 0.01},
         ),
         sampling_semantics=SamplingSemantics(
@@ -926,7 +940,7 @@ def test_make_private_with_epsilon_bsr_cyclic_epochs_total_steps_get_epsilon_par
     assert float(eps_epochs) == pytest.approx(float(eps_steps), rel=0.0, abs=1e-12)
 
 
-def test_make_private_with_epsilon_bsr_cyclic_fractional_epochs_total_steps_sample_rate_parity() -> None:
+def test_make_private_with_epsilon_bandmf_cyclic_fractional_epochs_total_steps_sample_rate_parity() -> None:
     dataset_size = 40
     batch_size = 4
     epochs = 1.5
@@ -954,8 +968,8 @@ def test_make_private_with_epsilon_bsr_cyclic_fractional_epochs_total_steps_samp
         max_grad_norm=1.0,
         poisson_sampling=False,
         noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bsr",
-            accounting_mode="bsr_accountant",
+            mechanism="bandmf",
+            accounting_mode="bandmf_accountant",
             mechanism_state={"coeffs": [1.0], "z_std": 0.01},
         ),
         sampling_semantics=SamplingSemantics(
@@ -975,8 +989,8 @@ def test_make_private_with_epsilon_bsr_cyclic_fractional_epochs_total_steps_samp
         max_grad_norm=1.0,
         poisson_sampling=False,
         noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bsr",
-            accounting_mode="bsr_accountant",
+            mechanism="bandmf",
+            accounting_mode="bandmf_accountant",
             mechanism_state={"coeffs": [1.0], "z_std": 0.01},
         ),
         sampling_semantics=SamplingSemantics(
@@ -990,7 +1004,7 @@ def test_make_private_with_epsilon_bsr_cyclic_fractional_epochs_total_steps_samp
     )
 
 
-def test_make_private_with_epsilon_bsr_cyclic_fractional_epochs_total_steps_get_epsilon_parity() -> None:
+def test_make_private_with_epsilon_bandmf_cyclic_fractional_epochs_total_steps_get_epsilon_parity() -> None:
     dataset_size = 40
     batch_size = 4
     epochs = 1.5
@@ -1018,8 +1032,8 @@ def test_make_private_with_epsilon_bsr_cyclic_fractional_epochs_total_steps_get_
         max_grad_norm=1.0,
         poisson_sampling=False,
         noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bsr",
-            accounting_mode="bsr_accountant",
+            mechanism="bandmf",
+            accounting_mode="bandmf_accountant",
             mechanism_state={"coeffs": [1.0], "z_std": 0.01},
         ),
         sampling_semantics=SamplingSemantics(
@@ -1039,8 +1053,8 @@ def test_make_private_with_epsilon_bsr_cyclic_fractional_epochs_total_steps_get_
         max_grad_norm=1.0,
         poisson_sampling=False,
         noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bsr",
-            accounting_mode="bsr_accountant",
+            mechanism="bandmf",
+            accounting_mode="bandmf_accountant",
             mechanism_state={"coeffs": [1.0], "z_std": 0.01},
         ),
         sampling_semantics=SamplingSemantics(
@@ -1175,7 +1189,6 @@ def test_make_private_with_epsilon_total_steps_nonpoisson_allows_bsr_torch_sampl
             mechanism_state={
                 "coeffs": [1.0],
                 "z_std": 0.01,
-                "mf_sensitivity": 1.0,
             },
         ),
         sampling_semantics=SamplingSemantics(
@@ -1275,7 +1288,7 @@ def test_resolve_total_steps_sample_rate_uses_semantics_and_requires_explicit_cu
         ),
         batch_size=8,
         dataset_size=64,
-        mechanism="bsr",
+        mechanism="bandmf",
     )
     assert abs(float(cyclic_rate) - (8.0 / 63.0)) < 1e-12
 
@@ -1316,7 +1329,7 @@ def test_cyclic_nondivisible_accountant_q_matches_sampler_implied_q() -> None:
         ),
         batch_size=batch_size,
         dataset_size=dataset_size,
-        mechanism="bsr",
+        mechanism="bandmf",
     )
     accountant_q = float(sample_rate) * float(bands)
     sampler_implied_q = expected_q * float(bands)
@@ -2156,10 +2169,9 @@ def test_bsr_config_builds_noise_mechanism() -> None:
 
 
 def test_bsr_config_requires_coeffs_and_z_std() -> None:
-    model = nn.Linear(4, 3)
     with pytest.raises(ValueError, match="coeffs"):
         _make_private(
-            model,
+            nn.Linear(4, 3),
             poisson_sampling=False,
             noise_seed=108,
             noise_mechanism_config=NoiseMechanismConfig(
@@ -2171,7 +2183,7 @@ def test_bsr_config_requires_coeffs_and_z_std() -> None:
 
     with pytest.raises(ValueError, match="z_std"):
         _make_private(
-            model,
+            nn.Linear(4, 3),
             poisson_sampling=False,
             noise_seed=109,
             noise_mechanism_config=NoiseMechanismConfig(

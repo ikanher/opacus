@@ -160,24 +160,26 @@ def _run_bnb_training_smoke(*, sampling_semantics: SamplingSemantics) -> None:
 
 
 def test_bnb_b_min_sep_training_smoke_loop() -> None:
-    _run_bnb_training_smoke(
-        sampling_semantics=SamplingSemantics(
-            sampling_mode="b_min_sep",
-            privacy_metadata={"b": 2, "p": 0.2},
+    with pytest.raises(ValueError, match="b_min_sep sampling is temporarily disabled"):
+        _run_bnb_training_smoke(
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="b_min_sep",
+                privacy_metadata={"b": 2, "p": 0.2},
+            )
         )
-    )
 
 
 def test_bnb_b_min_sep_training_smoke_loop_alt() -> None:
-    _run_bnb_training_smoke(
-        sampling_semantics=SamplingSemantics(
-            sampling_mode="b_min_sep",
-            privacy_metadata={"b": 3, "p": 0.25},
-        ),
-    )
+    with pytest.raises(ValueError, match="b_min_sep sampling is temporarily disabled"):
+        _run_bnb_training_smoke(
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="b_min_sep",
+                privacy_metadata={"b": 3, "p": 0.25},
+            ),
+        )
 
 
-def test_bsr_cyclic_poisson_training_smoke_loop() -> None:
+def test_bandmf_cyclic_poisson_training_smoke_loop() -> None:
     model = nn.Sequential(nn.Linear(4, 12), nn.Tanh(), nn.Linear(12, 3))
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     loader = _build_loader()
@@ -197,8 +199,8 @@ def test_bsr_cyclic_poisson_training_smoke_loop() -> None:
         poisson_sampling=False,
         noise_generator=torch.Generator().manual_seed(23),
         noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bsr",
-            accounting_mode="bsr_accountant",
+            mechanism="bandmf",
+            accounting_mode="bandmf_accountant",
             mechanism_state={
                 "coeffs": [1.0, 0.2],
                 "z_std": noise_multiplier * max_grad_norm / float(batch_size),
@@ -232,36 +234,15 @@ def test_target_epsilon_sampler_paths_smoke() -> None:
         (
             "bsr",
             SamplingSemantics(sampling_mode="torch_sampler", privacy_metadata={}),
-            {"coeffs": [1.0, 0.2], "mf_sensitivity": 1.0},
+            {"coeffs": [1.0, 0.2]},
         ),
         (
-            "bsr",
+            "bandmf",
             SamplingSemantics(
                 sampling_mode="cyclic_poisson",
                 privacy_metadata={"bands": 2},
             ),
-            {"coeffs": [1.0, 0.2], "mf_sensitivity": 1.0},
-        ),
-        (
-            "bnb",
-            SamplingSemantics(
-                sampling_mode="b_min_sep",
-                privacy_metadata={"b": 2, "p": 0.2, "bands": 2},
-            ),
-            {
-                "coeffs": [1.0, 0.2],
-                "bands": 2,
-                "c_matrix": build_bnb_toeplitz_c_matrix_and_contract(
-                    coeffs=[1.0, 0.2],
-                    bands=2,
-                    horizon=8,
-                )[0],
-                "c_matrix_contract": build_bnb_toeplitz_c_matrix_and_contract(
-                    coeffs=[1.0, 0.2],
-                    bands=2,
-                    horizon=8,
-                )[1],
-            },
+            {"coeffs": [1.0, 0.2]},
         ),
         (
             "bnb",
@@ -320,17 +301,19 @@ def test_target_epsilon_sampler_paths_smoke() -> None:
 
 
 @pytest.mark.parametrize(
-    "sampling_semantics,coeffs,seed,epochs",
+    "mechanism,sampling_semantics,coeffs,seed,epochs",
     [
-        (SamplingSemantics(sampling_mode="torch_sampler", privacy_metadata={}), [1.0, 0.2], 41, 2),
-        (SamplingSemantics(sampling_mode="torch_sampler", privacy_metadata={}), [1.0, 0.4, 0.1], 43, 2),
+        ("bsr", SamplingSemantics(sampling_mode="torch_sampler", privacy_metadata={}), [1.0, 0.2], 41, 2),
+        ("bsr", SamplingSemantics(sampling_mode="torch_sampler", privacy_metadata={}), [1.0, 0.4, 0.1], 43, 2),
         (
+            "bandmf",
             SamplingSemantics(sampling_mode="cyclic_poisson", privacy_metadata={"bands": 2}),
             [1.0, 0.2],
             47,
             2,
         ),
         (
+            "bandmf",
             SamplingSemantics(sampling_mode="cyclic_poisson", privacy_metadata={"bands": 3}),
             [1.0, 0.3, 0.1],
             53,
@@ -338,7 +321,8 @@ def test_target_epsilon_sampler_paths_smoke() -> None:
         ),
     ],
 )
-def test_bsr_short_stability_no_nans_across_representative_settings(
+def test_matrix_factorization_short_stability_no_nans_across_representative_settings(
+    mechanism: str,
     sampling_semantics: SamplingSemantics,
     coeffs: list[float],
     seed: int,
@@ -370,8 +354,8 @@ def test_bsr_short_stability_no_nans_across_representative_settings(
         poisson_sampling=False,
         noise_generator=torch.Generator().manual_seed(seed),
         noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bsr",
-            accounting_mode="bsr_accountant",
+            mechanism=mechanism,
+            accounting_mode=f"{mechanism}_accountant",
             mechanism_state=mechanism_state,
         ),
         sampling_semantics=sampling_semantics,

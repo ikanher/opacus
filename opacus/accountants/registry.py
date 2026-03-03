@@ -15,6 +15,7 @@
 from typing import Dict, Type
 
 from .accountant import IAccountant
+from .bandmf import BandMFAccountant
 from .bnb import BNBAccountant
 from .gdp import GaussianAccountant
 from .bsr import BSRAccountant
@@ -26,6 +27,7 @@ _ACCOUNTANTS: Dict[str, Type[IAccountant]] = {
     "rdp": RDPAccountant,
     "gdp": GaussianAccountant,
     "prv": PRVAccountant,
+    "bandmf": BandMFAccountant,
     "bsr": BSRAccountant,
     "bnb": BNBAccountant,
 }

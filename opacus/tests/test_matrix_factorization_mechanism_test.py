@@ -77,6 +77,14 @@ def test_noise_mechanism_config_bsr_requires_bsr_accountant() -> None:
         )
 
 
+def test_noise_mechanism_config_bandmf_requires_bandmf_accountant() -> None:
+    with pytest.raises(ValueError, match="bandmf mechanism requires bandmf_accountant"):
+        NoiseMechanismConfig(
+            mechanism="bandmf",
+            accounting_mode="standard_step_accountant",
+        )
+
+
 def test_noise_mechanism_config_rejects_correlated_alias() -> None:
     with pytest.raises(ValueError, match="mechanism must be one of"):
         NoiseMechanismConfig(
@@ -184,7 +192,7 @@ def test_distributed_bsr_supported_for_flat_hooks(monkeypatch) -> None:
     assert isinstance(dp_optimizer.noise_mechanism, CorrelatedNoiseMechanism)
 
 
-def test_distributed_bsr_supports_cyclic_poisson_sampling(monkeypatch) -> None:
+def test_distributed_bandmf_supports_cyclic_poisson_sampling(monkeypatch) -> None:
     monkeypatch.setattr(pe_mod, "DDP", nn.Linear)
     _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
 
@@ -206,8 +214,8 @@ def test_distributed_bsr_supports_cyclic_poisson_sampling(monkeypatch) -> None:
             privacy_metadata={"bands": 2},
         ),
         noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bsr",
-            accounting_mode="bsr_accountant",
+            mechanism="bandmf",
+            accounting_mode="bandmf_accountant",
             mechanism_state={"coeffs": [1.0, 0.2], "z_std": 0.01},
         ),
     )
@@ -267,7 +275,7 @@ def test_distributed_dpoptimizer_rank0_noise_and_global_mean_semantics(
     assert torch.allclose(p1.grad, expected_global_mean, rtol=0.0, atol=1e-7)
 
 
-def test_distributed_bnb_supports_b_min_sep_sampling(monkeypatch) -> None:
+def test_distributed_bnb_rejects_b_min_sep_sampling(monkeypatch) -> None:
     monkeypatch.setattr(pe_mod, "DDP", nn.Linear)
     _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
 
@@ -275,32 +283,29 @@ def test_distributed_bnb_supports_b_min_sep_sampling(monkeypatch) -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
-    _, dp_optimizer, private_loader = pe.make_private(
-        module=model,
-        optimizer=optimizer,
-        data_loader=_loader(),
-        noise_multiplier=0.0,
-        max_grad_norm=1.0,
-        poisson_sampling=False,
-        clipping="flat",
-        grad_sample_mode="hooks",
-        sampling_semantics=SamplingSemantics(
-            sampling_mode="b_min_sep",
-            privacy_metadata={"b": 2, "p": 0.25},
-        ),
-        noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bnb",
-            accounting_mode="bnb_accountant",
-            mechanism_state={"coeffs": [1.0, 0.3], "z_std": 0.01, "bands": 2},
-        ),
-    )
-
-    assert isinstance(dp_optimizer, DistributedDPOptimizer)
-    assert isinstance(dp_optimizer.noise_mechanism, CorrelatedNoiseMechanism)
-    assert isinstance(private_loader.batch_sampler, DistributedBMinSepSampler)
+    with pytest.raises(ValueError, match="b_min_sep sampling is temporarily disabled"):
+        pe.make_private(
+            module=model,
+            optimizer=optimizer,
+            data_loader=_loader(),
+            noise_multiplier=0.0,
+            max_grad_norm=1.0,
+            poisson_sampling=False,
+            clipping="flat",
+            grad_sample_mode="hooks",
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="b_min_sep",
+                privacy_metadata={"b": 2, "p": 0.25},
+            ),
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bnb",
+                accounting_mode="bnb_accountant",
+                mechanism_state={"coeffs": [1.0, 0.3], "z_std": 0.01, "bands": 2},
+            ),
+        )
 
 
-def test_distributed_bnb_supports_b_min_sep_sampling_alt(monkeypatch) -> None:
+def test_distributed_bnb_rejects_b_min_sep_sampling_alt(monkeypatch) -> None:
     monkeypatch.setattr(pe_mod, "DDP", nn.Linear)
     _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
 
@@ -308,30 +313,26 @@ def test_distributed_bnb_supports_b_min_sep_sampling_alt(monkeypatch) -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
-    _, dp_optimizer, private_loader = pe.make_private(
-        module=model,
-        optimizer=optimizer,
-        data_loader=_loader(),
-        noise_multiplier=0.0,
-        max_grad_norm=1.0,
-        poisson_sampling=False,
-        clipping="flat",
-        grad_sample_mode="hooks",
-        sampling_semantics=SamplingSemantics(
-            sampling_mode="b_min_sep",
-            privacy_metadata={"b": 2, "p": 0.25},
-        ),
-            
-        noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bnb",
-            accounting_mode="bnb_accountant",
-            mechanism_state={"coeffs": [1.0, 0.3], "z_std": 0.01, "bands": 2},
-        ),
-    )
-
-    assert isinstance(dp_optimizer, DistributedDPOptimizer)
-    assert isinstance(dp_optimizer.noise_mechanism, CorrelatedNoiseMechanism)
-    assert isinstance(private_loader.batch_sampler, DistributedBMinSepSampler)
+    with pytest.raises(ValueError, match="b_min_sep sampling is temporarily disabled"):
+        pe.make_private(
+            module=model,
+            optimizer=optimizer,
+            data_loader=_loader(),
+            noise_multiplier=0.0,
+            max_grad_norm=1.0,
+            poisson_sampling=False,
+            clipping="flat",
+            grad_sample_mode="hooks",
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="b_min_sep",
+                privacy_metadata={"b": 2, "p": 0.25},
+            ),
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bnb",
+                accounting_mode="bnb_accountant",
+                mechanism_state={"coeffs": [1.0, 0.3], "z_std": 0.01, "bands": 2},
+            ),
+        )
 
 
 def test_distributed_bsr_rejects_non_flat_clipping(monkeypatch) -> None:

@@ -108,7 +108,7 @@ class PrivacyEngine:
             raise ValueError("cyclic_poisson steps must be >= 1")
         if steps < bands:
             raise ValueError(
-                "cyclic_poisson BSR requires steps >= bands; "
+                "cyclic_poisson bandmf requires steps >= bands; "
                 f"got steps={steps}, bands={bands}"
             )
 
@@ -171,7 +171,7 @@ class PrivacyEngine:
         steps: int,
         kwargs: Dict[str, Any],
     ) -> NoiseMechanismConfig:
-        if mechanism_config.mechanism != "bsr":
+        if mechanism_config.mechanism != "bandmf":
             return mechanism_config
 
         if (
@@ -239,7 +239,7 @@ class PrivacyEngine:
         loss_reduction: Optional[str],
         correlated_denominator: Optional[float],
     ) -> None:
-        if mechanism_config.mechanism != "bsr":
+        if mechanism_config.mechanism not in ("bsr", "bandmf"):
             return
 
         metadata = (
@@ -270,7 +270,7 @@ class PrivacyEngine:
                 mechanism_config.mechanism_state
             ),
         }
-        logger.info("BSR_TRACE %s", json.dumps(payload, sort_keys=True))
+        logger.info("MF_TRACE %s", json.dumps(payload, sort_keys=True))
 
     def __init__(self, *, accountant: str = "prv", secure_mode: bool = False):
         """
@@ -314,7 +314,7 @@ class PrivacyEngine:
 
     @staticmethod
     def _accountant_for_mechanism(*, mechanism: str, default_accountant):
-        if mechanism in ("bsr", "bnb"):
+        if mechanism in ("bandmf", "bsr", "bnb"):
             return create_accountant(mechanism=mechanism)
 
         return default_accountant
@@ -512,8 +512,8 @@ class PrivacyEngine:
             else {}
         )
         cyclic_only_params = []
-        if kwargs.get("bsr_sensitivity_scale") is not None:
-            cyclic_only_params.append("bsr_sensitivity_scale")
+        if kwargs.get("sensitivity_scale") is not None:
+            cyclic_only_params.append("sensitivity_scale")
         if metadata.get("sensitivity_scale") is not None:
             cyclic_only_params.append("privacy_metadata['sensitivity_scale']")
         if mechanism_state.get("sensitivity_scale") is not None:
@@ -643,24 +643,24 @@ class PrivacyEngine:
             fixed_only_params.append("mechanism_state['min_separation']")
         if fixed_only_params:
             raise ValueError(
-                "cyclic-poisson bsr accounting received fixed-batch-only parameters: "
+                "cyclic-poisson bandmf accounting received fixed-batch-only parameters: "
                 + ", ".join(fixed_only_params)
             )
 
         explicit_scale = kwargs.get(
-            "bsr_sensitivity_scale",
+            "sensitivity_scale",
             metadata.get("sensitivity_scale", mechanism_state.get("sensitivity_scale")),
         )
         if explicit_scale is not None:
             scale = float(explicit_scale)
             if (not math.isfinite(scale)) or scale <= 0.0:
-                raise ValueError("bsr_sensitivity_scale must be finite and > 0")
+                raise ValueError("sensitivity_scale must be finite and > 0")
             return scale
 
         coeffs = mechanism_state.get("coeffs")
         if coeffs is None:
             raise ValueError(
-                "cyclic-poisson bsr accounting requires either `bsr_sensitivity_scale` "
+                "cyclic-poisson bandmf accounting requires either `sensitivity_scale` "
                 "or `mechanism_state['coeffs']`"
             )
 
@@ -686,7 +686,7 @@ class PrivacyEngine:
 
             if scale_steps < resolved_bands:
                 raise ValueError(
-                    "cyclic_poisson BSR requires steps >= bands; "
+                    "cyclic_poisson bandmf requires steps >= bands; "
                     f"got steps={scale_steps}, bands={resolved_bands}"
                 )
 
@@ -697,7 +697,7 @@ class PrivacyEngine:
             )
         )
         if (not math.isfinite(scale)) or scale <= 0.0:
-            raise ValueError("resolved bsr_sensitivity_scale must be finite and > 0")
+            raise ValueError("resolved sensitivity_scale must be finite and > 0")
 
         return scale
 
@@ -819,7 +819,7 @@ class PrivacyEngine:
         steps = total_steps if total_steps is not None else len(data_loader)
         if int(steps) < int(bands):
             raise ValueError(
-                "cyclic_poisson BSR requires steps >= bands; "
+                "cyclic_poisson bandmf requires steps >= bands; "
                 f"got steps={int(steps)}, bands={int(bands)}"
             )
         generator = self._sampler_generator(data_loader)
@@ -937,11 +937,22 @@ class PrivacyEngine:
         validate_cyclic_poisson_mode: bool,
     ) -> None:
         mechanism = mechanism_config.mechanism
-        if mechanism == "bsr" and poisson_sampling:
+        if mechanism in ("bandmf", "bsr") and poisson_sampling:
             raise ValueError(
-                "bsr mechanism requires fixed-batch semantics; "
+                f"{mechanism} mechanism requires fixed-batch semantics; "
                 "set poisson_sampling=False"
             )
+
+        if mechanism == "bandmf":
+            if sampling_semantics is None:
+                raise ValueError(
+                    "bandmf mechanism requires explicit sampling_semantics "
+                    "with sampling_mode='cyclic_poisson'"
+                )
+            if sampling_semantics.sampling_mode != "cyclic_poisson":
+                raise ValueError(
+                    "bandmf mechanism supports sampling_mode='cyclic_poisson' only in this phase"
+                )
 
         if mechanism == "bnb" and poisson_sampling:
             raise ValueError(
@@ -981,10 +992,20 @@ class PrivacyEngine:
             validate_cyclic_poisson_mode
             and sampling_semantics is not None
             and sampling_semantics.sampling_mode == "cyclic_poisson"
-            and mechanism != "bsr"
+            and mechanism != "bandmf"
         ):
             raise ValueError(
-                "cyclic_poisson sampling is supported only for mechanism='bsr'"
+                "cyclic_poisson sampling is supported only for mechanism='bandmf'"
+            )
+
+        if (
+            sampling_semantics is not None
+            and sampling_semantics.sampling_mode == "cyclic_poisson"
+            and mechanism == "bsr"
+        ):
+            raise ValueError(
+                "bsr mechanism does not support cyclic_poisson in this phase; "
+                "use mechanism='bandmf'"
             )
 
     @staticmethod
@@ -1140,11 +1161,11 @@ class PrivacyEngine:
 
             bsr_mf_sensitivity = None
             if (
-                mechanism_config.mechanism == "bsr"
+                mechanism_config.mechanism == "bandmf"
                 and sampling_semantics is not None
                 and sampling_semantics.sampling_mode == "cyclic_poisson"
             ):
-                nm_kwargs["bsr_sensitivity_scale"] = self._resolve_bsr_sensitivity_scale_for_cyclic(
+                nm_kwargs["sensitivity_scale"] = self._resolve_bsr_sensitivity_scale_for_cyclic(
                     mechanism_state=mechanism_config.mechanism_state,
                     sampling_semantics=sampling_semantics,
                     steps=int(total_steps),
@@ -1186,11 +1207,11 @@ class PrivacyEngine:
         implied_steps = int(float(epochs) * float(len(data_loader)))
         bsr_mf_sensitivity = None
         if (
-            mechanism_config.mechanism == "bsr"
+            mechanism_config.mechanism == "bandmf"
             and sampling_semantics is not None
             and sampling_semantics.sampling_mode == "cyclic_poisson"
         ):
-            nm_kwargs["bsr_sensitivity_scale"] = self._resolve_bsr_sensitivity_scale_for_cyclic(
+            nm_kwargs["sensitivity_scale"] = self._resolve_bsr_sensitivity_scale_for_cyclic(
                 mechanism_state=mechanism_config.mechanism_state,
                 sampling_semantics=sampling_semantics,
                 steps=implied_steps,
@@ -1442,7 +1463,7 @@ class PrivacyEngine:
         bnb_calibration_report: Optional[Dict[str, Any]],
         bnb_accounting_kwargs: Optional[Dict[str, Any]] = None,
     ) -> NoiseMechanismConfig:
-        if mechanism_config.mechanism not in ("bsr", "bnb"):
+        if mechanism_config.mechanism not in ("bandmf", "bsr", "bnb"):
             return mechanism_config
 
         if isinstance(max_grad_norm, list):
@@ -1800,7 +1821,7 @@ class PrivacyEngine:
 
         requested_noise_mechanism = kwargs.get("noise_mechanism")
         if distributed and (
-            mechanism_config.mechanism in ("bsr", "bnb")
+            mechanism_config.mechanism in ("bandmf", "bsr", "bnb")
             or isinstance(requested_noise_mechanism, CorrelatedNoiseMechanism)
         ):
             self._validate_distributed_correlated_support(
@@ -1844,7 +1865,7 @@ class PrivacyEngine:
         )
 
         if (
-            mechanism_config.mechanism == "bsr"
+            mechanism_config.mechanism == "bandmf"
             and sampling_semantics is not None
             and sampling_semantics.sampling_mode == "cyclic_poisson"
         ):
@@ -2038,7 +2059,7 @@ class PrivacyEngine:
         distributed = is_dpddp or is_ddp or is_fsdp
 
         correlated_denominator = None
-        if mechanism_config.mechanism in ("bsr", "bnb"):
+        if mechanism_config.mechanism in ("bandmf", "bsr", "bnb"):
             _, calibration_expected_batch_size = self._resolve_sample_rate_and_expected_batch_size(
                 poisson_sampling=poisson_sampling,
                 sampling_semantics=local_sampling_semantics,
@@ -2075,7 +2096,7 @@ class PrivacyEngine:
         )
 
         if (
-            mechanism_config.mechanism == "bsr"
+            mechanism_config.mechanism == "bandmf"
             and local_sampling_semantics is not None
             and local_sampling_semantics.sampling_mode == "cyclic_poisson"
         ):
@@ -2106,7 +2127,7 @@ class PrivacyEngine:
         )
 
         if (
-            mechanism_config.mechanism == "bsr"
+            mechanism_config.mechanism == "bandmf"
             and local_sampling_semantics is not None
             and local_sampling_semantics.sampling_mode == "cyclic_poisson"
         ):
@@ -2244,7 +2265,7 @@ class PrivacyEngine:
         Returns:
             Privacy budget (epsilon) expended so far.
         """
-        if self.accountant.mechanism() in ("bsr", "bnb"):
+        if self.accountant.mechanism() in ("bandmf", "bsr", "bnb"):
             kwargs.setdefault(
                 "mechanism_state", self.noise_mechanism_config.mechanism_state
             )

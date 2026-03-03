@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from .accountant import IAccountant
+from .bandmf import BandMFAccountant
 from .bnb import BNBAccountant
 from .gdp import GaussianAccountant
 from .bsr import BSRAccountant
@@ -26,6 +27,7 @@ __all__ = [
     "GaussianAccountant",
     "RDPAccountant",
     "PRVAccountant",
+    "BandMFAccountant",
     "BNBAccountant",
     "BSRAccountant",
     "register_accountant",
