@@ -748,6 +748,57 @@ class AccountingTest(unittest.TestCase):
 
         self.assertGreater(eps_larger_scale, eps_unit)
 
+    def test_bandmf_accountant_exposes_resolved_contract_metadata(self) -> None:
+        accountant = BandMFAccountant()
+        accountant.history = [(1.25, 0.02, 120)]
+        sampling_semantics = SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 10},
+        )
+
+        eps = accountant.get_epsilon(
+            delta=1e-5,
+            sampling_semantics=sampling_semantics,
+            sensitivity_scale=1.0,
+        )
+        self.assertGreaterEqual(eps, 0.0)
+        self.assertIsInstance(accountant.last_contract, dict)
+        assert accountant.last_contract is not None
+        self.assertEqual(accountant.last_contract["mechanism"], "bandmf")
+        self.assertEqual(accountant.last_contract["accounting_mode"], "bandmf_accountant")
+        self.assertEqual(accountant.last_contract["sampling_mode"], "cyclic_poisson")
+        self.assertEqual(accountant.last_contract["bands"], 10)
+        self.assertEqual(accountant.last_contract["steps"], 120)
+        self.assertAlmostEqual(accountant.last_contract["sample_rate"], 0.02, places=12)
+        self.assertAlmostEqual(accountant.last_contract["q"], 0.2, places=12)
+        self.assertEqual(accountant.last_contract["cycles"], 12)
+
+    def test_bandmf_accountant_rejects_steps_below_bands(self) -> None:
+        accountant = BandMFAccountant()
+        accountant.history = [(1.0, 0.01, 5)]
+        sampling_semantics = SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 8},
+        )
+        with self.assertRaisesRegex(ValueError, "steps must be >= bands"):
+            accountant.get_epsilon(
+                delta=1e-5,
+                sampling_semantics=sampling_semantics,
+            )
+
+    def test_bandmf_accountant_rejects_invalid_derived_q(self) -> None:
+        accountant = BandMFAccountant()
+        accountant.history = [(1.0, 0.2, 100)]
+        sampling_semantics = SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 6},
+        )
+        with self.assertRaisesRegex(ValueError, "derived q = bands \\* sample_rate"):
+            accountant.get_epsilon(
+                delta=1e-5,
+                sampling_semantics=sampling_semantics,
+            )
+
     def test_rdp_accountant(self) -> None:
         noise_multiplier = 1.5
         sample_rate = 0.04

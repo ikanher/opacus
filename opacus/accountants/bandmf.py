@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import math
+
 from opacus.accountants.analysis.bsr import (
     bsr_cyclic_poisson_epsilon_upper_bound,
 )
@@ -24,10 +26,32 @@ from .accountant import IAccountant
 class BandMFAccountant(IAccountant):
     """
     Accountant adapter for amplified cyclic BandMF mechanisms.
+
+    This path is intentionally separate from fixed-batch BSR accounting.
     """
 
     def __init__(self):
         super().__init__()
+        self.last_contract = None
+
+    @staticmethod
+    def _resolve_cyclic_contract(*, sample_rate: float, steps: int, bands: int) -> dict:
+        if bands <= 0:
+            raise ValueError("bands must be > 0")
+        if steps < bands:
+            raise ValueError(f"steps must be >= bands; got steps={steps}, bands={bands}")
+
+        q = float(sample_rate) * float(bands)
+        if not math.isfinite(q) or q <= 0.0 or q > 1.0:
+            raise ValueError(
+                f"derived q = bands * sample_rate must be in (0, 1]; got {q}"
+            )
+
+        cycles = int(math.ceil(float(steps) / float(bands)))
+        if cycles <= 0:
+            raise ValueError(f"derived cycles must be > 0; got {cycles}")
+
+        return {"q": q, "cycles": cycles, "bands": int(bands), "steps": int(steps)}
 
     def step(self, *, noise_multiplier: float, sample_rate: float):
         if len(self.history) >= 1:
@@ -91,6 +115,7 @@ class BandMFAccountant(IAccountant):
             raise ValueError(
                 "cyclic_poisson sampling requires privacy_metadata['bands']"
             )
+        bands = int(bands)
 
         state = mechanism_state if isinstance(mechanism_state, dict) else {}
         sensitivity_scale = kwargs.get(
@@ -99,8 +124,25 @@ class BandMFAccountant(IAccountant):
         )
 
         sensitivity_scale = float(sensitivity_scale)
-        if sensitivity_scale <= 0.0:
+        if not math.isfinite(sensitivity_scale) or sensitivity_scale <= 0.0:
             raise ValueError("bandmf_sensitivity_scale must be > 0")
+
+        contract = self._resolve_cyclic_contract(
+            sample_rate=float(sample_rate),
+            steps=int(total_steps),
+            bands=bands,
+        )
+        self.last_contract = {
+            "mechanism": "bandmf",
+            "accounting_mode": "bandmf_accountant",
+            "sampling_mode": sampling_mode,
+            "sample_rate": float(sample_rate),
+            "bands": int(contract["bands"]),
+            "steps": int(contract["steps"]),
+            "q": float(contract["q"]),
+            "cycles": int(contract["cycles"]),
+            "sensitivity_scale": float(sensitivity_scale),
+        }
 
         return float(
             bsr_cyclic_poisson_epsilon_upper_bound(
@@ -108,7 +150,7 @@ class BandMFAccountant(IAccountant):
                 target_delta=float(delta),
                 steps=int(total_steps),
                 sample_rate=float(sample_rate),
-                bands=int(bands),
+                bands=int(contract["bands"]),
             )
         )
 
