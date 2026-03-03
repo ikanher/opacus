@@ -797,17 +797,13 @@ def test_make_private_with_epsilon_bsr_explicit_coeffs_take_precedence() -> None
     assert state["coeffs"] == explicit
 
 
-def test_make_private_with_epsilon_bandmf_cyclic_still_uses_optimizer_strategy(
+def test_make_private_with_epsilon_bandmf_cyclic_uses_analytical_autogen(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sentinel = [0.3, 0.2, 0.1]
+    def _fail_optimize(*args, **kwargs):
+        raise AssertionError("_optimize_bsr_cyclic_coeffs should not be called on analytical cyclic path")
 
-    def _fake_optimize(*, bands: int, steps: int, max_optimizer_steps: int = 250) -> list[float]:
-        assert bands == 3
-        assert steps == 32
-        return list(sentinel)
-
-    monkeypatch.setattr(PrivacyEngine, "_optimize_bsr_cyclic_coeffs", staticmethod(_fake_optimize))
+    monkeypatch.setattr(PrivacyEngine, "_optimize_bsr_cyclic_coeffs", staticmethod(_fail_optimize))
 
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(
@@ -839,7 +835,99 @@ def test_make_private_with_epsilon_bandmf_cyclic_still_uses_optimizer_strategy(
     )
 
     state = dp_optimizer.noise_mechanism_config.mechanism_state
-    assert state["coeffs"] == sentinel
+    expected = generate_bsr_coeffs_from_sgd_workload(
+        bands=3,
+        momentum=0.9,
+        weight_decay=0.9999,
+    )
+    assert state["coeffs"] == pytest.approx(expected, rel=0.0, abs=1e-12)
+
+
+def test_make_private_with_epsilon_bsr_cyclic_uses_analytical_autogen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fail_optimize(*args, **kwargs):
+        raise AssertionError("_optimize_bsr_cyclic_coeffs should not be called on analytical cyclic path")
+
+    monkeypatch.setattr(PrivacyEngine, "_optimize_bsr_cyclic_coeffs", staticmethod(_fail_optimize))
+
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=0.05,
+        momentum=0.9,
+        weight_decay=0.9999,
+    )
+    pe = PrivacyEngine()
+
+    _, dp_optimizer, _ = pe.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        target_epsilon=1.0,
+        target_delta=1e-5,
+        total_steps=32,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 3},
+        ),
+    )
+
+    state = dp_optimizer.noise_mechanism_config.mechanism_state
+    expected = generate_bsr_coeffs_from_sgd_workload(
+        bands=3,
+        momentum=0.9,
+        weight_decay=0.9999,
+    )
+    assert state["coeffs"] == pytest.approx(expected, rel=0.0, abs=1e-12)
+
+
+def test_make_private_with_epsilon_bsr_cyclic_large_bands_stays_fast_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fail_optimize(*args, **kwargs):
+        raise AssertionError("_optimize_bsr_cyclic_coeffs should not be called on analytical cyclic path")
+
+    monkeypatch.setattr(PrivacyEngine, "_optimize_bsr_cyclic_coeffs", staticmethod(_fail_optimize))
+
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=0.05,
+        momentum=0.95,
+        weight_decay=0.0,
+    )
+    pe = PrivacyEngine()
+
+    _, dp_optimizer, _ = pe.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(n_samples=640, batch_size=10),
+        target_epsilon=2.0,
+        target_delta=1e-5,
+        total_steps=2000,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 48},
+        ),
+    )
+
+    state = dp_optimizer.noise_mechanism_config.mechanism_state
+    assert len(state["coeffs"]) == 48
 
 
 def test_make_private_with_epsilon_bandmf_cyclic_calibration_depends_on_coeffs() -> None:

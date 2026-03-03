@@ -1056,21 +1056,19 @@ class AccountingTest(unittest.TestCase):
         )
         self.assertLess(abs(noise_a - noise_b), 1e-6)
 
-    def test_bsr_accountant_rejects_cyclic_poisson(self) -> None:
+    def test_bsr_accountant_supports_cyclic_poisson(self) -> None:
         accountant = BSRAccountant()
         accountant.history = [(1.0, 0.01, 100)]
-        with self.assertRaisesRegex(
-            ValueError,
-            "does not support cyclic_poisson",
-        ):
-            accountant.get_epsilon(
-                delta=1e-5,
-                mechanism_state={},
-                sampling_semantics=SamplingSemantics(
-                    sampling_mode="cyclic_poisson",
-                    privacy_metadata={"bands": 10},
-                ),
-            )
+        eps = accountant.get_epsilon(
+            delta=1e-5,
+            mechanism_state={"sensitivity_scale": 1.0},
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="cyclic_poisson",
+                privacy_metadata={"bands": 10},
+            ),
+        )
+        self.assertTrue(math.isfinite(eps))
+        self.assertGreater(eps, 0.0)
 
     def test_bsr_cyclic_poisson_epsilon_invariant_within_same_round_bucket(self) -> None:
         # With fixed (q, noise, delta, bands), epsilon depends on rounds=ceil(steps/bands).

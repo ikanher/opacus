@@ -18,7 +18,9 @@ import math
 
 from opacus.accountants.analysis.bsr import (
     compute_bsr_mf_sensitivity_from_coeffs,
+    compute_bsr_kappa_from_coeffs,
     bsr_fixed_batch_epsilon_upper_bound,
+    bsr_cyclic_poisson_epsilon_upper_bound,
 )
 
 from .accountant import IAccountant
@@ -85,9 +87,66 @@ class BSRAccountant(IAccountant):
             else "torch_sampler"
         )
         if sampling_mode == "cyclic_poisson":
-            raise ValueError(
-                "bsr accountant does not support cyclic_poisson semantics in this phase; "
-                "use mechanism/accountant family 'bandmf' instead"
+            bands = metadata.get("bands", None)
+            if bands is None:
+                raise ValueError(
+                    "cyclic_poisson sampling requires privacy_metadata['bands']"
+                )
+            bands = int(bands)
+            if bands <= 0:
+                raise ValueError("bands must be > 0")
+            if total_steps < bands:
+                raise ValueError(
+                    f"steps must be >= bands; got steps={total_steps}, bands={bands}"
+                )
+
+            state = mechanism_state if isinstance(mechanism_state, dict) else {}
+            explicit_scale = kwargs.get(
+                "sensitivity_scale",
+                metadata.get("sensitivity_scale", state.get("sensitivity_scale")),
+            )
+            if explicit_scale is not None:
+                sensitivity_scale = float(explicit_scale)
+                if (not math.isfinite(sensitivity_scale)) or sensitivity_scale <= 0.0:
+                    raise ValueError("sensitivity_scale must be finite and > 0")
+            else:
+                coeffs = state.get("coeffs")
+                if coeffs is None:
+                    raise ValueError(
+                        "cyclic-poisson bsr accounting requires either `sensitivity_scale` "
+                        "or `mechanism_state['coeffs']`"
+                    )
+                scale_steps = kwargs.get(
+                    "bsr_iterations_number",
+                    metadata.get("iterations_number", state.get("iterations_number")),
+                )
+                if scale_steps is None:
+                    scale_steps = total_steps
+                scale_steps = int(scale_steps)
+                if scale_steps < 1:
+                    raise ValueError("bsr_iterations_number must be >= 1")
+                if scale_steps < bands:
+                    raise ValueError(
+                        "cyclic_poisson bsr requires steps >= bands; "
+                        f"got steps={scale_steps}, bands={bands}"
+                    )
+                sensitivity_scale = float(
+                    compute_bsr_kappa_from_coeffs(
+                        coeffs=coeffs,
+                        steps=scale_steps,
+                    )
+                )
+                if (not math.isfinite(sensitivity_scale)) or sensitivity_scale <= 0.0:
+                    raise ValueError("resolved sensitivity_scale must be finite and > 0")
+
+            return float(
+                bsr_cyclic_poisson_epsilon_upper_bound(
+                    noise_multiplier=float(noise_multiplier) / float(sensitivity_scale),
+                    target_delta=float(delta),
+                    steps=int(total_steps),
+                    sample_rate=float(sample_rate),
+                    bands=int(bands),
+                )
             )
 
         state = mechanism_state if isinstance(mechanism_state, dict) else {}

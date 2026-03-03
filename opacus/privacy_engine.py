@@ -173,9 +173,10 @@ class PrivacyEngine:
         mechanism_config: NoiseMechanismConfig,
         sampling_semantics: Optional[SamplingSemantics],
         steps: int,
+        optimizer: optim.Optimizer,
         kwargs: Dict[str, Any],
     ) -> NoiseMechanismConfig:
-        if mechanism_config.mechanism != "bandmf":
+        if mechanism_config.mechanism not in ("bandmf", "bsr"):
             return mechanism_config
 
         if (
@@ -197,13 +198,24 @@ class PrivacyEngine:
             )
 
         bands = int(bands)
+        if bands <= 0:
+            raise ValueError("cyclic_poisson bands must be > 0")
+        if int(steps) < bands:
+            raise ValueError(
+                "cyclic_poisson bandmf requires steps >= bands; "
+                f"got steps={int(steps)}, bands={bands}"
+            )
 
-        max_optimizer_steps = int(kwargs.get("bsr_strategy_max_optimizer_steps", 250))
-        state["coeffs"] = PrivacyEngine._optimize_bsr_cyclic_coeffs(
-            bands=bands,
-            steps=int(steps),
-            max_optimizer_steps=max_optimizer_steps,
+        momentum, weight_decay = PrivacyEngine._resolve_uniform_sgd_workload_from_optimizer(
+            optimizer=optimizer
         )
+        state["coeffs"] = generate_bsr_coeffs_from_sgd_workload(
+            bands=bands,
+            momentum=momentum,
+            weight_decay=weight_decay,
+        )
+        state["bands"] = bands
+        state["coeff_source"] = "analytical_auto"
 
         return NoiseMechanismConfig(
             mechanism=mechanism_config.mechanism,
@@ -252,7 +264,8 @@ class PrivacyEngine:
     ) -> NoiseMechanismConfig:
         # Contract split:
         # - `bsr` fixed-batch path uses analytical workload coefficients.
-        # - `bandmf` cyclic path keeps optimizer-based strategy resolution.
+        # - `bsr`/`bandmf` cyclic path auto-resolves coefficients analytically via
+        #   `_ensure_bsr_cyclic_coeffs`.
         if mechanism_config.mechanism != "bsr":
             return mechanism_config
 
@@ -283,6 +296,7 @@ class PrivacyEngine:
             weight_decay=weight_decay,
         )
         state["bands"] = bands
+        state["coeff_source"] = "analytical_auto"
 
         return NoiseMechanismConfig(
             mechanism=mechanism_config.mechanism,
@@ -295,9 +309,13 @@ class PrivacyEngine:
         coeffs = mechanism_state.get("coeffs")
         coeff_count = len(coeffs) if isinstance(coeffs, (list, tuple)) else None
         coeff_head = list(coeffs[:5]) if isinstance(coeffs, (list, tuple)) else None
+        coeff_source = mechanism_state.get("coeff_source")
+        if coeff_source is None and coeff_count:
+            coeff_source = "explicit_or_precomputed"
         return {
             "coeff_count": coeff_count,
             "coeff_head": coeff_head,
+            "coeff_source": coeff_source,
             "z_std": mechanism_state.get("z_std"),
             "sensitivity_scale": mechanism_state.get("sensitivity_scale"),
             "mf_sensitivity": mechanism_state.get("mf_sensitivity"),
@@ -1076,20 +1094,10 @@ class PrivacyEngine:
             validate_cyclic_poisson_mode
             and sampling_semantics is not None
             and sampling_semantics.sampling_mode == "cyclic_poisson"
-            and mechanism != "bandmf"
+            and mechanism not in ("bandmf", "bsr")
         ):
             raise ValueError(
-                "cyclic_poisson sampling is supported only for mechanism='bandmf'"
-            )
-
-        if (
-            sampling_semantics is not None
-            and sampling_semantics.sampling_mode == "cyclic_poisson"
-            and mechanism == "bsr"
-        ):
-            raise ValueError(
-                "bsr mechanism does not support cyclic_poisson in this phase; "
-                "use mechanism='bandmf'"
+                "cyclic_poisson sampling is supported only for mechanism in {'bandmf', 'bsr'}"
             )
 
     @staticmethod
@@ -1245,7 +1253,7 @@ class PrivacyEngine:
 
             bsr_mf_sensitivity = None
             if (
-                mechanism_config.mechanism == "bandmf"
+                mechanism_config.mechanism in ("bandmf", "bsr")
                 and sampling_semantics is not None
                 and sampling_semantics.sampling_mode == "cyclic_poisson"
             ):
@@ -2022,7 +2030,7 @@ class PrivacyEngine:
         )
 
         if (
-            mechanism_config.mechanism == "bandmf"
+            mechanism_config.mechanism in ("bandmf", "bsr")
             and sampling_semantics is not None
             and sampling_semantics.sampling_mode == "cyclic_poisson"
         ):
@@ -2031,6 +2039,7 @@ class PrivacyEngine:
                 mechanism_config=mechanism_config,
                 sampling_semantics=sampling_semantics,
                 steps=strategy_steps,
+                optimizer=optimizer,
                 kwargs=kwargs,
             )
 
@@ -2260,7 +2269,7 @@ class PrivacyEngine:
         )
 
         if (
-            mechanism_config.mechanism == "bandmf"
+            mechanism_config.mechanism in ("bandmf", "bsr")
             and local_sampling_semantics is not None
             and local_sampling_semantics.sampling_mode == "cyclic_poisson"
         ):
@@ -2273,6 +2282,7 @@ class PrivacyEngine:
                 mechanism_config=mechanism_config,
                 sampling_semantics=local_sampling_semantics,
                 steps=strategy_steps,
+                optimizer=optimizer,
                 kwargs=kwargs,
             )
             logger.info(
@@ -2324,7 +2334,7 @@ class PrivacyEngine:
         )
 
         if (
-            mechanism_config.mechanism == "bandmf"
+            mechanism_config.mechanism in ("bandmf", "bsr")
             and local_sampling_semantics is not None
             and local_sampling_semantics.sampling_mode == "cyclic_poisson"
         ):
