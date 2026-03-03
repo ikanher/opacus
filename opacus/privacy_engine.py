@@ -19,6 +19,7 @@ import warnings
 import copy
 import json
 import math
+import time
 from itertools import chain
 from typing import IO, Any, BinaryIO, Dict, List, Optional, Tuple, Union
 
@@ -1184,6 +1185,7 @@ class PrivacyEngine:
                     kwargs=kwargs,
                 )
 
+            t0 = time.perf_counter()
             noise_multiplier = get_noise_multiplier(
                 target_epsilon=target_epsilon,
                 target_delta=target_delta,
@@ -1194,6 +1196,27 @@ class PrivacyEngine:
                 sampling_semantics=sampling_semantics,
                 bsr_mf_sensitivity=bsr_mf_sensitivity,
                 **nm_kwargs,
+            )
+            logger.info(
+                "OPACUS_DP_TIMING %s",
+                json.dumps(
+                    {
+                        "phase": "get_noise_multiplier_non_bnb_steps",
+                        "elapsed_s": round(float(time.perf_counter() - t0), 6),
+                        "mechanism": mechanism_config.mechanism,
+                        "accountant": active_accountant.mechanism(),
+                        "sampling_mode": (
+                            sampling_semantics.sampling_mode
+                            if sampling_semantics is not None
+                            else None
+                        ),
+                        "steps": int(total_steps),
+                        "sample_rate": float(sample_rate),
+                        "target_epsilon": float(target_epsilon),
+                        "target_delta": float(target_delta),
+                    },
+                    sort_keys=True,
+                ),
             )
             return float(noise_multiplier), float(sample_rate)
 
@@ -1230,6 +1253,7 @@ class PrivacyEngine:
                 kwargs=kwargs,
             )
 
+        t0 = time.perf_counter()
         noise_multiplier = get_noise_multiplier(
             target_epsilon=target_epsilon,
             target_delta=target_delta,
@@ -1240,6 +1264,27 @@ class PrivacyEngine:
             sampling_semantics=sampling_semantics,
             bsr_mf_sensitivity=bsr_mf_sensitivity,
             **nm_kwargs,
+        )
+        logger.info(
+            "OPACUS_DP_TIMING %s",
+            json.dumps(
+                {
+                    "phase": "get_noise_multiplier_non_bnb_epochs",
+                    "elapsed_s": round(float(time.perf_counter() - t0), 6),
+                    "mechanism": mechanism_config.mechanism,
+                    "accountant": active_accountant.mechanism(),
+                    "sampling_mode": (
+                        sampling_semantics.sampling_mode
+                        if sampling_semantics is not None
+                        else None
+                    ),
+                    "steps": int(implied_steps),
+                    "sample_rate": float(sample_rate),
+                    "target_epsilon": float(target_epsilon),
+                    "target_delta": float(target_delta),
+                },
+                sort_keys=True,
+            ),
         )
         return float(noise_multiplier), float(sample_rate)
 
@@ -1302,6 +1347,7 @@ class PrivacyEngine:
         calibration_cfg = resolve_bnb_calibration_kwargs(
             overrides=kwargs,
         )
+        t0 = time.perf_counter()
         noise_multiplier = calibrate_b_min_sep_noise_multiplier_monte_carlo(
             c_matrix=bnb_c_matrix,
             bands=int(bnb_bands),
@@ -1315,6 +1361,27 @@ class PrivacyEngine:
             tolerance=float(calibration_cfg["bnb_tolerance"]),
             max_iterations=int(calibration_cfg["bnb_max_iterations"]),
             max_sigma=float(kwargs.get("bnb_max_sigma", 1e6)),
+        )
+        logger.info(
+            "OPACUS_DP_TIMING %s",
+            json.dumps(
+                {
+                    "phase": "get_noise_multiplier_bnb_monte_carlo",
+                    "elapsed_s": round(float(time.perf_counter() - t0), 6),
+                    "mechanism": mechanism_config.mechanism,
+                    "accountant": "bnb",
+                    "sampling_mode": (
+                        sampling_semantics.sampling_mode
+                        if sampling_semantics is not None
+                        else None
+                    ),
+                    "bands": int(bnb_bands),
+                    "target_epsilon": float(target_epsilon),
+                    "target_delta": float(target_delta),
+                    "num_samples": int(calibration_cfg["bnb_num_samples"]),
+                },
+                sort_keys=True,
+            ),
         )
         logger.info(
             "bnb init: get_noise_multiplier done -> sigma=%.6g",
@@ -2100,6 +2167,7 @@ class PrivacyEngine:
             and local_sampling_semantics is not None
             and local_sampling_semantics.sampling_mode == "cyclic_poisson"
         ):
+            t0 = time.perf_counter()
             if total_steps is not None:
                 strategy_steps = int(total_steps)
             else:
@@ -2110,7 +2178,21 @@ class PrivacyEngine:
                 steps=strategy_steps,
                 kwargs=kwargs,
             )
+            logger.info(
+                "OPACUS_DP_TIMING %s",
+                json.dumps(
+                    {
+                        "phase": "ensure_bsr_cyclic_coeffs",
+                        "elapsed_s": round(float(time.perf_counter() - t0), 6),
+                        "mechanism": mechanism_config.mechanism,
+                        "sampling_mode": "cyclic_poisson",
+                        "steps": int(strategy_steps),
+                    },
+                    sort_keys=True,
+                ),
+            )
 
+        t0 = time.perf_counter()
         noise_multiplier, _ = self._resolve_noise_multiplier_for_target_epsilon(
             mechanism_config=mechanism_config,
             active_accountant=active_accountant,
@@ -2124,6 +2206,24 @@ class PrivacyEngine:
             bnb_c_matrix=bnb_c_matrix,
             bnb_bands=bnb_bands,
             kwargs=kwargs,
+        )
+        logger.info(
+            "OPACUS_DP_TIMING %s",
+            json.dumps(
+                {
+                    "phase": "resolve_noise_multiplier_for_target_epsilon_total",
+                    "elapsed_s": round(float(time.perf_counter() - t0), 6),
+                    "mechanism": mechanism_config.mechanism,
+                    "sampling_mode": (
+                        local_sampling_semantics.sampling_mode
+                        if local_sampling_semantics is not None
+                        else None
+                    ),
+                    "target_epsilon": float(target_epsilon),
+                    "target_delta": float(target_delta),
+                },
+                sort_keys=True,
+            ),
         )
 
         if (
