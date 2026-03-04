@@ -179,31 +179,49 @@ class PrivacyEngine:
         if mechanism_config.mechanism not in ("bandmf", "bsr"):
             return mechanism_config
 
-        if (
-            sampling_semantics is None
-            or sampling_semantics.sampling_mode != "cyclic_poisson"
-        ):
-            return mechanism_config
-
         state = copy.deepcopy(mechanism_config.mechanism_state)
         coeffs = state.get("coeffs")
         if isinstance(coeffs, (list, tuple)) and len(coeffs) > 0:
             return mechanism_config
 
-        metadata = sampling_semantics.privacy_metadata or {}
-        bands = metadata.get("bands", state.get("bands"))
+        if mechanism_config.mechanism == "bsr" and (
+            sampling_semantics is None
+            or sampling_semantics.sampling_mode != "cyclic_poisson"
+        ):
+            return mechanism_config
+
+        metadata = (
+            sampling_semantics.privacy_metadata
+            if sampling_semantics is not None
+            else {}
+        )
+        bands = kwargs.get("bsr_bands", metadata.get("bands", state.get("bands")))
         if bands is None:
             raise ValueError(
-                "cyclic_poisson sampling requires privacy_metadata['bands']"
+                "auto coeff generation requires bands via `mechanism_state['bands']`, "
+                "`sampling_semantics.privacy_metadata['bands']`, or `bsr_bands`"
             )
 
         bands = int(bands)
         if bands <= 0:
-            raise ValueError("cyclic_poisson bands must be > 0")
+            raise ValueError("bands must be > 0")
         if int(steps) < bands:
             raise ValueError(
-                "cyclic_poisson bandmf requires steps >= bands; "
+                f"{mechanism_config.mechanism} coefficient resolution requires steps >= bands; "
                 f"got steps={int(steps)}, bands={bands}"
+            )
+
+        if mechanism_config.mechanism == "bandmf":
+            state["coeffs"] = PrivacyEngine._optimize_bsr_cyclic_coeffs(
+                bands=bands,
+                steps=int(steps),
+            )
+            state["bands"] = bands
+            state["coeff_source"] = "lbfgs_auto"
+            return NoiseMechanismConfig(
+                mechanism=mechanism_config.mechanism,
+                accounting_mode=mechanism_config.accounting_mode,
+                mechanism_state=state,
             )
 
         momentum, weight_decay = PrivacyEngine._resolve_uniform_sgd_workload_from_optimizer(
@@ -264,7 +282,9 @@ class PrivacyEngine:
     ) -> NoiseMechanismConfig:
         # Contract split:
         # - `bsr` fixed-batch path uses analytical workload coefficients.
-        # - `bsr`/`bandmf` cyclic path auto-resolves coefficients analytically via
+        # - `bsr` cyclic path auto-resolves coefficients analytically via
+        #   `_ensure_bsr_cyclic_coeffs`.
+        # - `bandmf` auto-resolves coefficients with L-BFGS via
         #   `_ensure_bsr_cyclic_coeffs`.
         if mechanism_config.mechanism != "bsr":
             return mechanism_config
@@ -2030,9 +2050,12 @@ class PrivacyEngine:
         )
 
         if (
-            mechanism_config.mechanism in ("bandmf", "bsr")
-            and sampling_semantics is not None
-            and sampling_semantics.sampling_mode == "cyclic_poisson"
+            mechanism_config.mechanism == "bandmf"
+            or (
+                mechanism_config.mechanism == "bsr"
+                and sampling_semantics is not None
+                and sampling_semantics.sampling_mode == "cyclic_poisson"
+            )
         ):
             strategy_steps = int(total_steps) if total_steps is not None else int(len(data_loader))
             mechanism_config = self._ensure_bsr_cyclic_coeffs(
@@ -2269,9 +2292,12 @@ class PrivacyEngine:
         )
 
         if (
-            mechanism_config.mechanism in ("bandmf", "bsr")
-            and local_sampling_semantics is not None
-            and local_sampling_semantics.sampling_mode == "cyclic_poisson"
+            mechanism_config.mechanism == "bandmf"
+            or (
+                mechanism_config.mechanism == "bsr"
+                and local_sampling_semantics is not None
+                and local_sampling_semantics.sampling_mode == "cyclic_poisson"
+            )
         ):
             t0 = time.perf_counter()
             if total_steps is not None:
@@ -2478,6 +2504,64 @@ class PrivacyEngine:
             )
             kwargs.setdefault("sampling_semantics", self.sampling_semantics)
         return self.accountant.get_epsilon(delta, **kwargs)
+
+    def get_accounting_telemetry(self, *, delta: Optional[float] = None) -> Dict[str, Any]:
+        """
+        Returns a compact runtime snapshot of accounting configuration and state.
+        """
+        mechanism_config = getattr(self, "noise_mechanism_config", None)
+        sampling_semantics = getattr(self, "sampling_semantics", None)
+        accountant = getattr(self, "accountant", None)
+
+        mechanism_state = (
+            mechanism_config.mechanism_state
+            if mechanism_config is not None and isinstance(mechanism_config.mechanism_state, dict)
+            else {}
+        )
+        coeffs = mechanism_state.get("coeffs")
+        coeff_count = len(coeffs) if isinstance(coeffs, (list, tuple)) else None
+        coeff_head = list(coeffs[:5]) if isinstance(coeffs, (list, tuple)) else None
+
+        payload: Dict[str, Any] = {
+            "mechanism": mechanism_config.mechanism if mechanism_config is not None else None,
+            "accounting_mode": (
+                mechanism_config.accounting_mode if mechanism_config is not None else None
+            ),
+            "accountant": accountant.mechanism() if accountant is not None else None,
+            "sampling_mode": (
+                sampling_semantics.sampling_mode if sampling_semantics is not None else None
+            ),
+            "sampling_metadata": (
+                dict(sampling_semantics.privacy_metadata)
+                if sampling_semantics is not None
+                else None
+            ),
+            "events_recorded": int(len(accountant)) if accountant is not None else None,
+            "z_std": mechanism_state.get("z_std"),
+            "coeff_count": coeff_count,
+            "coeff_head": coeff_head,
+            "coeff_source": mechanism_state.get("coeff_source"),
+            "ts_unix": round(time.time(), 6),
+        }
+
+        if mechanism_config is not None:
+            if mechanism_config.mechanism in ("bandmf", "bsr"):
+                payload["mechanism_state_summary"] = self._summarize_bsr_state(
+                    mechanism_state
+                )
+            elif mechanism_config.mechanism == "bnb":
+                payload["bnb_calibration_report"] = mechanism_state.get(
+                    "_bnb_calibration_report"
+                )
+
+        if delta is not None and accountant is not None:
+            payload["target_delta"] = float(delta)
+            try:
+                payload["epsilon_at_target_delta"] = float(self.get_epsilon(delta))
+            except Exception as exc:
+                payload["epsilon_at_target_delta_error"] = str(exc)
+
+        return payload
 
     def get_bnb_calibration_report(self):
         """
