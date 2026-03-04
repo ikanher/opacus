@@ -63,6 +63,7 @@ from opacus.utils.uniform_sampler import (
     DistributedBallsInBinsSampler,
     DistributedBMinSepSampler,
     DistributedCyclicPoissonSampler,
+    DistributedFixedSampler,
 )
 from torch import nn, optim
 from torch.distributed._composable.fsdp import FSDPModule
@@ -924,6 +925,39 @@ class PrivacyEngine:
             persistent_workers=data_loader.persistent_workers,
         )
 
+    def _rebuild_data_loader_with_sampler(
+        self, data_loader: DataLoader, sampler
+    ) -> DataLoader:
+        return DataLoader(
+            dataset=data_loader.dataset,
+            batch_size=data_loader.batch_size,
+            sampler=sampler,
+            drop_last=data_loader.drop_last,
+            num_workers=data_loader.num_workers,
+            collate_fn=data_loader.collate_fn,
+            pin_memory=data_loader.pin_memory,
+            timeout=data_loader.timeout,
+            worker_init_fn=data_loader.worker_init_fn,
+            multiprocessing_context=data_loader.multiprocessing_context,
+            generator=self._sampler_generator(data_loader),
+            prefetch_factor=data_loader.prefetch_factor,
+            persistent_workers=data_loader.persistent_workers,
+        )
+
+    def _build_distributed_torch_sampler(self, *, data_loader: DataLoader):
+        if isinstance(data_loader.dataset, torch.utils.data.IterableDataset):
+            raise ValueError("distributed torch_sampler is not supported for IterableDataset")
+
+        if data_loader.batch_size is None:
+            raise ValueError("distributed torch_sampler requires data_loader.batch_size")
+
+        shuffle = isinstance(data_loader.sampler, torch.utils.data.RandomSampler)
+        return DistributedFixedSampler(
+            total_size=len(data_loader.dataset),
+            shuffle=shuffle,
+            shuffle_seed=0,
+        )
+
     def _build_cyclic_poisson_sampler(
         self,
         *,
@@ -1730,6 +1764,17 @@ class PrivacyEngine:
             )
 
             return self._rebuild_data_loader_with_batch_sampler(data_loader, sampler)
+
+        if (
+            distributed
+            and not poisson_sampling
+            and (
+                sampling_semantics is None
+                or sampling_semantics.sampling_mode == "torch_sampler"
+            )
+        ):
+            sampler = self._build_distributed_torch_sampler(data_loader=data_loader)
+            return self._rebuild_data_loader_with_sampler(data_loader, sampler)
 
         if poisson_sampling:
             return DPDataLoader.from_data_loader(

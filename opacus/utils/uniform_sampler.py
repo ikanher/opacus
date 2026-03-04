@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List
+from typing import Iterator, List
 
 import torch
 from torch.utils.data import Sampler
@@ -174,6 +174,58 @@ class DistributedUniformWithReplacementSampler(Sampler):
         Args:
             epoch (int): Epoch number.
         """
+        self.epoch = epoch
+
+
+class DistributedFixedSampler(Sampler[int]):
+    """
+    Distributed fixed-index sampler.
+
+    The global index set is deterministically sharded across ranks (optionally
+    after deterministic shuffle per epoch). No padding is introduced, so rank
+    shards differ in size by at most one and remain disjoint.
+    """
+
+    def __init__(
+        self,
+        *,
+        total_size: int,
+        shuffle: bool = False,
+        shuffle_seed: int = 0,
+    ):
+        self.total_size = int(total_size)
+        self.shuffle = bool(shuffle)
+        self.shuffle_seed = int(shuffle_seed)
+        self.num_replicas = torch.distributed.get_world_size()
+        self.rank = torch.distributed.get_rank()
+        self.epoch = 0
+
+        if self.total_size <= 0:
+            raise ValueError(
+                "total_size should be a positive integer "
+                f"value, but got total_size={self.total_size}"
+            )
+
+        self.num_samples = self.total_size // self.num_replicas
+        if self.rank < self.total_size % self.num_replicas:
+            self.num_samples += 1
+
+    def __iter__(self) -> Iterator[int]:
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.shuffle_seed + self.epoch)
+            indices = torch.randperm(self.total_size, generator=g)
+        else:
+            indices = torch.arange(self.total_size)
+
+        indices = indices[self.rank : self.total_size : self.num_replicas]
+        assert len(indices) == self.num_samples
+        return iter(indices.tolist())
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def set_epoch(self, epoch: int) -> None:
         self.epoch = epoch
 
 

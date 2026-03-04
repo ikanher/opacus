@@ -25,6 +25,7 @@ from opacus.mechanism_contracts import SamplingSemantics
 from opacus.utils.uniform_sampler import (
     DistributedBMinSepSampler,
     DistributedCyclicPoissonSampler,
+    DistributedUniformWithReplacementSampler,
 )
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -46,6 +47,17 @@ def _loader(
     )
 
 
+def _index_loader(*, n_samples: int = 64, batch_size: int = 8) -> DataLoader:
+    x = torch.arange(n_samples, dtype=torch.int64)
+    y = torch.zeros(n_samples, dtype=torch.int64)
+    return DataLoader(
+        TensorDataset(x, y),
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+    )
+
+
 def _patch_distributed_primitives(monkeypatch, *, rank: int, world_size: int = 2) -> None:
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: world_size)
@@ -58,6 +70,15 @@ def _one_step(private_model: nn.Module, dp_optimizer, private_loader: DataLoader
     loss = F.cross_entropy(private_model(x), y)
     loss.backward()
     dp_optimizer.step()
+
+
+def _take_first_index_batches(loader: DataLoader, num_batches: int) -> list[list[int]]:
+    out: list[list[int]] = []
+    for i, (x, _y) in enumerate(loader):
+        if i >= num_batches:
+            break
+        out.append([int(v) for v in x.tolist()])
+    return out
 
 
 def _set_zero_grad_samples(dp_optimizer, *, batch_size: int) -> None:
@@ -190,6 +211,110 @@ def test_distributed_bsr_supported_for_flat_hooks(monkeypatch) -> None:
 
     assert isinstance(dp_optimizer, DistributedDPOptimizer)
     assert isinstance(dp_optimizer.noise_mechanism, CorrelatedNoiseMechanism)
+
+
+def test_distributed_torch_sampler_shards_batches_across_ranks(monkeypatch) -> None:
+    world_size = 2
+    semantics = SamplingSemantics(
+        sampling_mode="torch_sampler",
+        privacy_metadata={},
+    )
+
+    _patch_distributed_primitives(monkeypatch, rank=0, world_size=world_size)
+    pe0 = PrivacyEngine()
+    loader0 = pe0._prepare_data_loader(
+        _index_loader(n_samples=64, batch_size=8),
+        poisson_sampling=False,
+        distributed=True,
+        sampling_semantics=semantics,
+        total_steps=8,
+    )
+
+    _patch_distributed_primitives(monkeypatch, rank=1, world_size=world_size)
+    pe1 = PrivacyEngine()
+    loader1 = pe1._prepare_data_loader(
+        _index_loader(n_samples=64, batch_size=8),
+        poisson_sampling=False,
+        distributed=True,
+        sampling_semantics=semantics,
+        total_steps=8,
+    )
+
+    b0 = _take_first_index_batches(loader0, num_batches=3)
+    b1 = _take_first_index_batches(loader1, num_batches=3)
+    assert b0 != b1
+    assert len(set(b0[0]).intersection(set(b1[0]))) == 0
+    assert len(set(b0[0]).union(set(b1[0]))) == 16
+
+
+def test_distributed_cyclic_poisson_shards_batches_across_ranks(monkeypatch) -> None:
+    world_size = 2
+    semantics = SamplingSemantics(
+        sampling_mode="cyclic_poisson",
+        privacy_metadata={"bands": 4},
+    )
+
+    _patch_distributed_primitives(monkeypatch, rank=0, world_size=world_size)
+    pe0 = PrivacyEngine()
+    loader0 = pe0._prepare_data_loader(
+        _index_loader(n_samples=64, batch_size=8),
+        poisson_sampling=False,
+        distributed=True,
+        sampling_semantics=semantics,
+        total_steps=8,
+    )
+
+    _patch_distributed_primitives(monkeypatch, rank=1, world_size=world_size)
+    pe1 = PrivacyEngine()
+    loader1 = pe1._prepare_data_loader(
+        _index_loader(n_samples=64, batch_size=8),
+        poisson_sampling=False,
+        distributed=True,
+        sampling_semantics=semantics,
+        total_steps=8,
+    )
+
+    assert isinstance(loader0.batch_sampler, DistributedCyclicPoissonSampler)
+    assert isinstance(loader1.batch_sampler, DistributedCyclicPoissonSampler)
+
+    b0 = _take_first_index_batches(loader0, num_batches=3)
+    b1 = _take_first_index_batches(loader1, num_batches=3)
+    assert b0 != b1
+    for left, right in zip(b0, b1):
+        assert len(set(left).intersection(set(right))) == 0
+
+
+def test_distributed_poisson_shards_batches_across_ranks(monkeypatch) -> None:
+    world_size = 2
+
+    _patch_distributed_primitives(monkeypatch, rank=0, world_size=world_size)
+    pe0 = PrivacyEngine()
+    loader0 = pe0._prepare_data_loader(
+        _index_loader(n_samples=64, batch_size=32),
+        poisson_sampling=True,
+        distributed=True,
+        sampling_semantics=None,
+        total_steps=8,
+    )
+
+    _patch_distributed_primitives(monkeypatch, rank=1, world_size=world_size)
+    pe1 = PrivacyEngine()
+    loader1 = pe1._prepare_data_loader(
+        _index_loader(n_samples=64, batch_size=32),
+        poisson_sampling=True,
+        distributed=True,
+        sampling_semantics=None,
+        total_steps=8,
+    )
+
+    assert isinstance(loader0.batch_sampler, DistributedUniformWithReplacementSampler)
+    assert isinstance(loader1.batch_sampler, DistributedUniformWithReplacementSampler)
+
+    b0 = _take_first_index_batches(loader0, num_batches=3)
+    b1 = _take_first_index_batches(loader1, num_batches=3)
+    assert b0 != b1
+    for left, right in zip(b0, b1):
+        assert len(set(left).intersection(set(right))) == 0
 
 
 def test_distributed_bandmf_supports_cyclic_poisson_sampling(monkeypatch) -> None:
@@ -577,7 +702,7 @@ def test_distributed_bsr_rank0_checkpoint_resume_parity(monkeypatch) -> None:
     private_model1, dp_optimizer1, private_loader1 = pe1.make_private(
         module=model1,
         optimizer=optimizer1,
-        data_loader=_loader(),
+        data_loader=_loader(n_samples=32, batch_size=8),
         noise_multiplier=0.0,
         max_grad_norm=1.0,
         poisson_sampling=False,
@@ -589,7 +714,7 @@ def test_distributed_bsr_rank0_checkpoint_resume_parity(monkeypatch) -> None:
     private_model2, dp_optimizer2, private_loader2 = pe2.make_private(
         module=model2,
         optimizer=optimizer2,
-        data_loader=_loader(),
+        data_loader=_loader(n_samples=32, batch_size=8),
         noise_multiplier=0.0,
         max_grad_norm=1.0,
         poisson_sampling=False,
