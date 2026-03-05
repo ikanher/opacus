@@ -578,8 +578,8 @@ def test_make_private_with_epsilon_bsr_derives_mf_sensitivity_from_constraints()
             mechanism_state={
                 "coeffs": [1.0, 0.2],
                 "z_std": 0.01,
-                "max_participations": 1,
-                "min_separation": 1,
+                "bsr_max_participations": 1,
+                "bsr_min_separation": 1,
             },
         ),
     )
@@ -608,8 +608,8 @@ def test_make_private_with_epsilon_bsr_fixed_persists_mf_sensitivity_for_get_eps
             mechanism_state={
                 "coeffs": [1.0, 0.2],
                 "z_std": 0.01,
-                "max_participations": 1,
-                "min_separation": 1,
+                "bsr_max_participations": 1,
+                "bsr_min_separation": 1,
             },
         ),
         sampling_semantics=SamplingSemantics(
@@ -621,13 +621,13 @@ def test_make_private_with_epsilon_bsr_fixed_persists_mf_sensitivity_for_get_eps
 
     assert float(dp_optimizer.noise_multiplier) > 0.0
     state = pe.noise_mechanism_config.mechanism_state
-    assert "mf_sensitivity" in state
-    assert float(state["mf_sensitivity"]) > 0.0
+    assert "bsr_mf_sensitivity" in state
+    assert float(state["bsr_mf_sensitivity"]) > 0.0
 
     eps_default = pe.get_epsilon(1e-5)
     eps_override = pe.get_epsilon(
         1e-5,
-        bsr_mf_sensitivity=float(state["mf_sensitivity"]),
+        bsr_mf_sensitivity=float(state["bsr_mf_sensitivity"]),
     )
     assert eps_default == pytest.approx(eps_override, rel=0.0, abs=1e-12)
 
@@ -672,7 +672,7 @@ def test_make_private_with_epsilon_bsr_calibrates_with_default_accounting() -> N
         noise_mechanism_config=NoiseMechanismConfig(
             mechanism="bsr",
             accounting_mode="bsr_accountant",
-            mechanism_state={"coeffs": [1.0], "z_std": 0.01, "mf_sensitivity": 1.0},
+            mechanism_state={"coeffs": [1.0], "z_std": 0.01, "bsr_mf_sensitivity": 1.0},
         ),
     )
     assert float(dp_optimizer.noise_multiplier) > 0.0
@@ -699,7 +699,7 @@ def test_make_private_bsr_autoresolves_analytical_coeffs_from_bands_and_optimize
         noise_mechanism_config=NoiseMechanismConfig(
             mechanism="bsr",
             accounting_mode="bsr_accountant",
-            mechanism_state={"bands": 8, "z_std": 0.01},
+            mechanism_state={"bsr_bands": 8, "z_std": 0.01},
         ),
     )
 
@@ -736,7 +736,11 @@ def test_make_private_with_epsilon_bsr_autoresolves_analytical_coeffs_from_bands
         noise_mechanism_config=NoiseMechanismConfig(
             mechanism="bsr",
             accounting_mode="bsr_accountant",
-            mechanism_state={"bands": 8, "max_participations": 1, "min_separation": 1},
+            mechanism_state={
+                "bsr_bands": 8,
+                "bsr_max_participations": 1,
+                "bsr_min_separation": 1,
+            },
         ),
         sampling_semantics=SamplingSemantics(
             sampling_mode="torch_sampler",
@@ -753,8 +757,8 @@ def test_make_private_with_epsilon_bsr_autoresolves_analytical_coeffs_from_bands
         rel=0.0,
         abs=1e-12,
     )
-    assert "mf_sensitivity" in state
-    assert float(state["mf_sensitivity"]) > 0.0
+    assert "bsr_mf_sensitivity" in state
+    assert float(state["bsr_mf_sensitivity"]) > 0.0
 
 
 def test_make_private_with_epsilon_bsr_explicit_coeffs_take_precedence() -> None:
@@ -782,9 +786,9 @@ def test_make_private_with_epsilon_bsr_explicit_coeffs_take_precedence() -> None
             accounting_mode="bsr_accountant",
             mechanism_state={
                 "coeffs": explicit,
-                "bands": 8,
-                "max_participations": 1,
-                "min_separation": 1,
+                "bsr_bands": 8,
+                "bsr_max_participations": 1,
+                "bsr_min_separation": 1,
             },
         ),
         sampling_semantics=SamplingSemantics(
@@ -1010,15 +1014,15 @@ def test_make_private_with_epsilon_bandmf_cyclic_persists_sensitivity_scale() ->
 
     assert float(dp_optimizer.noise_multiplier) > 0.0
     state = pe.noise_mechanism_config.mechanism_state
-    assert "sensitivity_scale" in state
-    assert float(state["sensitivity_scale"]) > 0.0
+    assert "bsr_sensitivity_scale" in state
+    assert float(state["bsr_sensitivity_scale"]) > 0.0
     # Cyclic BandMF should not silently route through fixed-batch BSR sensitivity semantics.
-    assert "mf_sensitivity" not in state
+    assert "bsr_mf_sensitivity" not in state
 
     eps_default = pe.get_epsilon(1e-5)
     eps_override = pe.get_epsilon(
         1e-5,
-        sensitivity_scale=float(state["sensitivity_scale"]),
+        bsr_sensitivity_scale=float(state["bsr_sensitivity_scale"]),
     )
     assert eps_default == pytest.approx(eps_override, rel=0.0, abs=1e-12)
 

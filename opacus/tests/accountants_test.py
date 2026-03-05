@@ -203,9 +203,9 @@ class AccountingTest(unittest.TestCase):
         eps = accountant.get_epsilon(
             delta=0.2,
             mechanism_state={
-                "c_matrix": c_matrix,
+                "bnb_c_matrix": c_matrix,
                 "coeffs": [1.0, 0.2],
-                "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+                "bnb_c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
             },
             sampling_semantics=sampling_semantics,
             bnb_num_samples=10_000,
@@ -241,9 +241,9 @@ class AccountingTest(unittest.TestCase):
             eps = accountant.get_epsilon(
                 delta=0.2,
                 mechanism_state={
-                    "c_matrix": c_matrix,
+                    "bnb_c_matrix": c_matrix,
                     "coeffs": [1.0, 0.2],
-                    "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+                    "bnb_c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
                 },
                 sampling_semantics=sampling_semantics,
             )
@@ -270,9 +270,9 @@ class AccountingTest(unittest.TestCase):
             accountant.get_epsilon(
                 delta=4.0,
                 mechanism_state={
-                    "c_matrix": c_matrix,
+                    "bnb_c_matrix": c_matrix,
                     "coeffs": [1.0, 0.2],
-                    "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+                    "bnb_c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
                 },
                 sampling_semantics=sampling_semantics,
                 bnb_tolerance=1e-6,
@@ -296,9 +296,9 @@ class AccountingTest(unittest.TestCase):
         epsilon = accountant.get_epsilon(
             delta=0.2,
             mechanism_state={
-                "c_matrix": c_matrix,
+                "bnb_c_matrix": c_matrix,
                 "coeffs": [1.0, 0.2],
-                "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+                "bnb_c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
             },
             sampling_semantics=sampling_semantics,
         )
@@ -322,9 +322,9 @@ class AccountingTest(unittest.TestCase):
         eps_low_noise = accountant_low_noise.get_epsilon(
             delta=0.2,
             mechanism_state={
-                "c_matrix": c_matrix,
+                "bnb_c_matrix": c_matrix,
                 "coeffs": [1.0, 0.2],
-                "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+                "bnb_c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
             },
             sampling_semantics=sampling_semantics,
             bnb_num_samples=20_000,
@@ -336,9 +336,9 @@ class AccountingTest(unittest.TestCase):
         eps_high_noise = accountant_high_noise.get_epsilon(
             delta=0.2,
             mechanism_state={
-                "c_matrix": c_matrix,
+                "bnb_c_matrix": c_matrix,
                 "coeffs": [1.0, 0.2],
-                "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+                "bnb_c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
             },
             sampling_semantics=sampling_semantics,
             bnb_num_samples=20_000,
@@ -365,9 +365,9 @@ class AccountingTest(unittest.TestCase):
         eps_a = accountant_a.get_epsilon(
             delta=0.2,
             mechanism_state={
-                "c_matrix": c_matrix,
+                "bnb_c_matrix": c_matrix,
                 "coeffs": [1.0, 0.2],
-                "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+                "bnb_c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
             },
             sampling_semantics=sampling_semantics,
             bnb_num_samples=20_000,
@@ -379,9 +379,9 @@ class AccountingTest(unittest.TestCase):
         eps_b = accountant_b.get_epsilon(
             delta=0.2,
             mechanism_state={
-                "c_matrix": c_matrix,
+                "bnb_c_matrix": c_matrix,
                 "coeffs": [1.0, 0.2],
-                "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+                "bnb_c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
             },
             sampling_semantics=sampling_semantics,
             bnb_num_samples=20_000,
@@ -408,9 +408,9 @@ class AccountingTest(unittest.TestCase):
             accountant.get_epsilon(
                 delta=0.2,
                 mechanism_state={
-                    "c_matrix": c_matrix,
+                    "bnb_c_matrix": c_matrix,
                     "coeffs": [1.0],
-                    "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+                    "bnb_c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
                 },
                 sampling_semantics=sampling_semantics,
                 bnb_num_samples=5_000,
@@ -437,9 +437,9 @@ class AccountingTest(unittest.TestCase):
             accountant.get_epsilon(
                 delta=0.2,
                 mechanism_state={
-                    "c_matrix": c_matrix,
+                    "bnb_c_matrix": c_matrix,
                     "coeffs": [1.0, 0.2],
-                    "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+                    "bnb_c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
                 },
                 sampling_semantics=sampling_semantics,
                 bnb_bands=2,
@@ -467,9 +467,9 @@ class AccountingTest(unittest.TestCase):
             accountant.get_epsilon(
                 delta=0.2,
                 mechanism_state={
-                    "c_matrix": c_matrix,
+                    "bnb_c_matrix": c_matrix,
                     "coeffs": [1.0, 0.2],
-                    "c_matrix_contract": bad_contract,
+                    "bnb_c_matrix_contract": bad_contract,
                 },
                 sampling_semantics=sampling_semantics,
                 bnb_num_samples=5_000,
@@ -495,9 +495,9 @@ class AccountingTest(unittest.TestCase):
             accountant.get_epsilon(
                 delta=0.2,
                 mechanism_state={
-                    "c_matrix": c_matrix,
+                    "bnb_c_matrix": c_matrix,
                     "coeffs": coeffs,
-                    "c_matrix_contract": contract,
+                    "bnb_c_matrix_contract": contract,
                 },
                 sampling_semantics=sampling_semantics,
                 bnb_num_samples=5_000,
@@ -521,9 +521,9 @@ class AccountingTest(unittest.TestCase):
         eps = accountant.get_epsilon(
             delta=0.2,
             mechanism_state={
-                "c_matrix": c_matrix,
+                "bnb_c_matrix": c_matrix,
                 "coeffs": coeffs,
-                "c_matrix_contract": contract,
+                "bnb_c_matrix_contract": contract,
             },
             sampling_semantics=sampling_semantics,
             bnb_num_samples=5_000,
@@ -738,12 +738,12 @@ class AccountingTest(unittest.TestCase):
         eps_unit = accountant.get_epsilon(
             delta=delta,
             sampling_semantics=sampling_semantics,
-            sensitivity_scale=1.0,
+            bsr_sensitivity_scale=1.0,
         )
         eps_larger_scale = accountant.get_epsilon(
             delta=delta,
             sampling_semantics=sampling_semantics,
-            sensitivity_scale=2.0,
+            bsr_sensitivity_scale=2.0,
         )
 
         self.assertGreater(eps_larger_scale, eps_unit)
@@ -759,7 +759,7 @@ class AccountingTest(unittest.TestCase):
         eps = accountant.get_epsilon(
             delta=1e-5,
             sampling_semantics=sampling_semantics,
-            sensitivity_scale=1.0,
+            bsr_sensitivity_scale=1.0,
         )
         self.assertGreaterEqual(eps, 0.0)
         self.assertIsInstance(accountant.last_contract, dict)
@@ -797,6 +797,61 @@ class AccountingTest(unittest.TestCase):
             accountant.get_epsilon(
                 delta=1e-5,
                 sampling_semantics=sampling_semantics,
+            )
+
+    def test_bandmf_accountant_rejects_legacy_sensitivity_scale_alias(self) -> None:
+        accountant = BandMFAccountant()
+        accountant.history = [(1.0, 0.01, 100)]
+        sampling_semantics = SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 10},
+        )
+        with self.assertRaisesRegex(
+            ValueError, "removed alias `sensitivity_scale`.*`bsr_sensitivity_scale`"
+        ):
+            accountant.get_epsilon(
+                delta=1e-5,
+                sampling_semantics=sampling_semantics,
+                sensitivity_scale=1.0,
+            )
+
+    def test_bsr_accountant_rejects_legacy_fixed_batch_aliases(self) -> None:
+        accountant = BSRAccountant()
+        accountant.history = [(1.0, 0.1, 10)]
+        with self.assertRaisesRegex(
+            ValueError, "removed alias `mf_sensitivity`.*`bsr_mf_sensitivity`"
+        ):
+            accountant.get_epsilon(
+                delta=1e-5,
+                sampling_semantics=SamplingSemantics(
+                    sampling_mode="torch_sampler",
+                    privacy_metadata={},
+                ),
+                mf_sensitivity=1.0,
+            )
+
+    def test_bnb_accountant_rejects_legacy_runtime_aliases(self) -> None:
+        accountant = BNBAccountant()
+        accountant.history = [(1.0, 0.05, 5)]
+        c_matrix = torch.tensor(
+            [
+                [1.0, 0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0, 1.0],
+            ],
+            dtype=torch.float64,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "removed alias `c_matrix`.*`bnb_c_matrix`"
+        ):
+            accountant.get_epsilon(
+                delta=0.2,
+                sampling_semantics=SamplingSemantics(
+                    sampling_mode="b_min_sep",
+                    privacy_metadata={"bands": 2},
+                ),
+                c_matrix=c_matrix,
+                bnb_bands=2,
+                bnb_c_matrix_contract=_bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
             )
 
     def test_rdp_accountant(self) -> None:
@@ -978,9 +1033,9 @@ class AccountingTest(unittest.TestCase):
             epochs=epochs,
             accountant="bnb",
             mechanism_state={
-                "c_matrix": c_matrix,
+                "bnb_c_matrix": c_matrix,
                 "coeffs": [1.0, 0.2],
-                "c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+                "bnb_c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
             },
             sampling_semantics=SamplingSemantics(
                 sampling_mode="b_min_sep",
@@ -1061,7 +1116,7 @@ class AccountingTest(unittest.TestCase):
         accountant.history = [(1.0, 0.01, 100)]
         eps = accountant.get_epsilon(
             delta=1e-5,
-            mechanism_state={"sensitivity_scale": 1.0},
+            mechanism_state={"bsr_sensitivity_scale": 1.0},
             sampling_semantics=SamplingSemantics(
                 sampling_mode="cyclic_poisson",
                 privacy_metadata={"bands": 10},
@@ -1214,8 +1269,8 @@ class AccountingTest(unittest.TestCase):
 
         mechanism_state = {
             "coeffs": [1.0, 0.5],
-            "max_participations": 50,
-            "min_separation": 1,
+            "bsr_max_participations": 50,
+            "bsr_min_separation": 1,
         }
         sampling_semantics = SamplingSemantics(
             sampling_mode="torch_sampler",
@@ -1259,9 +1314,9 @@ class AccountingTest(unittest.TestCase):
             delta=delta,
             mechanism_state={
                 "coeffs": coeffs,
-                "max_participations": 4,
-                "min_separation": 2,
-                "mf_sensitivity": calibrated_mf_sensitivity,
+                "bsr_max_participations": 4,
+                "bsr_min_separation": 2,
+                "bsr_mf_sensitivity": calibrated_mf_sensitivity,
             },
             sampling_semantics=SamplingSemantics(
                 sampling_mode="torch_sampler",
@@ -1285,8 +1340,8 @@ class AccountingTest(unittest.TestCase):
             accountant="bsr",
             mechanism_state={
                 "coeffs": [1.0, 0.5, 0.25],
-                "max_participations": 20,
-                "min_separation": 2,
+                "bsr_max_participations": 20,
+                "bsr_min_separation": 2,
             },
             sampling_semantics=SamplingSemantics(
                 sampling_mode="torch_sampler",

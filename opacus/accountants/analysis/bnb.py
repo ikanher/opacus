@@ -50,7 +50,14 @@ def resolve_bnb_calibration_kwargs(
 @dataclass(frozen=True)
 class GaussianMixture:
     """
-    Finite Gaussian mixture with shared isotropic noise scale.
+    Finite Gaussian mixture with shared isotropic Gaussian noise scale.
+
+    This container is the core distribution object for BMinSep Monte Carlo
+    accounting: each component corresponds to a participation pattern-induced
+    mean shift, and all components share the same isotropic ``sigma``.
+    The sampled privacy loss is then computed between two such mixtures.
+
+    Source: BMinSep (Dong and Ganesh, 2025 draft), Section 4, Equation (1), and Section 5, Equation (2).
     """
 
     modes: torch.Tensor  # [k, d]
@@ -91,7 +98,11 @@ class DeltaVerificationResult:
 @dataclass(frozen=True)
 class BNBCalibrationReport:
     """
-    Stable, versioned calibration report payload for BNB runs.
+    Stable, versioned calibration payload for BNB Monte Carlo runs.
+
+    The goal is reproducible diagnostics: a reviewer should be able to
+    reconstruct what was calibrated, with which confidence split, and why
+    acceptance passed/failed, without re-reading logs.
     """
 
     version: int
@@ -139,7 +150,10 @@ class BNBCalibrationReport:
 @dataclass(frozen=True)
 class BNBCalibrationStatus:
     """
-    Structured runtime status for BNB calibration diagnostics.
+    Structured runtime status wrapper around a calibration report.
+
+    This is a lightweight object used for surfaces that need both machine-
+    readable report fields and a concise human summary string.
     """
 
     mechanism: str
@@ -166,7 +180,13 @@ def build_lower_toeplitz_c_matrix_from_coeffs(
     device: torch.device | None = None,
 ) -> torch.Tensor:
     """
-    Build lower-triangular Toeplitz C matrix from coefficient sequence.
+    Build a finite lower-triangular Toeplitz ``C`` from coefficient lags.
+
+    BMinSep accounting consumes an explicit finite-horizon matrix. This helper
+    materializes that matrix from the lag sequence so downstream calibration and
+    consistency checks can operate on a concrete tensor.
+
+    Source: BMinSep (Dong and Ganesh, 2025 draft), Section 5 (matrix-mechanism setup around Equation (2)).
     """
     coeff_list = [float(c) for c in coeffs]
     if len(coeff_list) == 0:
@@ -197,7 +217,10 @@ def make_bnb_toeplitz_c_matrix_contract(
     atol: float = 1e-9,
 ) -> dict[str, Any]:
     """
-    Build contract payload for lower_toeplitz_from_coeffs C matrix derivation.
+    Build metadata proving how a BNB ``C`` matrix was derived.
+
+    The contract is attached to runtime state so the accountant can verify that
+    the matrix/sampler pair still matches the expected BMinSep derivation.
     """
     if c_matrix.ndim != 2:
         raise ValueError("c_matrix must have shape [d, m]")
@@ -233,7 +256,9 @@ def build_bnb_toeplitz_c_matrix_and_contract(
     atol: float = 1e-9,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """
-    Convenience API: build Toeplitz C matrix and matching validation contract.
+    Convenience API that returns both Toeplitz matrix and validation contract.
+
+    Use this when callers need a one-shot, self-describing BNB state payload.
     """
     c_matrix = build_lower_toeplitz_c_matrix_from_coeffs(
         coeffs=coeffs,
@@ -258,7 +283,13 @@ def validate_bnb_c_matrix_contract(
     c_matrix_contract: dict[str, Any],
 ) -> None:
     """
-    Validate explicit C-matrix assumptions and optional numeric derivation checks.
+    Validate that runtime BNB matrix metadata still matches implementation assumptions.
+
+    This guard prevents silent drift between sampler/accountant wiring and the
+    matrix-construction path that calibration depended on. When derivation data
+    is present, the check is numeric and exact up to ``atol``.
+
+    Source: BMinSep (Dong and Ganesh, 2025 draft), Section 5 and Theorem 5.1 (consistency of recursion/accounting contract).
     """
     if not isinstance(c_matrix_contract, dict):
         raise ValueError("bnb consistency check requires c_matrix_contract to be a dict")
@@ -363,7 +394,9 @@ def make_bnb_calibration_report(
 
 def parse_bnb_calibration_report(payload: dict) -> BNBCalibrationReport:
     """
-    Parse calibration payloads for the current schema version.
+    Parse serialized BNB calibration payloads for supported schema versions.
+
+    Parsing is strict so report consumers fail fast on schema drift.
     """
     if not isinstance(payload, dict):
         raise ValueError("payload must be a dict")
@@ -411,7 +444,7 @@ def describe_bnb_calibration_report(
     payload: dict | BNBCalibrationReport,
 ) -> str:
     """
-    Compact diagnostic summary for logging/debugging calibration outcomes.
+    Produce a compact single-line summary for logs and debugging dashboards.
     """
     report = payload if isinstance(payload, BNBCalibrationReport) else parse_bnb_calibration_report(payload)
     status = "PASS" if report.verification_passed else "FAIL"
@@ -433,7 +466,16 @@ def split_confidence_alpha(
     num_checks: int,
 ) -> float:
     """
-    Conservative union-bound split for EVR repeated verification checks.
+    Split a total EVR confidence budget across repeated checks.
+
+    BNB often evaluates multiple Monte Carlo checks (and sometimes multiple
+    sigma candidates). This helper uses a conservative union-bound split so
+    each check gets ``alpha_total / num_checks`` and the overall failure budget
+    remains controlled.
+
+    Math: ``α_i = α_total / n_checks``.
+
+    Source: BMinSep (Dong and Ganesh, 2025 draft), Appendix A, Theorem A.1 (EVR-style confidence allocation).
     """
     if total_confidence_alpha <= 0.0 or total_confidence_alpha >= 1.0:
         raise ValueError("total_confidence_alpha must be in (0, 1)")
@@ -441,6 +483,7 @@ def split_confidence_alpha(
     if num_checks <= 0:
         raise ValueError("num_checks must be > 0")
 
+    # `alpha` budget split: alpha_i = alpha_total / num_checks.
     return float(total_confidence_alpha) / float(num_checks)
 
 
@@ -452,8 +495,14 @@ def verify_evr_confidence_split(
     total_confidence_alpha: float,
 ) -> tuple[DeltaVerificationResult, int, float]:
     """
-    Multi-check EVR verification using confidence splitting.
-    Returns (worst_case_verification, pass_count, per_check_alpha).
+    Run EVR verification over multiple LLR batches with a shared alpha budget.
+
+    Each batch is checked independently with Hoeffding bounds, then this
+    function returns the worst upper confidence bound plus how many checks
+    passed. The caller can then decide whether to accept only all-pass runs.
+
+    Returns:
+    ``(worst_case_verification, pass_count, per_check_alpha)``.
     """
     if len(llr_samples_seq) == 0:
         raise ValueError("llr_samples_seq must be non-empty")
@@ -462,6 +511,7 @@ def verify_evr_confidence_split(
         total_confidence_alpha=total_confidence_alpha,
         num_checks=len(llr_samples_seq),
     )
+    # `delta` target is passed through as `target_delta` in each EVR check.
 
     checks: list[DeltaVerificationResult] = []
     for llr in llr_samples_seq:
@@ -498,8 +548,13 @@ def select_evr_candidate_ladder(
     total_confidence_alpha: float,
 ) -> tuple[float, DeltaVerificationResult, int, float]:
     """
-    Evaluate an ordered sigma ladder and return the first candidate that passes.
-    If none pass, return the last candidate and its verification diagnostics.
+    Scan an increasing sigma ladder and pick the first EVR-accepted candidate.
+
+    This is a pragmatic calibration strategy: test a small ordered grid of
+    noise scales, spend confidence budget across candidates, and stop as soon
+    as the EVR upper bound satisfies the target delta.
+
+    If none pass, return diagnostics for the largest candidate.
     """
     if len(candidate_sigmas) == 0:
         raise ValueError("candidate_sigmas must be non-empty")
@@ -515,6 +570,7 @@ def select_evr_candidate_ladder(
     chosen_verification = None
     chosen_pass_count = 0
     chosen_per_alpha = 0.0
+    # Ladder confidence split: each sigma candidate receives alpha_total / |ladder|.
     per_candidate_alpha = float(total_confidence_alpha) / float(len(cleaned))
 
     for sigma in cleaned:
@@ -547,8 +603,11 @@ def select_evr_candidate_ladder_two_sided(
     total_confidence_alpha: float,
 ) -> tuple[float, DeltaVerificationResult, int, float]:
     """
-    Two-sided EVR candidate ladder:
-    each sigma must pass both forward and reverse verification directions.
+    Two-sided EVR ladder where each sigma must pass both DP directions.
+
+    For ``(epsilon, delta)`` guarantees we may need both ``P||Q`` and ``Q||P``
+    checks. This function splits confidence per candidate and per direction,
+    then accepts only when both directions pass.
     """
     if len(candidate_sigmas) == 0:
         raise ValueError("candidate_sigmas must be non-empty")
@@ -616,11 +675,17 @@ def build_b_min_sep_gaussian_mixture(
     reduce_dimensionality: bool = False,
 ) -> GaussianMixture:
     """
-    Builds b-min-sep Gaussian-mixture means from C.
+    Build the BMinSep Gaussian mixture induced by matrix ``C``.
 
-    Mirrors the structure from the reference Monte Carlo notebook:
-    if C is [d, m] and bands | m, produce m/bands equiprobable components by
-    summing each bins-aligned stripe across epochs.
+    Under b-min-separation participation, one sample's contribution induces a
+    finite set of possible mean shifts in the matrix mechanism output. This
+    function constructs that finite mixture by summing ``bands``-aligned stripes
+    of ``C`` and assigning uniform component probabilities.
+
+    This mirrors the Monte Carlo construction used for BMinSep accounting in
+    the accompanying paper workflow.
+
+    Source: BMinSep (Dong and Ganesh, 2025 draft), Section 5, Equations (2)-(4).
     """
     if c_matrix.ndim != 2:
         raise ValueError("c_matrix must have shape [d, m]")
@@ -635,6 +700,7 @@ def build_b_min_sep_gaussian_mixture(
             f"(got m={m}, bands={bands})"
         )
 
+    # `bands` is the b-min-separation/bin-width parameter.
     num_components = m // bands
     modes = c_matrix.reshape(d, bands, num_components).sum(dim=1)  # [d, k]
     if reduce_dimensionality:
@@ -737,7 +803,14 @@ def sample_b_min_sep_llr(
     reduce_dimensionality: bool = False,
 ) -> torch.Tensor:
     """
-    Samples LLR values for b-min-sep Gaussian-mixture privacy analysis.
+    Sample privacy-loss log-likelihood ratios for the BMinSep mechanism.
+
+    We draw outputs from the ``up`` mixture (adjacent dataset with one
+    contribution) and evaluate ``LLR = log p_up(y) - log p_lo(y)``, where
+    ``lo`` is the zero-mean baseline mixture. These LLR samples are the direct
+    input to Monte Carlo estimates of hockey-stick divergence.
+
+    Source: BMinSep (Dong and Ganesh, 2025 draft), Section 5, Equations (2)-(4), Theorem 5.1.
     """
     if num_samples <= 0:
         raise ValueError("num_samples must be > 0")
@@ -798,7 +871,11 @@ def verify_hockey_stick_delta_hoeffding(
     confidence_alpha: float = 1e-6,
 ) -> DeltaVerificationResult:
     """
-    Verifies delta <= target_delta using Hoeffding upper confidence bound.
+    Verify ``delta(epsilon) <= target_delta`` with a Hoeffding confidence bound.
+
+    The empirical estimate from sampled LLRs is converted to an upper
+    confidence bound with failure probability ``confidence_alpha``. Acceptance
+    is based on that upper bound, not the mean estimate.
     """
     if target_delta <= 0.0 or target_delta >= 1.0:
         raise ValueError("target_delta must be in (0, 1)")
@@ -835,9 +912,10 @@ def estimate_epsilon_from_llr_samples(
     max_iterations: int = 200,
 ) -> float:
     """
-    Inverts hockey-stick delta from LLR samples via binary search.
+    Invert Monte Carlo ``delta(epsilon)`` to estimate epsilon at target delta.
 
-    Uses monotonicity of delta(epsilon) for fixed LLR samples.
+    For fixed LLR samples, ``delta(epsilon)`` is monotone, so we bracket and
+    binary-search epsilon until the target delta is matched within tolerance.
     """
     if target_delta < 0.0 or target_delta >= 1.0:
         raise ValueError("target_delta must be in [0, 1)")
@@ -937,7 +1015,13 @@ def estimate_b_min_sep_epsilon_monte_carlo(
     max_iterations: int = 200,
 ) -> float:
     """
-    Estimates epsilon for a b-min-sep mechanism from Monte Carlo PLD samples.
+    Estimate epsilon for BMinSep accounting from Monte Carlo LLR samples.
+
+    This is the main one-shot estimator used by the BNB accountant: build LLR
+    samples for a fixed ``noise_multiplier`` and then invert ``delta(epsilon)``
+    numerically to return epsilon at ``target_delta``.
+
+    Source: BMinSep (Dong and Ganesh, 2025 draft), Section 5, Equations (2)-(4), Theorem 5.1.
     """
     if noise_multiplier <= 0.0:
         raise ValueError("noise_multiplier must be > 0")
@@ -976,7 +1060,13 @@ def estimate_b_min_sep_delta_monte_carlo(
     reduce_dimensionality: bool = False,
 ) -> float:
     """
-    Estimates hockey-stick delta for fixed epsilon from Monte Carlo PLD samples.
+    Estimate hockey-stick ``delta(epsilon)`` for BMinSep from Monte Carlo LLRs.
+
+    This is the direct Monte Carlo estimator used in sigma-calibration loops:
+    sample LLR values at fixed ``sigma`` and compute
+    ``E[max(0, 1 - exp(epsilon - LLR))]``.
+
+    Source: BMinSep (Dong and Ganesh, 2025 draft), Section 5, Equations (2)-(4), Theorem 5.1.
     """
     if noise_multiplier <= 0.0:
         raise ValueError("noise_multiplier must be > 0")
@@ -998,6 +1088,7 @@ def estimate_b_min_sep_delta_monte_carlo(
         seed=int(seed),
         reduce_dimensionality=reduce_dimensionality,
     )
+    # `delta(epsilon)` is estimated from sampled privacy-loss random variables.
     return estimate_hockey_stick_delta_from_llr_samples(
         epsilon=float(epsilon),
         llr_samples=llr_samples,
@@ -1016,7 +1107,11 @@ def calibrate_sigma_evr_binary_search(
     max_iterations: int = 60,
 ) -> tuple[float, DeltaVerificationResult]:
     """
-    EVR-style calibration: find smallest sigma whose verified delta is <= target.
+    Calibrate the smallest sigma that passes EVR verification at target budget.
+
+    The search is performed over sigma, but acceptance is based on the EVR
+    upper confidence bound for ``delta(epsilon)``. This provides a formal
+    high-confidence guard instead of raw point-estimate thresholding.
     """
     if target_epsilon < 0.0:
         raise ValueError("target_epsilon must be >= 0")
@@ -1033,6 +1128,7 @@ def calibrate_sigma_evr_binary_search(
     low = float(sigma_low)
     high = float(sigma_high)
 
+    # `sigma` is Gaussian noise stddev candidate in EVR calibration.
     verification_at_high = verify_hockey_stick_delta_hoeffding(
         epsilon=target_epsilon,
         llr_samples=llr_samples_fn(high),
@@ -1122,11 +1218,14 @@ def calibrate_b_min_sep_noise_multiplier_monte_carlo(
     max_sigma: float = 1e6,
 ) -> float:
     """
-    Monte Carlo calibration: binary-search sigma over delta(sigma).
+    Calibrate BMinSep noise multiplier by searching ``delta(sigma)``.
 
-    "Privacy Amplification for BandMF via b-Min-Sep Subsampling" (Dong et al., 2026)
+    This routine expands the high bracket until the Monte Carlo delta estimate
+    is below target, then runs binary search for the smallest feasible sigma.
+    It is a practical calibration path used when an explicit EVR ladder is not
+    required by the caller.
 
-    Based on sample code by the authors.
+    Source: BMinSep (Dong and Ganesh, 2025 draft), Section 5, Equations (2)-(4), Theorem 5.1.
     """
     if target_epsilon < 0.0:
         raise ValueError("target_epsilon must be >= 0")

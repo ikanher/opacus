@@ -14,10 +14,7 @@
 # limitations under the License.
 
 import unittest
-from unittest import mock
 
-import math
-import numpy as np
 import torch
 from opacus.utils.uniform_sampler import CyclicPoissonSampler
 

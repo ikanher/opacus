@@ -239,8 +239,17 @@ class BMinSepSampler(Sampler[List[int]]):
 
     When an eligible example participates, its cooldown is reset to
     `min_separation - 1`. Cooldown decrements by one at each step.
+    Constructor semantics: `sample_rate=p`, `min_separation=b`, `steps=T`.
 
-    "Privacy Amplification for BandMF via b-Min-Sep Subsampling" (Dong et al., 2026)
+    This implements the cooldown view of BMinSep subsampling: each example is
+    sampled only when eligible, and a participation event blocks the next
+    ``b-1`` steps. That enforcement is exactly the structural condition used by
+    BandMF/BMinSep privacy accounting.
+
+    Source: BMinSep (Dong and Ganesh, 2025 draft), Section 4, Algorithm 1.
+    Math: eligible item ``i`` participates with Bernoulli(``p``) when ``τ_i(t)=0``;
+    after participation, ``τ_i←b-1`` (otherwise ``τ_i`` decrements by ``1``),
+    enforcing minimum separation ``b``.
     """
 
     def __init__(
@@ -281,6 +290,7 @@ class BMinSepSampler(Sampler[List[int]]):
         for _ in range(self.steps):
             eligible = cooldown == 0
 
+            # `sample_rate` is Bernoulli participation probability `p` for eligible points.
             draws = (
                 torch.rand(self.num_samples, generator=self.generator)
                 < self.sample_rate
@@ -303,6 +313,17 @@ class DistributedBMinSepSampler(Sampler[List[int]]):
     The global index set is sharded across ranks (optionally after deterministic
     shuffle per epoch). Each rank then runs local b-min-separation sampling on
     its shard and yields global indices selected on that rank.
+    Constructor semantics: `sample_rate=p`, `min_separation=b`, `steps=T`.
+
+    This is the distributed analogue of ``BMinSepSampler``: sharding is done
+    first, then each rank applies the same cooldown dynamics locally. The union
+    of all rank-local outputs is therefore equivalent to global BMinSep
+    sampling under deterministic sharding.
+
+    Math: for local item ``i`` at step ``t``, sample Bernoulli(``p``) only when
+    ``τ_i(t)=0``; if sampled then ``τ_i <- b-1`` else ``τ_i``
+    decreases by one.
+    Source: BMinSep (Dong and Ganesh, 2025 draft), Section 4, Algorithm 1.
     """
 
     def __init__(
@@ -374,6 +395,7 @@ class DistributedBMinSepSampler(Sampler[List[int]]):
         for _ in range(self.steps):
             eligible = cooldown == 0
 
+            # `sample_rate` is local Bernoulli participation probability `p`.
             draws = (
                 torch.rand(self.num_samples, generator=self.generator)
                 < self.sample_rate
@@ -398,6 +420,8 @@ class BallsInBinsSampler(Sampler[List[int]]):
 
     Each example is assigned once to a uniform random bin in ``[0, bins-1]`` and
     participates at steps congruent to its assigned bin modulo ``bins``.
+    Constructor semantics: `bins=b`, `steps=T` (default `T=bins`).
+    Math: each item is assigned a fixed bin u∈{0,…,B−1} and is active iff step mod B = u.
     """
 
     def __init__(
@@ -434,6 +458,7 @@ class BallsInBinsSampler(Sampler[List[int]]):
 
     def __iter__(self):
         for step in range(self.steps):
+            # `bins` defines the modulo schedule; active bin index is `step % bins`.
             mask = self._assignment == (step % self.bins)
             indices = mask.nonzero(as_tuple=False).reshape(-1).tolist()
             yield indices
@@ -446,6 +471,9 @@ class DistributedBallsInBinsSampler(Sampler[List[int]]):
     The global index set is sharded across ranks. Each local index is assigned
     once to a uniform random bin in ``[0, bins-1]`` and participates at steps
     congruent to its assigned bin modulo ``bins``.
+    Constructor semantics: `bins=b`, `steps=T` (default `T=bins`).
+    Math: local item ``i`` gets fixed ``u_i ~ Unif({0,…,B−1})``; it is active at
+    step ``t`` iff ``t mod B = u_i``.
     """
 
     def __init__(
@@ -500,6 +528,7 @@ class DistributedBallsInBinsSampler(Sampler[List[int]]):
         assert len(indices) == self.num_samples
 
         for step in range(self.steps):
+            # `bins` controls periodic active bucket: `step % bins`.
             mask = self._assignment == (step % self.bins)
             local = mask.nonzero(as_tuple=False).reshape(-1)
             yield indices[local].tolist()
@@ -517,10 +546,11 @@ class CyclicPoissonSampler(Sampler[List[int]]):
       (extra tail indices are discarded);
     - at step ``t`` include each element of partition ``t % bands``
       independently with probability ``q = batch_size / partition_size``.
+    Constructor semantics: `bands=b`, `steps=T`, implicit `q=batch_size/partition_size`.
 
-    Reference:
-    "(Amplified) Banded Matrix Factorization: A unified approach to private
-    training" (Choquette-Choo et al., 2023)
+    Source: BandMF (Choquette-Choo et al., 2023), Section 5 and Theorems `thm:sampling-amplification`, `thm:general-amplification` (TBD: Look up section number.).
+    Math: cyclic Poisson uses one active partition ``P_{t mod b}`` per step and
+    samples each active item with ``q = m / |P_{t mod b}|``.
     """
 
     def __init__(
@@ -594,6 +624,7 @@ class CyclicPoissonSampler(Sampler[List[int]]):
         partitions = self._build_partitions()
         for step in range(self.steps):
             partition = partitions[step % self.bands]
+            # `q` within active partition: batch_size / partition_size.
             sampling_prob = float(self.batch_size) / float(len(partition))
             draws = torch.rand(len(partition), generator=self.generator) < sampling_prob
             selected = draws.nonzero(as_tuple=False).reshape(-1).tolist()
@@ -610,6 +641,10 @@ class DistributedCyclicPoissonSampler(Sampler[List[int]]):
 
     At each step, every rank samples from the same active cyclic partition,
     but only from its local shard of that partition (sharded by rank).
+    Constructor semantics: `bands=b`, `steps=T`, local `q=batch_size/|partition_rank|`.
+    Math: active partition is ``P_{t mod b}``; rank ``r`` uses shard
+    ``P_{t mod b}^{(r)}`` and samples each local item with
+    ``q_r = m_r / |P_{t mod b}^{(r)}|``.
     """
 
     def __init__(
@@ -694,6 +729,7 @@ class DistributedCyclicPoissonSampler(Sampler[List[int]]):
 
         for step in range(self.steps):
             local_partition = local_partitions[step % self.bands]
+            # Local active-partition probability `q_local = batch_size / |local_partition|`.
             sampling_prob = float(self.batch_size) / float(len(local_partition))
 
             draws = (

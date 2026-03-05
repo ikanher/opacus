@@ -177,6 +177,10 @@ class PrivacyEngine:
         optimizer: optim.Optimizer,
         kwargs: Dict[str, Any],
     ) -> NoiseMechanismConfig:
+        """
+        Ensure cyclic MF mechanisms have coefficient vectors available.
+        Math: ensure C-factor coefficients exist for cyclic runtime so correlated mechanism C and noise are defined.
+        """
         if mechanism_config.mechanism not in ("bandmf", "bsr"):
             return mechanism_config
 
@@ -196,10 +200,24 @@ class PrivacyEngine:
             if sampling_semantics is not None
             else {}
         )
-        bands = kwargs.get("bsr_bands", metadata.get("bands", state.get("bands")))
+        # `bands` is the band/min-separation parameter (`b`) used by cyclic schedules.
+        PrivacyEngine._raise_on_legacy_aliases(
+            source_name="mechanism_state",
+            payload=state,
+            aliases={"bands": "bsr_bands"},
+        )
+        metadata_bands = metadata.get("bands")
+        explicit_bands = kwargs.get("bsr_bands")
+        if explicit_bands is not None and metadata_bands is not None:
+            if int(explicit_bands) != int(metadata_bands):
+                raise ValueError(
+                    "conflicting canonical inputs: `bsr_bands` must match "
+                    "sampling_semantics privacy_metadata['bands']"
+                )
+        bands = kwargs.get("bsr_bands", metadata.get("bands", state.get("bsr_bands")))
         if bands is None:
             raise ValueError(
-                "auto coeff generation requires bands via `mechanism_state['bands']`, "
+                "auto coeff generation requires bands via `mechanism_state['bsr_bands']`, "
                 "`sampling_semantics.privacy_metadata['bands']`, or `bsr_bands`"
             )
 
@@ -217,7 +235,7 @@ class PrivacyEngine:
                 bands=bands,
                 steps=int(steps),
             )
-            state["bands"] = bands
+            state["bsr_bands"] = bands
             state["coeff_source"] = "lbfgs_auto"
             return NoiseMechanismConfig(
                 mechanism=mechanism_config.mechanism,
@@ -233,7 +251,7 @@ class PrivacyEngine:
             momentum=momentum,
             weight_decay=weight_decay,
         )
-        state["bands"] = bands
+        state["bsr_bands"] = bands
         state["coeff_source"] = "analytical_auto"
 
         return NoiseMechanismConfig(
@@ -281,6 +299,11 @@ class PrivacyEngine:
         sampling_semantics: Optional[SamplingSemantics],
         kwargs: Dict[str, Any],
     ) -> NoiseMechanismConfig:
+        """
+        Ensure fixed-batch BSR has analytical coefficients from SGD workload params.
+        Math: fixed-batch BSR uses analytically generated Toeplitz coefficients ``c_0,…,c_{b-1}`` from SGD workload parameters ``(α, β)``.
+        Source: BSR (Kalinin and Lampert, 2024), Section 3.1, Equation (9), Theorem 1.
+        """
         # Contract split:
         # - `bsr` fixed-batch path uses analytical workload coefficients.
         # - `bsr` cyclic path auto-resolves coefficients analytically via
@@ -296,11 +319,25 @@ class PrivacyEngine:
             return mechanism_config
 
         metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
-        bands = kwargs.get("bsr_bands", metadata.get("bands", state.get("bands")))
+        # `bands` is the truncation width for the BSR Toeplitz factor.
+        PrivacyEngine._raise_on_legacy_aliases(
+            source_name="mechanism_state",
+            payload=state,
+            aliases={"bands": "bsr_bands"},
+        )
+        metadata_bands = metadata.get("bands")
+        explicit_bands = kwargs.get("bsr_bands")
+        if explicit_bands is not None and metadata_bands is not None:
+            if int(explicit_bands) != int(metadata_bands):
+                raise ValueError(
+                    "conflicting canonical inputs: `bsr_bands` must match "
+                    "sampling_semantics privacy_metadata['bands']"
+                )
+        bands = kwargs.get("bsr_bands", metadata.get("bands", state.get("bsr_bands")))
         if bands is None:
             raise ValueError(
                 "bsr analytical auto-coeff generation requires bands via "
-                "`mechanism_state['bands']`, `sampling_semantics.privacy_metadata['bands']`, "
+                "`mechanism_state['bsr_bands']`, `sampling_semantics.privacy_metadata['bands']`, "
                 "or `bsr_bands`"
             )
 
@@ -316,7 +353,7 @@ class PrivacyEngine:
             momentum=momentum,
             weight_decay=weight_decay,
         )
-        state["bands"] = bands
+        state["bsr_bands"] = bands
         state["coeff_source"] = "analytical_auto"
 
         return NoiseMechanismConfig(
@@ -338,12 +375,12 @@ class PrivacyEngine:
             "coeff_head": coeff_head,
             "coeff_source": coeff_source,
             "z_std": mechanism_state.get("z_std"),
-            "sensitivity_scale": mechanism_state.get("sensitivity_scale"),
-            "mf_sensitivity": mechanism_state.get("mf_sensitivity"),
-            "min_separation": mechanism_state.get("min_separation"),
-            "max_participations": mechanism_state.get("max_participations"),
-            "iterations_number": mechanism_state.get("iterations_number"),
-            "bands": mechanism_state.get("bands"),
+            "bsr_sensitivity_scale": mechanism_state.get("bsr_sensitivity_scale"),
+            "bsr_mf_sensitivity": mechanism_state.get("bsr_mf_sensitivity"),
+            "bsr_min_separation": mechanism_state.get("bsr_min_separation"),
+            "bsr_max_participations": mechanism_state.get("bsr_max_participations"),
+            "bsr_iterations_number": mechanism_state.get("bsr_iterations_number"),
+            "bsr_bands": mechanism_state.get("bsr_bands"),
         }
 
     @staticmethod
@@ -629,43 +666,139 @@ class PrivacyEngine:
         sample_rate: Optional[float],
         kwargs: Dict[str, Any],
     ) -> float:
+        """
+        Resolve fixed-batch BSR sensitivity (`mf_sensitivity`) for epsilon calibration.
+        Math: resolve fixed-batch sensitivity ``S_{k,b}(C;T) = (Σ_i(Σ_j c_{i-jb})²)^{1/2}``,
+        where ``T`` is the horizon, ``k`` is the max-participation cap, and ``b`` is min-separation.
+        Source: BSR (Kalinin and Lampert, 2024), Section 3.2, Equation (10), Theorem 2.
+        """
         metadata = (
             sampling_semantics.privacy_metadata
             if sampling_semantics is not None
             else {}
         )
+        PrivacyEngine._raise_if_fixed_batch_has_cyclic_only_params(
+            mechanism_state=mechanism_state,
+            metadata=metadata,
+            kwargs=kwargs,
+        )
+        coeffs, max_participations, min_separation, sensitivity_steps = (
+            PrivacyEngine._resolve_fixed_batch_bsr_contract_inputs(
+                mechanism_state=mechanism_state,
+                metadata=metadata,
+                steps=steps,
+                sample_rate=sample_rate,
+                kwargs=kwargs,
+            )
+        )
+        return PrivacyEngine._resolve_fixed_batch_bsr_mf_sensitivity_value(
+            coeffs=coeffs,
+            max_participations=max_participations,
+            min_separation=min_separation,
+            sensitivity_steps=sensitivity_steps,
+            mechanism_state=mechanism_state,
+            metadata=metadata,
+            kwargs=kwargs,
+        )
+
+    @staticmethod
+    def _raise_if_fixed_batch_has_cyclic_only_params(
+        *,
+        mechanism_state: Dict[str, Any],
+        metadata: Dict[str, Any],
+        kwargs: Dict[str, Any],
+    ) -> None:
         cyclic_only_params = []
-        if kwargs.get("sensitivity_scale") is not None:
-            cyclic_only_params.append("sensitivity_scale")
-        if metadata.get("sensitivity_scale") is not None:
-            cyclic_only_params.append("privacy_metadata['sensitivity_scale']")
-        if mechanism_state.get("sensitivity_scale") is not None:
-            cyclic_only_params.append("mechanism_state['sensitivity_scale']")
+        PrivacyEngine._raise_on_legacy_aliases(
+            source_name="kwargs",
+            payload=kwargs,
+            aliases={"sensitivity_scale": "bsr_sensitivity_scale"},
+        )
+        PrivacyEngine._raise_on_legacy_aliases(
+            source_name="privacy_metadata",
+            payload=metadata,
+            aliases={"sensitivity_scale": "bsr_sensitivity_scale"},
+        )
+        PrivacyEngine._raise_on_legacy_aliases(
+            source_name="mechanism_state",
+            payload=mechanism_state,
+            aliases={"sensitivity_scale": "bsr_sensitivity_scale"},
+        )
+        if kwargs.get("bsr_sensitivity_scale") is not None:
+            cyclic_only_params.append("bsr_sensitivity_scale")
+        if metadata.get("bsr_sensitivity_scale") is not None:
+            cyclic_only_params.append("privacy_metadata['bsr_sensitivity_scale']")
+        if mechanism_state.get("bsr_sensitivity_scale") is not None:
+            cyclic_only_params.append("mechanism_state['bsr_sensitivity_scale']")
         if cyclic_only_params:
             raise ValueError(
                 "fixed-batch bsr accounting received cyclic-only parameters: "
                 + ", ".join(cyclic_only_params)
             )
 
+    @staticmethod
+    def _resolve_fixed_batch_bsr_contract_inputs(
+        *,
+        mechanism_state: Dict[str, Any],
+        metadata: Dict[str, Any],
+        steps: int,
+        sample_rate: Optional[float],
+        kwargs: Dict[str, Any],
+    ) -> tuple[Any, Any, Any, int]:
         coeffs = mechanism_state.get("coeffs")
+        PrivacyEngine._raise_on_legacy_aliases(
+            source_name="kwargs",
+            payload=kwargs,
+            aliases={
+                "max_participations": "bsr_max_participations",
+                "min_separation": "bsr_min_separation",
+                "iterations_number": "bsr_iterations_number",
+                "mf_sensitivity": "bsr_mf_sensitivity",
+            },
+        )
+        PrivacyEngine._raise_on_legacy_aliases(
+            source_name="privacy_metadata",
+            payload=metadata,
+            aliases={
+                "max_participations": "bsr_max_participations",
+                "min_separation": "bsr_min_separation",
+                "iterations_number": "bsr_iterations_number",
+                "mf_sensitivity": "bsr_mf_sensitivity",
+            },
+        )
+        PrivacyEngine._raise_on_legacy_aliases(
+            source_name="mechanism_state",
+            payload=mechanism_state,
+            aliases={
+                "max_participations": "bsr_max_participations",
+                "min_separation": "bsr_min_separation",
+                "iterations_number": "bsr_iterations_number",
+                "mf_sensitivity": "bsr_mf_sensitivity",
+            },
+        )
         max_participations = kwargs.get(
             "bsr_max_participations",
-            metadata.get("max_participations", mechanism_state.get("max_participations")),
+            metadata.get(
+                "bsr_max_participations",
+                mechanism_state.get("bsr_max_participations"),
+            ),
         )
         min_separation = kwargs.get(
             "bsr_min_separation",
             metadata.get(
-                "min_separation",
-                mechanism_state.get("min_separation", metadata.get("bands")),
+                "bsr_min_separation",
+                mechanism_state.get("bsr_min_separation"),
             ),
         )
         sensitivity_steps = kwargs.get(
             "bsr_iterations_number",
-            metadata.get("iterations_number", mechanism_state.get("iterations_number")),
+            metadata.get(
+                "bsr_iterations_number",
+                mechanism_state.get("bsr_iterations_number"),
+            ),
         )
         if sensitivity_steps is None:
             sensitivity_steps = steps
-
         sensitivity_steps = int(sensitivity_steps)
         if sensitivity_steps < 1:
             raise ValueError("bsr_iterations_number must be >= 1")
@@ -673,53 +806,17 @@ class PrivacyEngine:
             max_participations = int(math.ceil(float(sample_rate) * float(sensitivity_steps)))
             max_participations = max(1, int(max_participations))
         if min_separation is None:
-            # Conservative default for fixed-batch schedule when no stronger contract is provided.
             min_separation = 1
+        return coeffs, max_participations, min_separation, sensitivity_steps
 
-        mf_sensitivity = kwargs.get(
-            "bsr_mf_sensitivity",
-            metadata.get("mf_sensitivity", mechanism_state.get("mf_sensitivity")),
-        )
-        if mf_sensitivity is not None:
-            resolved = float(mf_sensitivity)
-            if not math.isfinite(resolved) or resolved <= 0.0:
-                raise ValueError("bsr_mf_sensitivity must be finite and > 0")
-            if (
-                coeffs is not None
-                and max_participations is not None
-                and min_separation is not None
-            ):
-                derived = float(
-                    compute_bsr_mf_sensitivity_from_coeffs(
-                        coeffs=coeffs,
-                        steps=sensitivity_steps,
-                        max_participations=int(max_participations),
-                        min_separation=int(min_separation),
-                    )
-                )
-                if not math.isfinite(derived) or derived <= 0.0:
-                    raise ValueError(
-                        "derived bsr_mf_sensitivity must be finite and > 0 "
-                        "when validating explicit bsr_mf_sensitivity"
-                    )
-                if not math.isclose(
-                    resolved, derived, rel_tol=1e-9, abs_tol=1e-12
-                ):
-                    raise ValueError(
-                        "provided bsr_mf_sensitivity is inconsistent with "
-                        "coeffs/max_participations/min_separation for the resolved "
-                        "bsr_iterations_number"
-                    )
-            return resolved
-
-        if coeffs is None or max_participations is None or min_separation is None:
-            raise ValueError(
-                "fixed-batch bsr accounting requires MF sensitivity or "
-                "enough metadata to derive it: "
-                "`mechanism_state['coeffs']`, "
-                "`max_participations`, `min_separation`"
-            )
-
+    @staticmethod
+    def _compute_bsr_mf_sensitivity_from_contract(
+        *,
+        coeffs: Any,
+        max_participations: Any,
+        min_separation: Any,
+        sensitivity_steps: int,
+    ) -> float:
         resolved = float(
             compute_bsr_mf_sensitivity_from_coeffs(
                 coeffs=coeffs,
@@ -733,6 +830,57 @@ class PrivacyEngine:
         return resolved
 
     @staticmethod
+    def _resolve_fixed_batch_bsr_mf_sensitivity_value(
+        *,
+        coeffs: Any,
+        max_participations: Any,
+        min_separation: Any,
+        sensitivity_steps: int,
+        mechanism_state: Dict[str, Any],
+        metadata: Dict[str, Any],
+        kwargs: Dict[str, Any],
+    ) -> float:
+        mf_sensitivity = kwargs.get(
+            "bsr_mf_sensitivity",
+            metadata.get(
+                "bsr_mf_sensitivity",
+                mechanism_state.get("bsr_mf_sensitivity"),
+            ),
+        )
+        if mf_sensitivity is not None:
+            resolved = float(mf_sensitivity)
+            if not math.isfinite(resolved) or resolved <= 0.0:
+                raise ValueError("bsr_mf_sensitivity must be finite and > 0")
+            if coeffs is not None and max_participations is not None and min_separation is not None:
+                derived = PrivacyEngine._compute_bsr_mf_sensitivity_from_contract(
+                    coeffs=coeffs,
+                    max_participations=max_participations,
+                    min_separation=min_separation,
+                    sensitivity_steps=sensitivity_steps,
+                )
+                if not math.isclose(resolved, derived, rel_tol=1e-9, abs_tol=1e-12):
+                    raise ValueError(
+                        "provided bsr_mf_sensitivity is inconsistent with "
+                        "coeffs/max_participations/min_separation for the resolved "
+                        "bsr_iterations_number"
+                    )
+            return resolved
+
+        if coeffs is None or max_participations is None or min_separation is None:
+            raise ValueError(
+                "fixed-batch bsr accounting requires MF sensitivity or "
+                "enough metadata to derive it: "
+                "`mechanism_state['coeffs']`, "
+                "`bsr_max_participations`, `bsr_min_separation`"
+            )
+        return PrivacyEngine._compute_bsr_mf_sensitivity_from_contract(
+            coeffs=coeffs,
+            max_participations=max_participations,
+            min_separation=min_separation,
+            sensitivity_steps=sensitivity_steps,
+        )
+
+    @staticmethod
     def _resolve_bsr_sensitivity_scale_for_cyclic(
         *,
         mechanism_state: Dict[str, Any],
@@ -740,79 +888,163 @@ class PrivacyEngine:
         steps: int,
         kwargs: Dict[str, Any],
     ) -> float:
+        """
+        Resolve cyclic sensitivity scale (`kappa`) for BandMF/BSR cyclic accounting.
+        Math: cyclic scale uses finite-horizon ``κ(T)`` and contract values
+        ``q = b·p`` and ``N_cycles = ⌈T/b⌉``.
+        Source: BandMF (Choquette-Choo et al., 2023), Section 5 and Theorems `thm:sampling-amplification`, `thm:general-amplification` (TBD: Look up section number.).
+        """
         metadata = (
             sampling_semantics.privacy_metadata
             if sampling_semantics is not None
             else {}
         )
+        PrivacyEngine._raise_if_cyclic_has_fixed_batch_only_params(
+            mechanism_state=mechanism_state,
+            metadata=metadata,
+            kwargs=kwargs,
+        )
+        PrivacyEngine._raise_on_legacy_aliases(
+            source_name="kwargs",
+            payload=kwargs,
+            aliases={"sensitivity_scale": "bsr_sensitivity_scale"},
+        )
+        PrivacyEngine._raise_on_legacy_aliases(
+            source_name="privacy_metadata",
+            payload=metadata,
+            aliases={"sensitivity_scale": "bsr_sensitivity_scale"},
+        )
+        PrivacyEngine._raise_on_legacy_aliases(
+            source_name="mechanism_state",
+            payload=mechanism_state,
+            aliases={"sensitivity_scale": "bsr_sensitivity_scale"},
+        )
+        explicit_scale = kwargs.get(
+            "bsr_sensitivity_scale",
+            metadata.get(
+                "bsr_sensitivity_scale",
+                mechanism_state.get("bsr_sensitivity_scale"),
+            ),
+        )
+        if explicit_scale is not None:
+            scale = float(explicit_scale)
+            if (not math.isfinite(scale)) or scale <= 0.0:
+                raise ValueError("bsr_sensitivity_scale must be finite and > 0")
+            return scale
+        return PrivacyEngine._resolve_cyclic_scale_from_coeffs(
+            mechanism_state=mechanism_state,
+            metadata=metadata,
+            steps=steps,
+            kwargs=kwargs,
+        )
+
+    @staticmethod
+    def _raise_if_cyclic_has_fixed_batch_only_params(
+        *,
+        mechanism_state: Dict[str, Any],
+        metadata: Dict[str, Any],
+        kwargs: Dict[str, Any],
+    ) -> None:
         fixed_only_params = []
+        PrivacyEngine._raise_on_legacy_aliases(
+            source_name="kwargs",
+            payload=kwargs,
+            aliases={
+                "mf_sensitivity": "bsr_mf_sensitivity",
+                "max_participations": "bsr_max_participations",
+                "min_separation": "bsr_min_separation",
+                "iterations_number": "bsr_iterations_number",
+            },
+        )
+        PrivacyEngine._raise_on_legacy_aliases(
+            source_name="privacy_metadata",
+            payload=metadata,
+            aliases={
+                "mf_sensitivity": "bsr_mf_sensitivity",
+                "max_participations": "bsr_max_participations",
+                "min_separation": "bsr_min_separation",
+                "iterations_number": "bsr_iterations_number",
+            },
+        )
+        PrivacyEngine._raise_on_legacy_aliases(
+            source_name="mechanism_state",
+            payload=mechanism_state,
+            aliases={
+                "mf_sensitivity": "bsr_mf_sensitivity",
+                "max_participations": "bsr_max_participations",
+                "min_separation": "bsr_min_separation",
+                "iterations_number": "bsr_iterations_number",
+            },
+        )
         if kwargs.get("bsr_mf_sensitivity") is not None:
             fixed_only_params.append("bsr_mf_sensitivity")
         if kwargs.get("bsr_max_participations") is not None:
             fixed_only_params.append("bsr_max_participations")
         if kwargs.get("bsr_min_separation") is not None:
             fixed_only_params.append("bsr_min_separation")
-        if metadata.get("mf_sensitivity") is not None:
-            fixed_only_params.append("privacy_metadata['mf_sensitivity']")
-        if metadata.get("max_participations") is not None:
-            fixed_only_params.append("privacy_metadata['max_participations']")
-        if metadata.get("min_separation") is not None:
-            fixed_only_params.append("privacy_metadata['min_separation']")
-        if mechanism_state.get("mf_sensitivity") is not None:
-            fixed_only_params.append("mechanism_state['mf_sensitivity']")
-        if mechanism_state.get("max_participations") is not None:
-            fixed_only_params.append("mechanism_state['max_participations']")
-        if mechanism_state.get("min_separation") is not None:
-            fixed_only_params.append("mechanism_state['min_separation']")
+        if metadata.get("bsr_mf_sensitivity") is not None:
+            fixed_only_params.append("privacy_metadata['bsr_mf_sensitivity']")
+        if metadata.get("bsr_max_participations") is not None:
+            fixed_only_params.append("privacy_metadata['bsr_max_participations']")
+        if metadata.get("bsr_min_separation") is not None:
+            fixed_only_params.append("privacy_metadata['bsr_min_separation']")
+        if mechanism_state.get("bsr_mf_sensitivity") is not None:
+            fixed_only_params.append("mechanism_state['bsr_mf_sensitivity']")
+        if mechanism_state.get("bsr_max_participations") is not None:
+            fixed_only_params.append("mechanism_state['bsr_max_participations']")
+        if mechanism_state.get("bsr_min_separation") is not None:
+            fixed_only_params.append("mechanism_state['bsr_min_separation']")
         if fixed_only_params:
             raise ValueError(
                 "cyclic-poisson bandmf accounting received fixed-batch-only parameters: "
                 + ", ".join(fixed_only_params)
             )
 
-        explicit_scale = kwargs.get(
-            "sensitivity_scale",
-            metadata.get("sensitivity_scale", mechanism_state.get("sensitivity_scale")),
-        )
-        if explicit_scale is not None:
-            scale = float(explicit_scale)
-            if (not math.isfinite(scale)) or scale <= 0.0:
-                raise ValueError("sensitivity_scale must be finite and > 0")
-            return scale
-
+    @staticmethod
+    def _resolve_cyclic_scale_from_coeffs(
+        *,
+        mechanism_state: Dict[str, Any],
+        metadata: Dict[str, Any],
+        steps: int,
+        kwargs: Dict[str, Any],
+    ) -> float:
         coeffs = mechanism_state.get("coeffs")
         if coeffs is None:
             raise ValueError(
                 "cyclic-poisson bandmf accounting requires either `sensitivity_scale` "
                 "or `mechanism_state['coeffs']`"
             )
-
         scale_steps = kwargs.get(
             "bsr_iterations_number",
-            metadata.get("iterations_number", mechanism_state.get("iterations_number")),
+            metadata.get(
+                "bsr_iterations_number",
+                mechanism_state.get("bsr_iterations_number"),
+            ),
         )
         if scale_steps is None:
             scale_steps = steps
-
         scale_steps = int(scale_steps)
         if scale_steps < 1:
             raise ValueError("bsr_iterations_number must be >= 1")
-
-        bands = metadata.get("bands", mechanism_state.get("bands"))
-        if bands is None and coeffs is not None:
-            bands = len(coeffs)
-
-        if bands is not None:
-            resolved_bands = int(bands)
-            if resolved_bands <= 0:
-                raise ValueError("cyclic_poisson bands must be > 0")
-
-            if scale_steps < resolved_bands:
+        metadata_bands = metadata.get("bands")
+        explicit_bands = kwargs.get("bsr_bands")
+        if explicit_bands is not None and metadata_bands is not None:
+            if int(explicit_bands) != int(metadata_bands):
                 raise ValueError(
-                    "cyclic_poisson bandmf requires steps >= bands; "
-                    f"got steps={scale_steps}, bands={resolved_bands}"
+                    "conflicting canonical inputs: `bsr_bands` must match "
+                    "sampling_semantics privacy_metadata['bands']"
                 )
-
+        bands = kwargs.get("bsr_bands", metadata.get("bands", mechanism_state.get("bsr_bands")))
+        if bands is None:
+            bands = len(coeffs)
+        resolved_bands = int(bands)
+        if resolved_bands <= 0:
+            raise ValueError("cyclic_poisson bands must be > 0")
+        if scale_steps < resolved_bands:
+            raise ValueError(
+                "cyclic_poisson bandmf requires steps >= bands; "
+                f"got steps={scale_steps}, bands={resolved_bands}"
+            )
         scale = float(
             compute_bsr_kappa_from_coeffs(
                 coeffs=coeffs,
@@ -820,8 +1052,7 @@ class PrivacyEngine:
             )
         )
         if (not math.isfinite(scale)) or scale <= 0.0:
-            raise ValueError("resolved sensitivity_scale must be finite and > 0")
-
+            raise ValueError("resolved bsr_sensitivity_scale must be finite and > 0")
         return scale
 
     @staticmethod
@@ -833,18 +1064,44 @@ class PrivacyEngine:
     ) -> tuple[Any, int, Dict[str, Any]]:
         state = mechanism_state if isinstance(mechanism_state, dict) else {}
         metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
-        c_matrix = kwargs.get("bnb_c_matrix", state.get("c_matrix"))
-        bands = kwargs.get("bnb_bands", metadata.get("bands", state.get("bands")))
+        PrivacyEngine._raise_on_legacy_aliases(
+            source_name="kwargs",
+            payload=kwargs,
+            aliases={
+                "c_matrix": "bnb_c_matrix",
+                "bands": "bnb_bands",
+                "c_matrix_contract": "bnb_c_matrix_contract",
+            },
+        )
+        PrivacyEngine._raise_on_legacy_aliases(
+            source_name="mechanism_state",
+            payload=state,
+            aliases={
+                "c_matrix": "bnb_c_matrix",
+                "bands": "bnb_bands",
+                "c_matrix_contract": "bnb_c_matrix_contract",
+            },
+        )
+        c_matrix = kwargs.get("bnb_c_matrix", state.get("bnb_c_matrix"))
+        metadata_bands = metadata.get("bands")
+        explicit_bands = kwargs.get("bnb_bands")
+        if explicit_bands is not None and metadata_bands is not None:
+            if int(explicit_bands) != int(metadata_bands):
+                raise ValueError(
+                    "conflicting canonical inputs: `bnb_bands` must match "
+                    "sampling_semantics privacy_metadata['bands']"
+                )
+        bands = kwargs.get("bnb_bands", metadata.get("bands", state.get("bnb_bands")))
 
         c_matrix_contract = kwargs.get(
             "bnb_c_matrix_contract",
-            state.get("c_matrix_contract"),
+            state.get("bnb_c_matrix_contract"),
         )
 
         if c_matrix is None or bands is None or c_matrix_contract is None:
             raise ValueError(
                 "bnb calibration requires b_min_sep/balls_in_bins inputs: "
-                "`c_matrix`, `bands`, and `c_matrix_contract`"
+                "`bnb_c_matrix`, `bnb_bands`, and `bnb_c_matrix_contract`"
             )
 
         return c_matrix, int(bands), c_matrix_contract
@@ -966,12 +1223,18 @@ class PrivacyEngine:
         bands: int,
         total_steps: Optional[int],
     ):
+        """
+        Build cyclic-poisson sampler objects from runtime config.
+        Math: partition ``P_r`` is active at step ``t`` iff ``r = t mod b``; each
+        ``i ∈ P_r`` is sampled with ``q = m / |P_r|``.
+        """
         if isinstance(data_loader.dataset, torch.utils.data.IterableDataset):
             raise ValueError("cyclic_poisson sampling is not supported for IterableDataset")
 
         if data_loader.batch_size is None:
             raise ValueError("cyclic_poisson sampling requires data_loader.batch_size")
 
+        # `steps` is the global optimization horizon; must cover at least one full cycle of `bands`.
         steps = total_steps if total_steps is not None else len(data_loader)
         if int(steps) < int(bands):
             raise ValueError(
@@ -1012,9 +1275,15 @@ class PrivacyEngine:
         p: float,
         total_steps: Optional[int],
     ):
+        """
+        Build b-min-separation samplers.
+        Math: item ``i`` is sampled with Bernoulli(``p``) only when ``τ_i(t)=0``; if sampled,
+        ``τ_i←b−1``, else ``τ_i`` decreases by ``1``.
+        """
         if isinstance(data_loader.dataset, torch.utils.data.IterableDataset):
             raise ValueError("b_min_sep sampling is not supported for IterableDataset")
 
+        # `b` is min-separation; `p` is per-step participation probability.
         steps = total_steps if total_steps is not None else len(data_loader)
         generator = self._sampler_generator(data_loader)
         if distributed:
@@ -1042,9 +1311,15 @@ class PrivacyEngine:
         bins: int,
         total_steps: Optional[int],
     ):
+        """
+        Build balls-in-bins samplers.
+        Math: assign ``u_i ~ Unif({0,…,B−1})`` once; item ``i`` is active at step ``t`` iff
+        ``t mod B = u_i``.
+        """
         if isinstance(data_loader.dataset, torch.utils.data.IterableDataset):
             raise ValueError("balls_in_bins sampling is not supported for IterableDataset")
 
+        # `bins` is the modulo bucket count controlling periodic participation windows.
         steps = total_steps if total_steps is not None else len(data_loader)
         generator = self._sampler_generator(data_loader)
         if distributed:
@@ -1092,6 +1367,14 @@ class PrivacyEngine:
         sampling_semantics: Optional[SamplingSemantics],
         validate_cyclic_poisson_mode: bool,
     ) -> None:
+        """
+        Enforce mechanism/sampler compatibility constraints.
+        Math: enforces accountant contracts against runtime sampling law, e.g.
+        cyclic requires ``q = b·p ∈ (0,1]``, fixed-batch BSR uses ``S_{k,b}(C;T)``,
+        and BNB requires b-min-sep/balls-in-bins semantics.
+        Source: BandMF (Choquette-Choo et al., 2023), Section 5 and Theorems `thm:sampling-amplification`, `thm:general-amplification` (TBD: Look up section number.); and
+        BMinSep (Dong and Ganesh, 2025 draft), Section 4 (sampling law) and Section 5, Equations (2)-(4), Theorem 5.1.
+        """
         mechanism = mechanism_config.mechanism
         if mechanism in ("bandmf", "bsr") and poisson_sampling:
             raise ValueError(
@@ -1291,12 +1574,17 @@ class PrivacyEngine:
         kwargs: Dict[str, Any],
         nm_kwargs: Dict[str, Any],
     ) -> Tuple[float, float]:
+        """
+        Resolve sigma for non-BNB mechanisms by delegating to accountant calibration.
+        Math: non-BNB noise calibration solves for σ_ref such that composed ε(δ) meets target under selected accountant.
+        """
         if total_steps:
             if epochs is not None:
                 raise ValueError(
                     "make_private_with_epsilon takes as input EITHER a number of steps or a number of epochs"
                 )
 
+            # `sample_rate` is the accountant participation probability `q` input.
             sample_rate = self._resolve_total_steps_sample_rate(
                 poisson_sampling=poisson_sampling,
                 sampling_semantics=sampling_semantics,
@@ -1311,7 +1599,7 @@ class PrivacyEngine:
                 and sampling_semantics is not None
                 and sampling_semantics.sampling_mode == "cyclic_poisson"
             ):
-                nm_kwargs["sensitivity_scale"] = self._resolve_bsr_sensitivity_scale_for_cyclic(
+                nm_kwargs["bsr_sensitivity_scale"] = self._resolve_bsr_sensitivity_scale_for_cyclic(
                     mechanism_state=mechanism_config.mechanism_state,
                     sampling_semantics=sampling_semantics,
                     steps=int(total_steps),
@@ -1379,7 +1667,7 @@ class PrivacyEngine:
             and sampling_semantics is not None
             and sampling_semantics.sampling_mode == "cyclic_poisson"
         ):
-            nm_kwargs["sensitivity_scale"] = self._resolve_bsr_sensitivity_scale_for_cyclic(
+            nm_kwargs["bsr_sensitivity_scale"] = self._resolve_bsr_sensitivity_scale_for_cyclic(
                 mechanism_state=mechanism_config.mechanism_state,
                 sampling_semantics=sampling_semantics,
                 steps=implied_steps,
@@ -1448,6 +1736,10 @@ class PrivacyEngine:
         bnb_bands: Optional[int],
         kwargs: Dict[str, Any],
     ) -> Tuple[float, float]:
+        """
+        Resolve sigma for BNB via Monte Carlo + EVR calibration.
+        Math: BNB calibration searches σ using Monte Carlo δ estimates with EVR/Hoeffding confidence control.
+        """
         if bnb_c_matrix is None or bnb_bands is None:
             raise ValueError(
                 "bnb calibration requires resolved runtime inputs (`c_matrix`, `bands`)"
@@ -1459,6 +1751,7 @@ class PrivacyEngine:
                     "make_private_with_epsilon takes as input EITHER a number of steps or a number of epochs"
                 )
 
+            # `sample_rate` is carried for runtime metadata; BNB sigma solve uses C/bands contract.
             sample_rate = self._resolve_total_steps_sample_rate(
                 poisson_sampling=poisson_sampling,
                 sampling_semantics=sampling_semantics,
@@ -1550,6 +1843,10 @@ class PrivacyEngine:
         bnb_bands: Optional[int],
         kwargs: Dict[str, Any],
     ) -> Tuple[float, float]:
+        """
+        Dispatch epsilon->sigma calibration based on mechanism/accountant path.
+        Math: dispatcher picks the correct ε→σ calibration path (BNB Monte Carlo vs non-BNB accountant solve).
+        """
         nm_kwargs = dict(kwargs)
         nm_kwargs.pop("bsr_mf_sensitivity", None)
 
@@ -2422,7 +2719,7 @@ class PrivacyEngine:
                 kwargs=kwargs,
             )
             state = copy.deepcopy(mechanism_config.mechanism_state)
-            state["sensitivity_scale"] = float(resolved_scale)
+            state["bsr_sensitivity_scale"] = float(resolved_scale)
 
             mechanism_config = NoiseMechanismConfig(
                 mechanism=mechanism_config.mechanism,
@@ -2457,7 +2754,7 @@ class PrivacyEngine:
             )
 
             state = copy.deepcopy(mechanism_config.mechanism_state)
-            state["mf_sensitivity"] = float(resolved_mf_sensitivity)
+            state["bsr_mf_sensitivity"] = float(resolved_mf_sensitivity)
 
             mechanism_config = NoiseMechanismConfig(
                 mechanism=mechanism_config.mechanism,
@@ -2787,3 +3084,15 @@ class PrivacyEngine:
             grad_clip_scheduler.load_state_dict(grad_clip_scheduler_state_dict)
 
         return checkpoint
+    @staticmethod
+    def _raise_on_legacy_aliases(
+        *,
+        source_name: str,
+        payload: Dict[str, Any],
+        aliases: Dict[str, str],
+    ) -> None:
+        for legacy_name, canonical_name in aliases.items():
+            if payload.get(legacy_name) is not None:
+                raise ValueError(
+                    f"{source_name} uses removed alias `{legacy_name}`; use `{canonical_name}`"
+                )
