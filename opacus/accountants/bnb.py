@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+from typing import Any, Dict, Tuple
 from opacus.accountants.analysis.bnb import (
     estimate_b_min_sep_epsilon_monte_carlo,
     resolve_bnb_calibration_kwargs,
@@ -21,6 +22,86 @@ from opacus.accountants.analysis.bnb import (
 from opacus.accountants.analysis.bnb_preflight import validate_bnb_runtime_consistency
 
 from .accountant import IAccountant
+
+
+def resolve_bnb_b_min_sep_inputs(
+    *,
+    mechanism_state: Dict[str, Any],
+    sampling_semantics,
+    kwargs: Dict[str, Any],
+) -> Tuple[Any, int, Dict[str, Any]]:
+    state = mechanism_state if isinstance(mechanism_state, dict) else {}
+    metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
+    c_matrix = kwargs.get(
+        "bnb_c_matrix",
+        kwargs.get("c_matrix", state.get("bnb_c_matrix", state.get("c_matrix"))),
+    )
+
+    metadata_bands = metadata.get("bands")
+    explicit_bands = kwargs.get("bnb_bands")
+    if explicit_bands is not None and metadata_bands is not None:
+        if int(explicit_bands) != int(metadata_bands):
+            raise ValueError(
+                "bnb consistency check failed: sampling_semantics privacy_metadata['bands'] "
+                f"({int(metadata_bands)}) != accounting bands ({int(explicit_bands)})"
+            )
+
+    bands = kwargs.get("bnb_bands", metadata.get("bands", state.get("bnb_bands")))
+
+    c_matrix_contract = kwargs.get(
+        "bnb_c_matrix_contract",
+        kwargs.get(
+            "c_matrix_contract",
+            state.get("bnb_c_matrix_contract", state.get("c_matrix_contract")),
+        ),
+    )
+
+    if c_matrix is None or bands is None or c_matrix_contract is None:
+        raise ValueError(
+            "bnb calibration requires b_min_sep/balls_in_bins inputs: "
+            "`bnb_c_matrix`, `bnb_bands`, and `bnb_c_matrix_contract`"
+        )
+
+    return c_matrix, int(bands), c_matrix_contract
+
+
+def validate_bnb_accounting_runtime_consistency(
+    *,
+    mechanism_state: Dict[str, Any],
+    sampling_semantics,
+    c_matrix: Any,
+    bands: int,
+    c_matrix_contract: Dict[str, Any],
+) -> None:
+    validate_bnb_runtime_consistency(
+        mechanism_state=mechanism_state,
+        sampling_semantics=sampling_semantics,
+        c_matrix=c_matrix,
+        bands=int(bands),
+        c_matrix_contract=c_matrix_contract,
+        coeffs_error_prefix="bnb consistency check",
+    )
+
+
+def validate_bnb_sampling_policy(
+    *,
+    sampling_semantics,
+    mechanism: str,
+) -> None:
+    if mechanism != "bnb" or sampling_semantics is None:
+        return
+    mode = sampling_semantics.sampling_mode
+    if mode == "b_min_sep":
+        raise ValueError(
+            "b_min_sep sampling is temporarily disabled pending p-aware BNB accounting; "
+            "use sampling_mode='balls_in_bins'"
+        )
+
+    if mode not in ("balls_in_bins",):
+        raise ValueError(
+            "bnb mechanism requires sampling_semantics in "
+            "{'balls_in_bins'}"
+        )
 
 
 class BNBAccountant(IAccountant):

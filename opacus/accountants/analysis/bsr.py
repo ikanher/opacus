@@ -21,9 +21,6 @@ from opacus.accountants.analysis import rdp as rdp_analysis
 
 # Opacus MF paper-comment convention for this file:
 # - Short tags: `BSR (Kalinin and Lampert, 2024)`, `BandMF (Choquette-Choo et al., 2023)`.
-# - Math-note format: one intuition line + one compact equation + variable mapping.
-# - Inline variable map at first semantic use in each function.
-# - Scope note: document implemented BSR/BandMF paths only (no AOF commentary).
 
 
 def generate_bsr_coeffs_from_sgd_workload(
@@ -142,21 +139,18 @@ def compute_bsr_mf_sensitivity_from_coeffs(
     steps: int,
     max_participations: int,
     min_separation: int,
-    require_nonnegative_decreasing: bool = True,
 ) -> float:
     """
     Compute fixed-batch MF sensitivity from BSR Toeplitz coefficients.
 
-    In the fixed-batch BSR path, accounting needs one scalar sensitivity term
-    that captures how much the encoded stream can change under the
-    ``(k, b)`` participation contract. This function computes that term directly
-    from Toeplitz coefficients and a finite horizon ``steps``.
+    In the fixed-batch BSR, accounting needs one scalar sensitivity term that
+    captures how much the encoded stream can change under the ``(k, b)``
+    participation contract. This function computes that term directly from
+    Toeplitz coefficients and a finite horizon ``steps``.
 
     Math:
     ``S_{k,b}(C;T) = (sum_i (sum_j c_{i-jb})^2)^{1/2}``, where
     ``T=steps``, ``k=max_participations``, ``b=min_separation``.
-    The optional monotonicity check enforces the nonnegative/decreasing regime
-    assumed by the closed-form implementation path.
 
     Source: BSR (Kalinin and Lampert, 2024), Section 3.2, Equation (10), Theorem 2.
     """
@@ -173,7 +167,7 @@ def compute_bsr_mf_sensitivity_from_coeffs(
         min_separation=min_separation,
     )
 
-    if require_nonnegative_decreasing and not _is_nonnegative_decreasing(coeff_list):
+    if not _is_nonnegative_decreasing(coeff_list):
         raise ValueError(
             "BSR closed-form sensitivity requires nonnegative decreasing coefficients"
         )
@@ -213,7 +207,8 @@ def compute_bsr_kappa_from_coeffs(
     ``κ(T) = (Σ_{t=0}^{min(T,b)-1} c_t^2)^{1/2}``, where ``c_t`` are Toeplitz
     coefficients and ``b`` is the coefficient truncation width.
 
-    Source: BSR (Kalinin and Lampert, 2024), Section 3.2 and Equation (10) (finite-horizon specialization).
+    Source: BSR (Kalinin and Lampert, 2024), Section 3.2 and Equation (10),
+        finite-horizon Toeplitz column-norm scale from BSR coeff parameterization.
     """
     coeff_list = [float(c) for c in coeffs]
     if len(coeff_list) == 0:
@@ -243,10 +238,12 @@ def calibrate_bsr_z_std(
     a simple rescaling of the reference multiplier by clipping and denominator
     terms used by the training loop.
 
-    Math:
-    ``z_std = noise_multiplier_ref * max_grad_norm / denominator``.
+    - noise_multiplier_ref is the DP accountant-scale multiplier.
+    - max_grad_norm is clipping norm.
+    - denominator is chosen by loss reduction:
+      - 1 for "sum"
+      - expected_batch_size for "mean"
 
-    Source: BSR (Kalinin and Lampert, 2024). TBD: Look up section number.
     """
     if noise_multiplier_ref <= 0.0:
         raise ValueError("noise_multiplier_ref must be > 0")
@@ -274,14 +271,6 @@ def bsr_fixed_batch_epsilon_upper_bound(
     After reducing the mechanism to an effective Gaussian release with
     ``sigma_eff = noise_multiplier / mf_sensitivity``, we reuse Opacus'
     canonical RDP utilities to convert to ``(epsilon, delta)`` at one step.
-    This docstring is intentionally explicit because this reduction is the
-    key contract between matrix sensitivity code and the generic accountant.
-
-    Math:
-    ``sigma_eff = noise_multiplier / mf_sensitivity`` and then standard
-    Gaussian-mechanism RDP conversion.
-
-    Source: AnalyticGM (Balle and Wang, 2018), Theorem 8 (Gaussian calibration form).
     """
     if noise_multiplier <= 0.0:
         raise ValueError("noise_multiplier must be > 0")
@@ -328,10 +317,13 @@ def bsr_cyclic_poisson_epsilon_upper_bound(
     ``q = b·p`` and the number of composed steps is ``⌈T / b⌉``.
     We then delegate to the standard RDP machinery.
 
-    This is the accounting reduction used by the amplified BandMF-style path
-    in this repository.
+    This is the accounting reduction used by the amplified BandMF-style path.
 
-    Source: BandMF (Choquette-Choo et al., 2023), Section 5 and Theorems `thm:sampling-amplification`, `thm:general-amplification` (TBD: Look up section number.).
+    Derived from BandMF cyclic amplification reduction:
+
+        (q_eff = b·p, T_eff = ceil(T/b)),
+
+    then evaluated with standard sampled-Gaussian RDP conversion.”
     """
     if noise_multiplier <= 0.0:
         raise ValueError("noise_multiplier must be > 0")

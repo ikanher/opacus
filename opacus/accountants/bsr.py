@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any, Dict, Optional
 
 from opacus.accountants.analysis.bsr import (
     compute_bsr_mf_sensitivity_from_coeffs,
@@ -26,6 +27,212 @@ from opacus.accountants.analysis.bsr import (
 from .accountant import IAccountant
 
 
+def resolve_bsr_mf_sensitivity_for_fixed_batch(
+    *,
+    mechanism_state: Dict[str, Any],
+    sampling_semantics,
+    steps: int,
+    sample_rate: Optional[float],
+    kwargs: Dict[str, Any],
+) -> float:
+    metadata = (
+        sampling_semantics.privacy_metadata
+        if sampling_semantics is not None
+        else {}
+    )
+    _raise_if_fixed_batch_has_cyclic_only_params(
+        mechanism_state=mechanism_state,
+        metadata=metadata,
+        kwargs=kwargs,
+    )
+
+    (
+        coeffs,
+        max_participations,
+        min_separation,
+        sensitivity_steps,
+        mf_sensitivity,
+        explicit_mf_sensitivity_override,
+    ) = BSRAccountant._resolve_fixed_batch_contract_inputs(
+        state=mechanism_state,
+        metadata=metadata,
+        kwargs=kwargs,
+        total_steps=int(steps),
+        sample_rate=float(sample_rate) if sample_rate is not None else None,
+    )
+
+    return BSRAccountant._resolve_fixed_batch_mf_sensitivity(
+        coeffs=coeffs,
+        max_participations=max_participations,
+        min_separation=min_separation,
+        sensitivity_steps=sensitivity_steps,
+        mf_sensitivity=mf_sensitivity,
+        explicit_mf_sensitivity_override=explicit_mf_sensitivity_override,
+    )
+
+
+def resolve_bsr_sensitivity_scale_for_cyclic(
+    *,
+    mechanism_state: Dict[str, Any],
+    sampling_semantics,
+    steps: int,
+    kwargs: Dict[str, Any],
+) -> float:
+    metadata = (
+        sampling_semantics.privacy_metadata
+        if sampling_semantics is not None
+        else {}
+    )
+    _raise_if_cyclic_has_fixed_batch_only_params(
+        mechanism_state=mechanism_state,
+        metadata=metadata,
+        kwargs=kwargs,
+    )
+
+    bands = kwargs.get(
+        "bsr_bands",
+        metadata.get("bands", mechanism_state.get("bsr_bands")),
+    )
+    if bands is None:
+        coeffs = mechanism_state.get("coeffs")
+        bands = len(coeffs) if coeffs is not None else None
+
+    if bands is None:
+        raise ValueError(
+            "cyclic_poisson bsr requires `bands` in sampling semantics metadata, "
+            "`bsr_bands`, or derivable from coeffs"
+        )
+
+    return BSRAccountant._resolve_cyclic_sensitivity_scale(
+        state=mechanism_state,
+        metadata=metadata,
+        kwargs=kwargs,
+        total_steps=int(steps),
+        bands=int(bands),
+    )
+
+
+def _raise_if_fixed_batch_has_cyclic_only_params(
+    *,
+    mechanism_state: Dict[str, Any],
+    metadata: Dict[str, Any],
+    kwargs: Dict[str, Any],
+) -> None:
+    cyclic_only_params = []
+
+    _raise_on_legacy_aliases(
+        source_name="kwargs",
+        payload=kwargs,
+        aliases={"sensitivity_scale": "bsr_sensitivity_scale"},
+    )
+
+    _raise_on_legacy_aliases(
+        source_name="privacy_metadata",
+        payload=metadata,
+        aliases={"sensitivity_scale": "bsr_sensitivity_scale"},
+    )
+
+    _raise_on_legacy_aliases(
+        source_name="mechanism_state",
+        payload=mechanism_state,
+        aliases={"sensitivity_scale": "bsr_sensitivity_scale"},
+    )
+
+    if kwargs.get("bsr_sensitivity_scale") is not None:
+        cyclic_only_params.append("bsr_sensitivity_scale")
+
+    if metadata.get("bsr_sensitivity_scale") is not None:
+        cyclic_only_params.append("privacy_metadata['bsr_sensitivity_scale']")
+
+    if mechanism_state.get("bsr_sensitivity_scale") is not None:
+        cyclic_only_params.append("mechanism_state['bsr_sensitivity_scale']")
+
+    if cyclic_only_params:
+        raise ValueError(
+            "fixed-batch bsr accounting received cyclic-only parameters: "
+            + ", ".join(cyclic_only_params)
+        )
+
+
+def _raise_if_cyclic_has_fixed_batch_only_params(
+    *,
+    mechanism_state: Dict[str, Any],
+    metadata: Dict[str, Any],
+    kwargs: Dict[str, Any],
+) -> None:
+    fixed_only_params = []
+    _raise_on_legacy_aliases(
+        source_name="kwargs",
+        payload=kwargs,
+        aliases={
+            "mf_sensitivity": "bsr_mf_sensitivity",
+            "max_participations": "bsr_max_participations",
+            "min_separation": "bsr_min_separation",
+            "iterations_number": "bsr_iterations_number",
+        },
+    )
+    _raise_on_legacy_aliases(
+        source_name="privacy_metadata",
+        payload=metadata,
+        aliases={
+            "mf_sensitivity": "bsr_mf_sensitivity",
+            "max_participations": "bsr_max_participations",
+            "min_separation": "bsr_min_separation",
+            "iterations_number": "bsr_iterations_number",
+        },
+    )
+    _raise_on_legacy_aliases(
+        source_name="mechanism_state",
+        payload=mechanism_state,
+        aliases={
+            "mf_sensitivity": "bsr_mf_sensitivity",
+            "max_participations": "bsr_max_participations",
+            "min_separation": "bsr_min_separation",
+            "iterations_number": "bsr_iterations_number",
+        },
+    )
+    if kwargs.get("bsr_mf_sensitivity") is not None:
+        fixed_only_params.append("bsr_mf_sensitivity")
+
+    if kwargs.get("bsr_max_participations") is not None:
+        fixed_only_params.append("bsr_max_participations")
+
+    if kwargs.get("bsr_min_separation") is not None:
+        fixed_only_params.append("bsr_min_separation")
+
+    if metadata.get("bsr_mf_sensitivity") is not None:
+        fixed_only_params.append("privacy_metadata['bsr_mf_sensitivity']")
+
+    if metadata.get("bsr_max_participations") is not None:
+        fixed_only_params.append("privacy_metadata['bsr_max_participations']")
+
+    if metadata.get("bsr_min_separation") is not None:
+        fixed_only_params.append("privacy_metadata['bsr_min_separation']")
+
+    if mechanism_state.get("bsr_mf_sensitivity") is not None:
+        fixed_only_params.append("mechanism_state['bsr_mf_sensitivity']")
+
+    if mechanism_state.get("bsr_max_participations") is not None:
+        fixed_only_params.append("mechanism_state['bsr_max_participations']")
+
+    if mechanism_state.get("bsr_min_separation") is not None:
+        fixed_only_params.append("mechanism_state['bsr_min_separation']")
+
+    if fixed_only_params:
+        raise ValueError(
+            "cyclic-poisson bandmf accounting received fixed-batch-only parameters: "
+            + ", ".join(fixed_only_params)
+        )
+
+
+def _raise_on_legacy_aliases(*, source_name: str, payload: dict, aliases: dict) -> None:
+    for legacy_name, canonical_name in aliases.items():
+        if payload.get(legacy_name) is not None:
+            raise ValueError(
+                f"{source_name} uses removed alias `{legacy_name}`; use `{canonical_name}`"
+            )
+
+
 class BSRAccountant(IAccountant):
     """
     Accountant adapter for BSR-family mechanisms.
@@ -33,14 +240,10 @@ class BSRAccountant(IAccountant):
     This class is the runtime bridge between mechanism metadata and the two
     supported accounting reductions:
     1. fixed-batch BSR using matrix-factorization sensitivity ``S_{k,b}(C;T)``;
-    2. cyclic-poisson BSR/BandMF using ``kappa(T)`` plus sampled-Gaussian RDP composition.
-
-    The high-level contract is: infer the right branch from sampling semantics,
-    resolve the needed sensitivity scale from explicit metadata or coefficients,
-    and delegate epsilon computation to analysis helpers.
+    2. cyclic-poisson BSR/BandMF using ``κ(T)`` plus sampled-Gaussian RDP composition.
 
     Source: BSR (Kalinin and Lampert, 2024), Section 3.2, Equation (10), Theorem 2; and
-    BandMF (Choquette-Choo et al., 2023), Section 5 and Theorems `thm:sampling-amplification`, `thm:general-amplification` (TBD: Look up section number.).
+    BandMF (Choquette-Choo et al., 2023), Section 5 and Theorems 4 and 5.
     """
 
     def __init__(self):
@@ -108,6 +311,7 @@ class BSRAccountant(IAccountant):
             if sampling_semantics is not None
             else "torch_sampler"
         )
+
         return state, metadata, sampling_mode
 
     @staticmethod
@@ -123,8 +327,8 @@ class BSRAccountant(IAccountant):
         Resolve the cyclic-path sensitivity normalization scale.
 
         Cyclic accounting expects ``bsr_sensitivity_scale`` (interpreted as
-        ``kappa(T)``). We prefer explicit metadata when provided; otherwise we
-        derive ``kappa(T)`` from Toeplitz coefficients over the resolved horizon.
+        ``κ(T)``). We prefer explicit metadata when provided; otherwise we
+        derive ``κ(T)`` from Toeplitz coefficients over the resolved horizon.
         """
         explicit_scale = kwargs.get(
             "bsr_sensitivity_scale",
@@ -197,7 +401,7 @@ class BSRAccountant(IAccountant):
         ``σ_eff = σ / κ(T)``.
         We then delegate to sampled-Gaussian/RDP composition.
 
-        Source: BandMF (Choquette-Choo et al., 2023), Section 5 and Theorems `thm:sampling-amplification`, `thm:general-amplification` (TBD: Look up section number.).
+        Source: BandMF (Choquette-Choo et al., 2023), Section 5 and Theorems 4 and 5.
         """
         bands = metadata.get("bands", None)
         if bands is None:
@@ -244,9 +448,8 @@ class BSRAccountant(IAccountant):
         """
         Resolve all fixed-batch sensitivity inputs from kwargs/state/metadata.
 
-        This collects the parameter tuple needed by
-        ``S_{k,b}(C;T)``-based accounting and applies branch defaults when
-        fields are omitted.
+        This collects the parameter tuple needed by ``S_{k,b}(C;T)``-based
+        accounting and applies branch defaults when fields are omitted.
         """
         mf_sensitivity = kwargs.get(
             "bsr_mf_sensitivity",
@@ -255,6 +458,7 @@ class BSRAccountant(IAccountant):
                 state.get("bsr_mf_sensitivity"),
             ),
         )
+
         explicit_mf_sensitivity_override = "bsr_mf_sensitivity" in kwargs
         coeffs = state.get("coeffs")
         max_participations = kwargs.get(
@@ -264,6 +468,7 @@ class BSRAccountant(IAccountant):
                 state.get("bsr_max_participations"),
             ),
         )
+
         min_separation = kwargs.get(
             "bsr_min_separation",
             metadata.get(
@@ -279,6 +484,7 @@ class BSRAccountant(IAccountant):
                 state.get("bsr_iterations_number"),
             ),
         )
+
         if sensitivity_steps is None:
             sensitivity_steps = total_steps
 
@@ -317,7 +523,7 @@ class BSRAccountant(IAccountant):
 
         If explicit sensitivity is missing, derive it from coefficients. If an
         explicit override is present and coefficients are available, validate
-        the override against the derived value to avoid contract drift.
+        the override against the derived value.
         """
         if mf_sensitivity is None:
             if coeffs is None:
@@ -432,9 +638,6 @@ class BSRAccountant(IAccountant):
 
         - ``sampling_mode == "cyclic_poisson"``: cyclic contract accounting.
         - otherwise: fixed-batch BSR accounting.
-
-        The method also enforces canonical parameter names and rejects removed
-        aliases to keep mechanism/accountant wiring unambiguous.
         """
         if not self.history:
             return 0.0
@@ -506,6 +709,7 @@ class BSRAccountant(IAccountant):
     @classmethod
     def mechanism(cls) -> str:
         return "bsr"
+
     @staticmethod
     def _raise_on_legacy_aliases(*, source_name: str, payload: dict, aliases: dict) -> None:
         for legacy_name, canonical_name in aliases.items():

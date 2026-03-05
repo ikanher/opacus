@@ -548,8 +548,9 @@ class CyclicPoissonSampler(Sampler[List[int]]):
       independently with probability ``q = batch_size / partition_size``.
     Constructor semantics: `bands=b`, `steps=T`, implicit `q=batch_size/partition_size`.
 
-    Source: BandMF (Choquette-Choo et al., 2023), Section 5 and Theorems `thm:sampling-amplification`, `thm:general-amplification` (TBD: Look up section number.).
-    Math: cyclic Poisson uses one active partition ``P_{t mod b}`` per step and
+    Source: BandMF (Choquette-Choo et al., 2023), Section 5 and Theorems 4 and 5.
+
+    Cyclic Poisson uses one active partition ``P_{t mod b}`` per step and
     samples each active item with ``q = m / |P_{t mod b}|``.
     """
 

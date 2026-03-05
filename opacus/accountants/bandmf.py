@@ -35,7 +35,7 @@ class BandMFAccountant(IAccountant):
     Math branch:
     ``q = b·p``, ``N_{cycles} = ⌈T / b⌉``.
 
-    Source: BandMF (Choquette-Choo et al., 2023), Section 5 and Theorems `thm:sampling-amplification`, `thm:general-amplification` (TBD: Look up section number.).
+    Source: BandMF (Choquette-Choo et al., 2023), Section 5 and Theorems 4 and 5.
     """
 
     def __init__(self):
@@ -105,7 +105,7 @@ class BandMFAccountant(IAccountant):
         3. normalize runtime noise by ``bsr_sensitivity_scale``,
         4. compose sampled-Gaussian RDP over the derived contract.
 
-        Source: BandMF (Choquette-Choo et al., 2023), Section 5 and Theorems `thm:sampling-amplification`, `thm:general-amplification` (TBD: Look up section number.).
+        Source: BandMF (Choquette-Choo et al., 2023), Section 5 and Theorems 4 and 5.
         """
         if not self.history:
             return 0.0
