@@ -17,6 +17,9 @@ from __future__ import annotations
 import math
 from typing import Any, Dict, Optional
 
+from opacus.accountants.analysis.bisr import (
+    compute_bisr_mf_sensitivity_upper_bound_from_coeffs,
+)
 from opacus.accountants.analysis.bsr import (
     compute_bsr_mf_sensitivity_from_coeffs,
     compute_bsr_kappa_from_coeffs,
@@ -64,6 +67,7 @@ def resolve_bsr_mf_sensitivity_for_fixed_batch(
     )
 
     return BSRAccountant._resolve_fixed_batch_mf_sensitivity(
+        mechanism="bsr",
         coeffs=coeffs,
         max_participations=max_participations,
         min_separation=min_separation,
@@ -479,6 +483,7 @@ class BSRAccountant(IAccountant):
     @staticmethod
     def _resolve_fixed_batch_mf_sensitivity(
         *,
+        mechanism: str,
         coeffs,
         max_participations: int,
         min_separation: int,
@@ -491,14 +496,20 @@ class BSRAccountant(IAccountant):
 
         If explicit sensitivity is missing, derive it from coefficients. If an
         explicit override is present and coefficients are available, validate
-        the override against the derived value.
+        the override against the derived value for the selected mechanism.
         """
-        if mf_sensitivity is None:
-            if coeffs is None:
-                raise ValueError(
-                    "fixed-batch bsr accounting requires MF sensitivity or "
-                    "enough data to derive it: "
-                    "`coeffs`, `max_participations`, `min_separation`"
+        if mechanism not in ("bsr", "bisr"):
+            raise ValueError("mechanism must be one of {'bsr', 'bisr'}")
+
+        def _derive_from_coeffs() -> float:
+            if mechanism == "bisr":
+                return float(
+                    compute_bisr_mf_sensitivity_upper_bound_from_coeffs(
+                        coeffs=coeffs,
+                        steps=sensitivity_steps,
+                        max_participations=int(max_participations),
+                        min_separation=int(min_separation),
+                    )
                 )
 
             return float(
@@ -510,20 +521,23 @@ class BSRAccountant(IAccountant):
                 )
             )
 
+        if mf_sensitivity is None:
+            if coeffs is None:
+                raise ValueError(
+                    "fixed-batch bsr accounting requires MF sensitivity or "
+                    "enough data to derive it: "
+                    "`coeffs`, `max_participations`, `min_separation`"
+                )
+
+            return _derive_from_coeffs()
+
         mf_sensitivity = float(mf_sensitivity)
         if not math.isfinite(mf_sensitivity) or mf_sensitivity <= 0.0:
             raise ValueError("bsr_mf_sensitivity must be finite and > 0")
         if (
             explicit_mf_sensitivity_override and coeffs is not None
         ):
-            derived = float(
-                compute_bsr_mf_sensitivity_from_coeffs(
-                    coeffs=coeffs,
-                    steps=sensitivity_steps,
-                    max_participations=int(max_participations),
-                    min_separation=int(min_separation),
-                )
-            )
+            derived = _derive_from_coeffs()
             if not math.isfinite(derived) or derived <= 0.0:
                 raise ValueError(
                     "derived bsr_mf_sensitivity must be finite and > 0 "
@@ -561,6 +575,7 @@ class BSRAccountant(IAccountant):
 
         Source: BSR (Kalinin and Lampert, 2024), Section 3.2, Equation (10), Theorem 2.
         """
+        mechanism = str(state.get("_noise_mechanism", "bsr"))
         (
             coeffs,
             max_participations,
@@ -577,6 +592,7 @@ class BSRAccountant(IAccountant):
         )
 
         resolved_mf_sensitivity = BSRAccountant._resolve_fixed_batch_mf_sensitivity(
+            mechanism=mechanism,
             coeffs=coeffs,
             max_participations=max_participations,
             min_separation=min_separation,
@@ -589,7 +605,7 @@ class BSRAccountant(IAccountant):
             mf_sensitivity=float(resolved_mf_sensitivity),
         )
         self.last_contract = {
-            "mechanism": "bsr",
+            "mechanism": mechanism,
             "accounting_mode": "fixed_batch_prv",
             "sampling_mode": "torch_sampler",
             "global_steps": int(total_steps),

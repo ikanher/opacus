@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 
+import math
+
 import torch
 import pytest
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from opacus import NoiseMechanismConfig, PrivacyEngine
+from opacus.accountants.utils import get_noise_multiplier
 from opacus.optimizers import CorrelatedNoiseMechanism
 
 import opacus.privacy_engine as pe_mod
@@ -93,3 +96,35 @@ def test_make_private_with_epsilon_bisr_fixed_batch_resolves_mf_sensitivity(monk
     assert float(captured["bsr_mf_sensitivity"]) > 0.0
     assert pe.noise_mechanism_config.mechanism_state["coeff_source"] == "analytical_auto"
     assert float(pe.noise_mechanism_config.mechanism_state["bsr_mf_sensitivity"]) > 0.0
+
+
+def test_bisr_fixed_batch_noise_search_accepts_explicit_mf_sensitivity() -> None:
+    pe = PrivacyEngine()
+    coeffs = [1.0, -0.5, -0.125, -0.0625, -0.0390625]
+    state = {"coeffs": coeffs, "bsr_bands": 5, "_noise_mechanism": "bisr"}
+    semantics = pe_mod.SamplingSemantics(
+        sampling_mode="torch_sampler",
+        privacy_metadata={},
+    )
+
+    resolved = pe._resolve_bisr_mf_sensitivity_for_fixed_batch(
+        mechanism_state=state,
+        sampling_semantics=semantics,
+        steps=2000,
+        sample_rate=0.01,
+        kwargs={},
+    )
+
+    sigma = get_noise_multiplier(
+        target_epsilon=8.0,
+        target_delta=1e-5,
+        sample_rate=0.01,
+        steps=2000,
+        accountant="bsr",
+        mechanism_state=state,
+        sampling_semantics=semantics,
+        bsr_mf_sensitivity=resolved,
+    )
+
+    assert math.isfinite(float(sigma))
+    assert float(sigma) > 0.0

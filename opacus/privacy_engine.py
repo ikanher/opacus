@@ -196,9 +196,14 @@ class PrivacyEngine:
             return mechanism_config
 
         state = copy.deepcopy(mechanism_config.mechanism_state)
+        state["_noise_mechanism"] = mechanism_config.mechanism
         coeffs = state.get("coeffs")
         if isinstance(coeffs, (list, tuple)) and len(coeffs) > 0:
-            return mechanism_config
+            return NoiseMechanismConfig(
+                mechanism=mechanism_config.mechanism,
+                accounting_mode=mechanism_config.accounting_mode,
+                mechanism_state=state,
+            )
 
         if mechanism_config.mechanism in ("bsr", "bisr") and (
             sampling_semantics is None
@@ -259,6 +264,16 @@ class PrivacyEngine:
             accounting_mode=mechanism_config.accounting_mode,
             mechanism_state=state,
         )
+
+    @staticmethod
+    def _annotate_mechanism_state(
+        *,
+        mechanism: str,
+        mechanism_state: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        state = copy.deepcopy(mechanism_state)
+        state["_noise_mechanism"] = mechanism
+        return state
 
     @staticmethod
     def _resolve_uniform_sgd_workload_from_optimizer(
@@ -1342,7 +1357,10 @@ class PrivacyEngine:
                 sample_rate=sample_rate,
                 steps=total_steps,
                 accountant=active_accountant.mechanism(),
-                mechanism_state=mechanism_config.mechanism_state,
+                mechanism_state=self._annotate_mechanism_state(
+                    mechanism=mechanism_config.mechanism,
+                    mechanism_state=mechanism_config.mechanism_state,
+                ),
                 sampling_semantics=sampling_semantics,
                 bsr_mf_sensitivity=bsr_mf_sensitivity,
                 **nm_kwargs,
@@ -1427,7 +1445,10 @@ class PrivacyEngine:
             sample_rate=sample_rate,
             steps=implied_steps,
             accountant=active_accountant.mechanism(),
-            mechanism_state=mechanism_config.mechanism_state,
+            mechanism_state=self._annotate_mechanism_state(
+                mechanism=mechanism_config.mechanism,
+                mechanism_state=mechanism_config.mechanism_state,
+            ),
             sampling_semantics=sampling_semantics,
             bsr_mf_sensitivity=bsr_mf_sensitivity,
             **nm_kwargs,
@@ -2469,6 +2490,7 @@ class PrivacyEngine:
                     kwargs=kwargs,
                 )
             state = copy.deepcopy(mechanism_config.mechanism_state)
+            state["_noise_mechanism"] = mechanism_config.mechanism
             state["bsr_sensitivity_scale"] = float(resolved_scale)
 
             mechanism_config = NoiseMechanismConfig(
@@ -2513,6 +2535,7 @@ class PrivacyEngine:
                 )
 
             state = copy.deepcopy(mechanism_config.mechanism_state)
+            state["_noise_mechanism"] = mechanism_config.mechanism
             state["bsr_mf_sensitivity"] = float(resolved_mf_sensitivity)
 
             mechanism_config = NoiseMechanismConfig(
