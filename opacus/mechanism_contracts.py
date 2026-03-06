@@ -130,28 +130,28 @@ class NoiseMechanismConfig:
 
         if (
             mechanism == "bandmf"
-            and self.accounting_mode != "bandmf_accountant"
+            and self.accounting_mode not in ("bandmf_accountant", "bnb_accountant")
         ):
             raise ValueError(
-                "bandmf mechanism requires bandmf_accountant "
+                "bandmf mechanism requires bandmf_accountant or bnb_accountant "
                 "for authoritative accounting"
             )
 
         if (
             mechanism == "bsr"
-            and self.accounting_mode != "bsr_accountant"
+            and self.accounting_mode not in ("bsr_accountant", "bnb_accountant")
         ):
             raise ValueError(
-                "bsr mechanism requires bsr_accountant "
+                "bsr mechanism requires bsr_accountant or bnb_accountant "
                 "for authoritative accounting"
             )
 
         if (
             mechanism == "bisr"
-            and self.accounting_mode != "bsr_accountant"
+            and self.accounting_mode not in ("bsr_accountant", "bnb_accountant")
         ):
             raise ValueError(
-                "bisr mechanism requires bsr_accountant "
+                "bisr mechanism requires bsr_accountant or bnb_accountant "
                 "for authoritative accounting"
             )
 

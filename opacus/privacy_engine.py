@@ -47,6 +47,7 @@ from opacus.accountants.analysis.bisr import (
 )
 from opacus.accountants.analysis.bnb import (
     BNBCalibrationStatus,
+    build_bnb_toeplitz_c_matrix_and_contract,
     calibrate_b_min_sep_noise_multiplier_monte_carlo,
     describe_bnb_calibration_report,
     make_bnb_calibration_report,
@@ -496,10 +497,12 @@ class PrivacyEngine:
             )
 
     @staticmethod
-    def _accountant_for_mechanism(*, mechanism: str, default_accountant):
-        if mechanism in ("bandmf", "bsr", "bnb"):
-            return create_accountant(mechanism=mechanism)
-        if mechanism == "bisr":
+    def _accountant_for_mechanism(*, mechanism_config: NoiseMechanismConfig, default_accountant):
+        if mechanism_config.accounting_mode == "bnb_accountant":
+            return create_accountant(mechanism="bnb")
+        if mechanism_config.mechanism in ("bandmf", "bsr", "bnb"):
+            return create_accountant(mechanism=mechanism_config.mechanism)
+        if mechanism_config.mechanism == "bisr":
             return create_accountant(mechanism="bsr")
 
         return default_accountant
@@ -1066,7 +1069,10 @@ class PrivacyEngine:
         *,
         sampling_semantics: Optional[SamplingSemantics],
         mechanism: str,
+        accounting_mode: str,
     ) -> None:
+        if accounting_mode != "bnb_accountant":
+            return
         validate_bnb_sampling_policy_helper(
             sampling_semantics=sampling_semantics,
             mechanism=mechanism,
@@ -1091,6 +1097,7 @@ class PrivacyEngine:
             Section 4 and Section 5, Equations (2)-(4), Theorem 5.1.
         """
         mechanism = mechanism_config.mechanism
+        accounting_mode = mechanism_config.accounting_mode
         if mechanism in ("bandmf", "bsr", "bisr") and poisson_sampling:
             raise ValueError(
                 f"{mechanism} mechanism requires fixed-batch semantics; "
@@ -1101,11 +1108,21 @@ class PrivacyEngine:
             if sampling_semantics is None:
                 raise ValueError(
                     "bandmf mechanism requires explicit sampling_semantics "
-                    "with sampling_mode='cyclic_poisson'"
+                    "with sampling_mode in {'cyclic_poisson', 'balls_in_bins'}"
                 )
-            if sampling_semantics.sampling_mode != "cyclic_poisson":
+            if (
+                accounting_mode == "bandmf_accountant"
+                and sampling_semantics.sampling_mode != "cyclic_poisson"
+            ):
                 raise ValueError(
-                    "bandmf mechanism supports sampling_mode='cyclic_poisson' only in this phase"
+                    "bandmf mechanism with bandmf_accountant supports sampling_mode='cyclic_poisson' only in this phase"
+                )
+            if (
+                accounting_mode == "bnb_accountant"
+                and sampling_semantics.sampling_mode != "balls_in_bins"
+            ):
+                raise ValueError(
+                    "bandmf mechanism with bnb_accountant requires sampling_mode='balls_in_bins'"
                 )
 
         if mechanism == "bnb" and poisson_sampling:
@@ -1123,6 +1140,7 @@ class PrivacyEngine:
         self._validate_bnb_sampling_policy(
             sampling_semantics=sampling_semantics,
             mechanism=mechanism,
+            accounting_mode=accounting_mode,
         )
 
         if (
@@ -1136,10 +1154,10 @@ class PrivacyEngine:
         if (
             sampling_semantics is not None
             and sampling_semantics.sampling_mode == "balls_in_bins"
-            and mechanism != "bnb"
+            and mechanism not in ("bandmf", "bsr", "bisr", "bnb")
         ):
             raise ValueError(
-                "balls_in_bins sampling is supported only for mechanism='bnb'"
+                "balls_in_bins sampling is supported only for mechanism in {'bandmf', 'bsr', 'bisr', 'bnb'}"
             )
 
         if (
@@ -1246,7 +1264,7 @@ class PrivacyEngine:
         sampling_semantics: Optional[SamplingSemantics],
         kwargs: Dict[str, Any],
     ) -> Tuple[Optional[torch.Tensor], Optional[int], Optional[Dict[str, Any]]]:
-        if mechanism_config.mechanism != "bnb":
+        if mechanism_config.accounting_mode != "bnb_accountant":
             return None, None, None
 
         if (
@@ -1254,18 +1272,44 @@ class PrivacyEngine:
             or sampling_semantics.sampling_mode not in ("balls_in_bins",)
         ):
             raise ValueError(
-                "bnb calibration requires sampling_semantics with "
+                "balls-in-bins calibration requires sampling_semantics with "
                 "sampling_mode in {'balls_in_bins'}"
             )
+        mechanism_state = copy.deepcopy(mechanism_config.mechanism_state)
+        metadata = (
+            sampling_semantics.privacy_metadata
+            if sampling_semantics is not None
+            else {}
+        )
+        bands = metadata.get("bands", mechanism_state.get("bnb_bands", mechanism_state.get("bsr_bands")))
+        coeffs = mechanism_state.get("coeffs")
+        if (
+            mechanism_state.get("bnb_c_matrix") is None
+            and isinstance(coeffs, (list, tuple))
+            and len(coeffs) > 0
+            and bands is not None
+        ):
+            horizon = kwargs.get("total_steps")
+            if horizon is None:
+                horizon = kwargs.get("steps")
+            if horizon is not None:
+                c_matrix, c_matrix_contract = build_bnb_toeplitz_c_matrix_and_contract(
+                    coeffs=list(coeffs),
+                    bands=int(bands),
+                    horizon=int(horizon),
+                )
+                mechanism_state["bnb_c_matrix"] = c_matrix
+                mechanism_state["bnb_c_matrix_contract"] = c_matrix_contract
+                mechanism_state["bnb_bands"] = int(bands)
 
         bnb_c_matrix, bnb_bands, bnb_c_matrix_contract = self._resolve_bnb_b_min_sep_inputs(
-            mechanism_state=mechanism_config.mechanism_state,
+            mechanism_state=mechanism_state,
             sampling_semantics=sampling_semantics,
             kwargs=kwargs,
         )
 
         self._validate_bnb_accounting_runtime_consistency(
-            mechanism_state=mechanism_config.mechanism_state,
+            mechanism_state=mechanism_state,
             sampling_semantics=sampling_semantics,
             c_matrix=bnb_c_matrix,
             bands=int(bnb_bands),
@@ -1605,7 +1649,7 @@ class PrivacyEngine:
         nm_kwargs = dict(kwargs)
         nm_kwargs.pop("bsr_mf_sensitivity", None)
 
-        if mechanism_config.mechanism == "bnb":
+        if active_accountant.mechanism() == "bnb":
             return self._resolve_bnb_noise_multiplier_for_target_epsilon(
                 mechanism_config=mechanism_config,
                 target_epsilon=target_epsilon,
@@ -1645,11 +1689,7 @@ class PrivacyEngine:
         target_delta: float,
         kwargs: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        if (
-            mechanism != "bnb"
-            or bnb_c_matrix is None
-            or bnb_bands is None
-        ):
+        if bnb_c_matrix is None or bnb_bands is None:
             return None
 
         calibration_cfg = resolve_bnb_calibration_kwargs(
@@ -1701,7 +1741,7 @@ class PrivacyEngine:
         mechanism: str,
         kwargs: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        if mechanism != "bnb":
+        if mechanism not in ("bandmf", "bsr", "bisr", "bnb"):
             return None
 
         calibration_cfg = resolve_bnb_calibration_kwargs(
@@ -2075,7 +2115,7 @@ class PrivacyEngine:
             )
 
         active_accountant = self._accountant_for_mechanism(
-            mechanism=mechanism_config.mechanism,
+            mechanism_config=mechanism_config,
             default_accountant=self.default_accountant,
         )
 
@@ -2323,7 +2363,7 @@ class PrivacyEngine:
             )
 
         active_accountant = self._accountant_for_mechanism(
-            mechanism=mechanism_config.mechanism,
+            mechanism_config=mechanism_config,
             default_accountant=self.default_accountant,
         )
 

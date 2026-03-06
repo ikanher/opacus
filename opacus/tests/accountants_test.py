@@ -1046,6 +1046,64 @@ class AccountingTest(unittest.TestCase):
 
         self.assertGreater(noise_multiplier, 0.0)
 
+    def test_get_noise_multiplier_bsr_balls_in_bins_uses_bnb_accountant(self) -> None:
+        delta = 0.2
+        sample_rate = 0.25
+        epsilon = 0.5
+        epochs = 1
+        coeffs = [1.0, 0.2]
+        c_matrix = _lower_toeplitz_from_coeffs(coeffs, horizon=4)
+
+        noise_multiplier = get_noise_multiplier(
+            target_epsilon=epsilon,
+            target_delta=delta,
+            sample_rate=sample_rate,
+            epochs=epochs,
+            accountant="bnb",
+            mechanism_state={
+                "coeffs": coeffs,
+                "bsr_bands": 2,
+                "bnb_c_matrix": c_matrix,
+                "bnb_c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+                "_noise_mechanism": "bsr",
+            },
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 4, "bands": 2},
+            ),
+        )
+
+        self.assertGreater(noise_multiplier, 0.0)
+
+    def test_get_noise_multiplier_bisr_balls_in_bins_uses_bnb_accountant(self) -> None:
+        delta = 0.2
+        sample_rate = 0.25
+        epsilon = 0.5
+        epochs = 1
+        coeffs = [1.0, -0.5]
+        c_matrix = _lower_toeplitz_from_coeffs(coeffs, horizon=4)
+
+        noise_multiplier = get_noise_multiplier(
+            target_epsilon=epsilon,
+            target_delta=delta,
+            sample_rate=sample_rate,
+            epochs=epochs,
+            accountant="bnb",
+            mechanism_state={
+                "coeffs": coeffs,
+                "bsr_bands": 2,
+                "bnb_c_matrix": c_matrix,
+                "bnb_c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+                "_noise_mechanism": "bisr",
+            },
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 4, "bands": 2},
+            ),
+        )
+
+        self.assertGreater(noise_multiplier, 0.0)
+
     def test_bsr_accountant_default_calibration(self) -> None:
         target_epsilon = 1.0
         target_delta = 1e-5

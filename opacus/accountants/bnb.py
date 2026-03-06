@@ -46,7 +46,13 @@ def resolve_bnb_b_min_sep_inputs(
                 f"({int(metadata_bands)}) != accounting bands ({int(explicit_bands)})"
             )
 
-    bands = kwargs.get("bnb_bands", metadata.get("bands", state.get("bnb_bands")))
+    bands = kwargs.get(
+        "bnb_bands",
+        kwargs.get(
+            "bsr_bands",
+            metadata.get("bands", state.get("bnb_bands", state.get("bsr_bands"))),
+        ),
+    )
 
     c_matrix_contract = kwargs.get(
         "bnb_c_matrix_contract",
@@ -88,7 +94,7 @@ def validate_bnb_sampling_policy(
     sampling_semantics,
     mechanism: str,
 ) -> None:
-    if mechanism != "bnb" or sampling_semantics is None:
+    if mechanism not in ("bandmf", "bsr", "bisr", "bnb") or sampling_semantics is None:
         return
     mode = sampling_semantics.sampling_mode
     if mode == "b_min_sep":
@@ -99,7 +105,7 @@ def validate_bnb_sampling_policy(
 
     if mode not in ("balls_in_bins",):
         raise ValueError(
-            "bnb mechanism requires sampling_semantics in "
+            "balls-in-bins accountant path requires sampling_semantics in "
             "{'balls_in_bins'}"
         )
 
