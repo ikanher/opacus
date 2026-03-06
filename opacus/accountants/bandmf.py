@@ -147,21 +147,6 @@ class BandMFAccountant(IAccountant):
 
         state = mechanism_state if isinstance(mechanism_state, dict) else {}
         # `bsr_sensitivity_scale` corresponds to the mechanism sensitivity normalization.
-        self._raise_on_legacy_aliases(
-            source_name="kwargs",
-            payload=kwargs,
-            aliases={"sensitivity_scale": "bsr_sensitivity_scale"},
-        )
-        self._raise_on_legacy_aliases(
-            source_name="privacy_metadata",
-            payload=metadata,
-            aliases={"sensitivity_scale": "bsr_sensitivity_scale"},
-        )
-        self._raise_on_legacy_aliases(
-            source_name="mechanism_state",
-            payload=state,
-            aliases={"sensitivity_scale": "bsr_sensitivity_scale"},
-        )
         sensitivity_scale = kwargs.get(
             "bsr_sensitivity_scale",
             metadata.get(
@@ -207,10 +192,3 @@ class BandMFAccountant(IAccountant):
     @classmethod
     def mechanism(cls) -> str:
         return "bandmf"
-    @staticmethod
-    def _raise_on_legacy_aliases(*, source_name: str, payload: dict, aliases: dict) -> None:
-        for legacy_name, canonical_name in aliases.items():
-            if payload.get(legacy_name) is not None:
-                raise ValueError(
-                    f"{source_name} uses removed alias `{legacy_name}`; use `{canonical_name}`"
-                )

@@ -120,24 +120,6 @@ def _raise_if_fixed_batch_has_cyclic_only_params(
 ) -> None:
     cyclic_only_params = []
 
-    _raise_on_legacy_aliases(
-        source_name="kwargs",
-        payload=kwargs,
-        aliases={"sensitivity_scale": "bsr_sensitivity_scale"},
-    )
-
-    _raise_on_legacy_aliases(
-        source_name="privacy_metadata",
-        payload=metadata,
-        aliases={"sensitivity_scale": "bsr_sensitivity_scale"},
-    )
-
-    _raise_on_legacy_aliases(
-        source_name="mechanism_state",
-        payload=mechanism_state,
-        aliases={"sensitivity_scale": "bsr_sensitivity_scale"},
-    )
-
     if kwargs.get("bsr_sensitivity_scale") is not None:
         cyclic_only_params.append("bsr_sensitivity_scale")
 
@@ -161,36 +143,6 @@ def _raise_if_cyclic_has_fixed_batch_only_params(
     kwargs: Dict[str, Any],
 ) -> None:
     fixed_only_params = []
-    _raise_on_legacy_aliases(
-        source_name="kwargs",
-        payload=kwargs,
-        aliases={
-            "mf_sensitivity": "bsr_mf_sensitivity",
-            "max_participations": "bsr_max_participations",
-            "min_separation": "bsr_min_separation",
-            "iterations_number": "bsr_iterations_number",
-        },
-    )
-    _raise_on_legacy_aliases(
-        source_name="privacy_metadata",
-        payload=metadata,
-        aliases={
-            "mf_sensitivity": "bsr_mf_sensitivity",
-            "max_participations": "bsr_max_participations",
-            "min_separation": "bsr_min_separation",
-            "iterations_number": "bsr_iterations_number",
-        },
-    )
-    _raise_on_legacy_aliases(
-        source_name="mechanism_state",
-        payload=mechanism_state,
-        aliases={
-            "mf_sensitivity": "bsr_mf_sensitivity",
-            "max_participations": "bsr_max_participations",
-            "min_separation": "bsr_min_separation",
-            "iterations_number": "bsr_iterations_number",
-        },
-    )
     if kwargs.get("bsr_mf_sensitivity") is not None:
         fixed_only_params.append("bsr_mf_sensitivity")
 
@@ -223,14 +175,6 @@ def _raise_if_cyclic_has_fixed_batch_only_params(
             "cyclic-poisson bandmf accounting received fixed-batch-only parameters: "
             + ", ".join(fixed_only_params)
         )
-
-
-def _raise_on_legacy_aliases(*, source_name: str, payload: dict, aliases: dict) -> None:
-    for legacy_name, canonical_name in aliases.items():
-        if payload.get(legacy_name) is not None:
-            raise ValueError(
-                f"{source_name} uses removed alias `{legacy_name}`; use `{canonical_name}`"
-            )
 
 
 class BSRAccountant(IAccountant):
@@ -647,40 +591,6 @@ class BSRAccountant(IAccountant):
             mechanism_state=mechanism_state,
             sampling_semantics=sampling_semantics,
         )
-        self._raise_on_legacy_aliases(
-            source_name="kwargs",
-            payload=kwargs,
-            aliases={
-                "sensitivity_scale": "bsr_sensitivity_scale",
-                "mf_sensitivity": "bsr_mf_sensitivity",
-                "max_participations": "bsr_max_participations",
-                "min_separation": "bsr_min_separation",
-                "iterations_number": "bsr_iterations_number",
-            },
-        )
-        self._raise_on_legacy_aliases(
-            source_name="privacy_metadata",
-            payload=metadata,
-            aliases={
-                "sensitivity_scale": "bsr_sensitivity_scale",
-                "mf_sensitivity": "bsr_mf_sensitivity",
-                "max_participations": "bsr_max_participations",
-                "min_separation": "bsr_min_separation",
-                "iterations_number": "bsr_iterations_number",
-            },
-        )
-        self._raise_on_legacy_aliases(
-            source_name="mechanism_state",
-            payload=state,
-            aliases={
-                "sensitivity_scale": "bsr_sensitivity_scale",
-                "mf_sensitivity": "bsr_mf_sensitivity",
-                "max_participations": "bsr_max_participations",
-                "min_separation": "bsr_min_separation",
-                "iterations_number": "bsr_iterations_number",
-                "bands": "bsr_bands",
-            },
-        )
 
         if sampling_mode == "cyclic_poisson":
             return self._get_epsilon_cyclic(
@@ -709,11 +619,3 @@ class BSRAccountant(IAccountant):
     @classmethod
     def mechanism(cls) -> str:
         return "bsr"
-
-    @staticmethod
-    def _raise_on_legacy_aliases(*, source_name: str, payload: dict, aliases: dict) -> None:
-        for legacy_name, canonical_name in aliases.items():
-            if payload.get(legacy_name) is not None:
-                raise ValueError(
-                    f"{source_name} uses removed alias `{legacy_name}`; use `{canonical_name}`"
-                )

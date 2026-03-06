@@ -209,24 +209,6 @@ class BNBAccountant(IAccountant):
         )
 
         # `bands` is the min-separation/bin-width parameter in b-min-sep construction.
-        self._raise_on_legacy_aliases(
-            source_name="kwargs",
-            payload=kwargs,
-            aliases={
-                "c_matrix": "bnb_c_matrix",
-                "bands": "bnb_bands",
-                "c_matrix_contract": "bnb_c_matrix_contract",
-            },
-        )
-        self._raise_on_legacy_aliases(
-            source_name="mechanism_state",
-            payload=state,
-            aliases={
-                "c_matrix": "bnb_c_matrix",
-                "bands": "bnb_bands",
-                "c_matrix_contract": "bnb_c_matrix_contract",
-            },
-        )
         c_matrix = kwargs.get("bnb_c_matrix", state.get("bnb_c_matrix"))
         bands = kwargs.get("bnb_bands", metadata.get("bands", state.get("bnb_bands")))
         c_matrix_contract = kwargs.get(
@@ -307,10 +289,3 @@ class BNBAccountant(IAccountant):
     @classmethod
     def mechanism(cls) -> str:
         return "bnb"
-    @staticmethod
-    def _raise_on_legacy_aliases(*, source_name: str, payload: dict, aliases: dict) -> None:
-        for legacy_name, canonical_name in aliases.items():
-            if payload.get(legacy_name) is not None:
-                raise ValueError(
-                    f"{source_name} uses removed alias `{legacy_name}`; use `{canonical_name}`"
-                )
