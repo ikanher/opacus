@@ -799,27 +799,26 @@ class AccountingTest(unittest.TestCase):
                 sampling_semantics=sampling_semantics,
             )
 
-    def test_bandmf_accountant_rejects_legacy_sensitivity_scale_alias(self) -> None:
+    def test_bandmf_accountant_ignores_legacy_sensitivity_scale_kwarg(self) -> None:
         accountant = BandMFAccountant()
         accountant.history = [(1.0, 0.01, 100)]
         sampling_semantics = SamplingSemantics(
             sampling_mode="cyclic_poisson",
             privacy_metadata={"bands": 10},
         )
-        with self.assertRaisesRegex(
-            ValueError, "removed alias `sensitivity_scale`.*`bsr_sensitivity_scale`"
-        ):
-            accountant.get_epsilon(
-                delta=1e-5,
-                sampling_semantics=sampling_semantics,
-                sensitivity_scale=1.0,
-            )
+        epsilon = accountant.get_epsilon(
+            delta=1e-5,
+            sampling_semantics=sampling_semantics,
+            sensitivity_scale=1.0,
+        )
+        self.assertGreater(epsilon, 0.0)
 
-    def test_bsr_accountant_rejects_legacy_fixed_batch_aliases(self) -> None:
+    def test_bsr_accountant_legacy_fixed_batch_alias_is_not_used(self) -> None:
         accountant = BSRAccountant()
         accountant.history = [(1.0, 0.1, 10)]
         with self.assertRaisesRegex(
-            ValueError, "removed alias `mf_sensitivity`.*`bsr_mf_sensitivity`"
+            ValueError,
+            "requires MF sensitivity or enough data to derive it",
         ):
             accountant.get_epsilon(
                 delta=1e-5,
@@ -827,10 +826,10 @@ class AccountingTest(unittest.TestCase):
                     sampling_mode="torch_sampler",
                     privacy_metadata={},
                 ),
-                mf_sensitivity=1.0,
+                mf_sensitivity=1.0,  # legacy key: no longer consumed
             )
 
-    def test_bnb_accountant_rejects_legacy_runtime_aliases(self) -> None:
+    def test_bnb_accountant_legacy_runtime_aliases_are_not_used(self) -> None:
         accountant = BNBAccountant()
         accountant.history = [(1.0, 0.05, 5)]
         c_matrix = torch.tensor(
@@ -841,7 +840,8 @@ class AccountingTest(unittest.TestCase):
             dtype=torch.float64,
         )
         with self.assertRaisesRegex(
-            ValueError, "removed alias `c_matrix`.*`bnb_c_matrix`"
+            ValueError,
+            "requires b_min_sep/balls_in_bins inputs",
         ):
             accountant.get_epsilon(
                 delta=0.2,
@@ -849,7 +849,7 @@ class AccountingTest(unittest.TestCase):
                     sampling_mode="b_min_sep",
                     privacy_metadata={"bands": 2},
                 ),
-                c_matrix=c_matrix,
+                c_matrix=c_matrix,  # legacy key: no longer consumed
                 bnb_bands=2,
                 bnb_c_matrix_contract=_bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
             )

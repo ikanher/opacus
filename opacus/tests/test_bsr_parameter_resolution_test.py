@@ -246,17 +246,23 @@ def test_fixed_batch_mf_sensitivity_rejects_cyclic_only_kwargs() -> None:
         )
 
 
-def test_cyclic_scale_rejects_legacy_sensitivity_scale_alias() -> None:
-    with pytest.raises(
-        ValueError,
-        match="removed alias `sensitivity_scale`.*`bsr_sensitivity_scale`",
-    ):
-        PrivacyEngine._resolve_bsr_sensitivity_scale_for_cyclic(
-            mechanism_state={"coeffs": [1.0, 0.2]},
-            sampling_semantics=SamplingSemantics(
-                sampling_mode="cyclic_poisson",
-                privacy_metadata={"bands": 2},
-            ),
-            steps=10,
-            kwargs={"sensitivity_scale": 1.0},
-        )
+def test_cyclic_scale_ignores_legacy_sensitivity_scale_alias() -> None:
+    baseline = PrivacyEngine._resolve_bsr_sensitivity_scale_for_cyclic(
+        mechanism_state={"coeffs": [1.0, 0.2]},
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 2},
+        ),
+        steps=10,
+        kwargs={},
+    )
+    resolved = PrivacyEngine._resolve_bsr_sensitivity_scale_for_cyclic(
+        mechanism_state={"coeffs": [1.0, 0.2]},
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="cyclic_poisson",
+            privacy_metadata={"bands": 2},
+        ),
+        steps=10,
+        kwargs={"sensitivity_scale": 1.0},
+    )
+    assert resolved == pytest.approx(baseline, rel=0.0, abs=1e-12)
