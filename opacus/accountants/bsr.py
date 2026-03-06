@@ -22,6 +22,8 @@ from opacus.accountants.analysis.bsr import (
     compute_bsr_kappa_from_coeffs,
     bsr_fixed_batch_epsilon_upper_bound,
     bsr_cyclic_poisson_epsilon_upper_bound,
+    resolve_bsr_cyclic_gaussian_contract,
+    resolve_bsr_fixed_batch_gaussian_contract,
 )
 
 from .accountant import IAccountant
@@ -192,6 +194,7 @@ class BSRAccountant(IAccountant):
 
     def __init__(self):
         super().__init__()
+        self.last_contract = None
 
     def step(self, *, noise_multiplier: float, sample_rate: float):
         # `noise_multiplier` is the runtime Gaussian multiplier (`sigma_ref`);
@@ -326,8 +329,8 @@ class BSRAccountant(IAccountant):
 
         return float(sensitivity_scale)
 
-    @staticmethod
     def _get_epsilon_cyclic(
+        self,
         *,
         delta: float,
         noise_multiplier: float,
@@ -369,6 +372,27 @@ class BSRAccountant(IAccountant):
             total_steps=total_steps,
             bands=bands,
         )
+        reduced_contract = resolve_bsr_cyclic_gaussian_contract(
+            noise_multiplier=float(noise_multiplier) / float(sensitivity_scale),
+            steps=int(total_steps),
+            sample_rate=float(sample_rate),
+            bands=int(bands),
+        )
+        self.last_contract = {
+            "mechanism": "bsr",
+            "accounting_mode": "cyclic_prv",
+            "sampling_mode": "cyclic_poisson",
+            "bands": int(bands),
+            "global_steps": int(total_steps),
+            "sample_rate": float(sample_rate),
+            "q": float(reduced_contract["sample_rate"]),
+            "cycles": int(reduced_contract["steps"]),
+            "sensitivity_scale": float(sensitivity_scale),
+            "effective_noise_multiplier": float(
+                reduced_contract["effective_noise_multiplier"]
+            ),
+            "accountant_backend": "prv",
+        }
 
         return float(
             bsr_cyclic_poisson_epsilon_upper_bound(
@@ -517,8 +541,8 @@ class BSRAccountant(IAccountant):
 
         return float(mf_sensitivity)
 
-    @staticmethod
     def _get_epsilon_fixed_batch(
+        self,
         *,
         delta: float,
         noise_multiplier: float,
@@ -560,6 +584,25 @@ class BSRAccountant(IAccountant):
             mf_sensitivity=mf_sensitivity,
             explicit_mf_sensitivity_override=explicit_mf_sensitivity_override,
         )
+        reduced_contract = resolve_bsr_fixed_batch_gaussian_contract(
+            noise_multiplier=float(noise_multiplier),
+            mf_sensitivity=float(resolved_mf_sensitivity),
+        )
+        self.last_contract = {
+            "mechanism": "bsr",
+            "accounting_mode": "fixed_batch_prv",
+            "sampling_mode": "torch_sampler",
+            "global_steps": int(total_steps),
+            "sample_rate": float(sample_rate),
+            "sensitivity_steps": int(sensitivity_steps),
+            "max_participations": int(max_participations),
+            "min_separation": int(min_separation),
+            "mf_sensitivity": float(resolved_mf_sensitivity),
+            "effective_noise_multiplier": float(
+                reduced_contract["effective_noise_multiplier"]
+            ),
+            "accountant_backend": "prv",
+        }
 
         return float(
             bsr_fixed_batch_epsilon_upper_bound(

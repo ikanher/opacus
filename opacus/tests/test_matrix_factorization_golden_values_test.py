@@ -133,6 +133,7 @@ def test_bsr_sensitivity_matches_lean_identity_vectors() -> None:
 def test_bsr_fixed_batch_epsilon_matches_jax_golden_cases() -> None:
     # Values below were computed in the JAX stack using dp_accounting RDP
     # accountant over a single Gaussian event with sigma_eff = nm / sensitivity.
+    # Keep this as explicit RDP legacy parity coverage.
     cases = [
         {
             "noise_multiplier": 1.25,
@@ -158,6 +159,7 @@ def test_bsr_fixed_batch_epsilon_matches_jax_golden_cases() -> None:
             noise_multiplier=case["noise_multiplier"],
             target_delta=case["target_delta"],
             mf_sensitivity=case["mf_sensitivity"],
+            accountant="rdp",
             rdp_orders=RDP_ORDERS,
         )
         _assert_close(
@@ -171,6 +173,7 @@ def test_bsr_fixed_batch_epsilon_matches_jax_golden_cases() -> None:
 def test_bsr_cyclic_poisson_epsilon_matches_jax_golden_cases() -> None:
     # Values below were computed in the JAX stack via sampled-Gaussian RDP
     # composition using q = bands * sample_rate and cycles = ceil(steps / bands).
+    # Keep this as explicit RDP legacy parity coverage.
     cases = [
         {
             "noise_multiplier": 1.1,
@@ -205,6 +208,7 @@ def test_bsr_cyclic_poisson_epsilon_matches_jax_golden_cases() -> None:
             steps=case["steps"],
             sample_rate=case["sample_rate"],
             bands=case["bands"],
+            accountant="rdp",
             rdp_orders=RDP_ORDERS,
         )
         _assert_close(

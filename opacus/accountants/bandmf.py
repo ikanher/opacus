@@ -18,6 +18,7 @@ import math
 
 from opacus.accountants.analysis.bsr import (
     bsr_cyclic_poisson_epsilon_upper_bound,
+    resolve_bsr_cyclic_gaussian_contract,
 )
 
 from .accountant import IAccountant
@@ -167,6 +168,7 @@ class BandMFAccountant(IAccountant):
         self.last_contract = {
             "mechanism": "bandmf",
             "accounting_mode": "bandmf_accountant",
+            "accountant_backend": "prv",
             "sampling_mode": sampling_mode,
             "sample_rate": float(sample_rate),
             "bands": int(contract["bands"]),
@@ -175,6 +177,15 @@ class BandMFAccountant(IAccountant):
             "cycles": int(contract["cycles"]),
             "sensitivity_scale": float(sensitivity_scale),
         }
+        reduced_contract = resolve_bsr_cyclic_gaussian_contract(
+            noise_multiplier=float(noise_multiplier) / float(sensitivity_scale),
+            steps=int(total_steps),
+            sample_rate=float(sample_rate),
+            bands=int(contract["bands"]),
+        )
+        self.last_contract["effective_noise_multiplier"] = float(
+            reduced_contract["effective_noise_multiplier"]
+        )
 
         return float(
             bsr_cyclic_poisson_epsilon_upper_bound(

@@ -15,9 +15,8 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable
-
-from opacus.accountants.analysis import rdp as rdp_analysis
+import warnings
+from typing import Iterable, Literal
 
 # Opacus MF paper-comment convention for this file:
 # - Short tags: `BSR (Kalinin and Lampert, 2024)`, `BandMF (Choquette-Choo et al., 2023)`.
@@ -258,80 +257,45 @@ def calibrate_bsr_z_std(
     return float(noise_multiplier_ref) * float(max_grad_norm) / float(denominator)
 
 
-def bsr_fixed_batch_epsilon_upper_bound(
+def resolve_bsr_fixed_batch_gaussian_contract(
     *,
     noise_multiplier: float,
-    target_delta: float,
     mf_sensitivity: float,
-    rdp_orders: Iterable[float] | None = None,
-) -> float:
+) -> dict[str, float | int]:
     """
-    Upper-bound ``epsilon`` for fixed-batch BSR via Gaussian/RDP conversion.
+    Resolve the reduced single-event Gaussian contract for fixed-batch MF.
 
-    After reducing the mechanism to an effective Gaussian release with
-    ``sigma_eff = noise_multiplier / mf_sensitivity``, we reuse Opacus'
-    canonical RDP utilities to convert to ``(epsilon, delta)`` at one step.
+    The fixed-batch path reduces the whole MF mechanism to one effective
+    Gaussian release with sensitivity absorbed into ``sigma_eff``.
     """
     if noise_multiplier <= 0.0:
         raise ValueError("noise_multiplier must be > 0")
-
-    if target_delta <= 0.0 or target_delta > 1.0:
-        raise ValueError("target_delta must be in (0, 1]")
 
     if mf_sensitivity <= 0.0:
         raise ValueError("mf_sensitivity must be > 0")
 
-    # `Δ`/`kappa`-style scale in code: `mf_sensitivity`; `σ` in Gaussian accounting: `sigma_eff`.
     sigma_eff = float(noise_multiplier) / float(mf_sensitivity)
-
-    orders = _resolve_rdp_orders(rdp_orders)
-
-    rdp_values = rdp_analysis.compute_rdp(
-        q=1.0,
-        noise_multiplier=sigma_eff,
-        steps=1,
-        orders=orders,
-    )
-    eps, _ = rdp_analysis.get_privacy_spent(
-        orders=orders,
-        rdp=rdp_values,
-        delta=float(target_delta),
-    )
-    return float(eps)
+    return {
+        "effective_noise_multiplier": float(sigma_eff),
+        "sample_rate": 1.0,
+        "steps": 1,
+        "mf_sensitivity": float(mf_sensitivity),
+    }
 
 
-def bsr_cyclic_poisson_epsilon_upper_bound(
+def resolve_bsr_cyclic_gaussian_contract(
     *,
     noise_multiplier: float,
-    target_delta: float,
     steps: int,
     sample_rate: float,
     bands: int,
-    rdp_orders: Iterable[float] | None = None,
-) -> float:
+) -> dict[str, float | int]:
     """
-    Upper-bound ``epsilon`` for cyclic-poisson BSR/BandMF-style composition.
-
-    The cyclic participation contract is converted to a sampled Gaussian
-    composition problem where each cycle has effective sampling probability
-    ``q = b·p`` and the number of composed steps is ``⌈T / b⌉``.
-    We then delegate to the standard RDP machinery.
-
-    This is the accounting reduction used by the amplified BandMF-style path.
-
-    Derived from BandMF cyclic amplification reduction:
-
-        (q_eff = b·p, T_eff = ceil(T/b)),
-
-    then evaluated with standard sampled-Gaussian RDP conversion.”
+    Resolve the reduced sampled-Gaussian contract for cyclic MF accounting.
     """
     if noise_multiplier <= 0.0:
         raise ValueError("noise_multiplier must be > 0")
 
-    # `delta` in accountant API maps directly to target delta.
-    if target_delta <= 0.0 or target_delta > 1.0:
-        raise ValueError("target_delta must be in (0, 1]")
-    
     if steps < 0:
         raise ValueError("steps must be >= 0")
 
@@ -342,9 +306,13 @@ def bsr_cyclic_poisson_epsilon_upper_bound(
         raise ValueError("bands must be > 0")
 
     if steps == 0:
-        return 0.0
+        return {
+            "effective_noise_multiplier": float(noise_multiplier),
+            "sample_rate": float(sample_rate) * float(bands),
+            "steps": 0,
+            "bands": int(bands),
+        }
 
-    # `q` is effective cyclic participation probability: `bands * sample_rate`.
     q = float(sample_rate) * float(bands)
     if q <= 0.0 or q > 1.0:
         raise ValueError(
@@ -352,19 +320,146 @@ def bsr_cyclic_poisson_epsilon_upper_bound(
             f"got {q}"
         )
 
-    # `steps` is the global horizon; cycles = ceil(steps / bands).
     composed_cycles = int(math.ceil(float(steps) / float(bands)))
-    orders = _resolve_rdp_orders(rdp_orders)
+    return {
+        "effective_noise_multiplier": float(noise_multiplier),
+        "sample_rate": float(q),
+        "steps": int(composed_cycles),
+        "bands": int(bands),
+        "global_steps": int(steps),
+    }
 
-    rdp_values = rdp_analysis.compute_rdp(
-        q=q,
-        noise_multiplier=float(noise_multiplier),
-        steps=composed_cycles,
-        orders=orders,
+
+def _evaluate_reduced_gaussian_contract(
+    *,
+    contract: dict[str, float | int],
+    target_delta: float,
+    accountant: Literal["prv", "rdp"] = "prv",
+    rdp_orders: Iterable[float] | None = None,
+    eps_error: float = 0.01,
+    delta_error: float | None = None,
+) -> float:
+    if target_delta <= 0.0 or target_delta > 1.0:
+        raise ValueError("target_delta must be in (0, 1]")
+
+    noise_multiplier = float(contract["effective_noise_multiplier"])
+    sample_rate = float(contract["sample_rate"])
+    steps = int(contract["steps"])
+
+    if steps == 0:
+        return 0.0
+
+    if accountant == "rdp":
+        from opacus.accountants.rdp import RDPAccountant
+
+        rdp_accountant = RDPAccountant()
+        rdp_accountant.history = [(noise_multiplier, sample_rate, steps)]
+        return float(
+            rdp_accountant.get_epsilon(
+                delta=float(target_delta),
+                alphas=_resolve_rdp_orders(rdp_orders),
+            )
+        )
+
+    if accountant == "prv":
+        from opacus.accountants.prv import PRVAccountant
+
+        prv_accountant = PRVAccountant()
+        prv_accountant.history = [(noise_multiplier, sample_rate, steps)]
+        with warnings.catch_warnings():
+            # q=1 is a valid single-Gaussian boundary case for the reduced MF
+            # contract, but the subsampling PRV formulas hit harmless log(0)
+            # branches while simplifying to that limit.
+            warnings.filterwarnings(
+                "ignore",
+                category=RuntimeWarning,
+                module=r"opacus\.accountants\.analysis\.prv\.prvs",
+            )
+            return float(
+                prv_accountant.get_epsilon(
+                    delta=float(target_delta),
+                    eps_error=float(eps_error),
+                    delta_error=delta_error,
+                )
+            )
+
+    raise ValueError(f"Unexpected accountant backend: {accountant}")
+
+
+def bsr_fixed_batch_epsilon_upper_bound(
+    *,
+    noise_multiplier: float,
+    target_delta: float,
+    mf_sensitivity: float,
+    accountant: Literal["prv", "rdp"] = "prv",
+    rdp_orders: Iterable[float] | None = None,
+    eps_error: float = 0.01,
+    delta_error: float | None = None,
+) -> float:
+    """
+    Upper-bound ``epsilon`` for fixed-batch BSR via reduced Gaussian accounting.
+
+    After reducing the mechanism to an effective Gaussian release with
+    ``sigma_eff = noise_multiplier / mf_sensitivity``, we evaluate the reduced
+    single-event contract with the requested accountant backend.
+    """
+    contract = resolve_bsr_fixed_batch_gaussian_contract(
+        noise_multiplier=noise_multiplier,
+        mf_sensitivity=mf_sensitivity,
     )
-    eps, _ = rdp_analysis.get_privacy_spent(
-        orders=orders,
-        rdp=rdp_values,
-        delta=float(target_delta),
+    return float(
+        _evaluate_reduced_gaussian_contract(
+            contract=contract,
+            target_delta=target_delta,
+            accountant=accountant,
+            rdp_orders=rdp_orders,
+            eps_error=eps_error,
+            delta_error=delta_error,
+        )
     )
-    return float(eps)
+
+
+def bsr_cyclic_poisson_epsilon_upper_bound(
+    *,
+    noise_multiplier: float,
+    target_delta: float,
+    steps: int,
+    sample_rate: float,
+    bands: int,
+    accountant: Literal["prv", "rdp"] = "prv",
+    rdp_orders: Iterable[float] | None = None,
+    eps_error: float = 0.01,
+    delta_error: float | None = None,
+) -> float:
+    """
+    Upper-bound ``epsilon`` for cyclic-poisson BSR/BandMF-style composition.
+
+    The cyclic participation contract is converted to a sampled Gaussian
+    composition problem where each cycle has effective sampling probability
+    ``q = b·p`` and the number of composed steps is ``⌈T / b⌉``.
+    We then evaluate the reduced contract with the requested accountant backend.
+
+    This is the accounting reduction used by the amplified BandMF-style path.
+
+    Derived from BandMF cyclic amplification reduction:
+
+        (q_eff = b·p, T_eff = ceil(T/b)),
+
+    then evaluated with standard sampled-Gaussian RDP conversion.”
+    """
+    contract = resolve_bsr_cyclic_gaussian_contract(
+        noise_multiplier=noise_multiplier,
+        steps=steps,
+        sample_rate=sample_rate,
+        bands=bands,
+    )
+    return float(
+        _evaluate_reduced_gaussian_contract(
+            contract=contract,
+            target_delta=target_delta,
+            accountant=accountant,
+            rdp_orders=rdp_orders,
+            eps_error=eps_error,
+            delta_error=delta_error,
+        )
+    )

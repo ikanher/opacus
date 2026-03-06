@@ -80,15 +80,22 @@ def test_bsr_kappa_matches_frozen_jax_goldens() -> None:
 
 
 def test_bsr_accounting_matches_frozen_goldens() -> None:
+    # Keep frozen JAX-derived accounting values as explicit RDP parity coverage.
     fixture = _load_fixture()
     cases = {c["name"]: c for c in fixture["accounting_cases"]}
 
     fixed = cases["fixed_small_1"]
-    fixed_eps = bsr_fixed_batch_epsilon_upper_bound(**fixed["params"])
+    fixed_eps = bsr_fixed_batch_epsilon_upper_bound(
+        **fixed["params"],
+        accountant="rdp",
+    )
     assert math.isclose(float(fixed_eps), float(fixed["epsilon"]), rel_tol=0.0, abs_tol=1e-12)
 
     cyclic = cases["cyclic_small_1"]
-    cyclic_eps = bsr_cyclic_poisson_epsilon_upper_bound(**cyclic["params"])
+    cyclic_eps = bsr_cyclic_poisson_epsilon_upper_bound(
+        **cyclic["params"],
+        accountant="rdp",
+    )
     assert math.isclose(
         float(cyclic_eps), float(cyclic["epsilon"]), rel_tol=0.0, abs_tol=1e-12
     )
@@ -100,11 +107,13 @@ def test_bsr_accounting_matches_frozen_goldens() -> None:
         steps=boundary["params"]["steps"],
         sample_rate=boundary["params"]["sample_rate"],
         bands=boundary["params"]["bands"],
+        accountant="rdp",
     )
     fixed_boundary = bsr_fixed_batch_epsilon_upper_bound(
         noise_multiplier=boundary["params"]["noise_multiplier"],
         target_delta=boundary["params"]["target_delta"],
         mf_sensitivity=boundary["params"]["mf_sensitivity"],
+        accountant="rdp",
     )
     assert math.isclose(
         float(cyclic_boundary),

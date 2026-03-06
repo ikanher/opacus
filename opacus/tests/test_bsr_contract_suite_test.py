@@ -6,6 +6,8 @@ import itertools
 import math
 
 import pytest
+from scipy.optimize import brentq
+from scipy.stats import norm
 
 from opacus.accountants.analysis.bsr import (
     bsr_cyclic_poisson_epsilon_upper_bound,
@@ -13,6 +15,7 @@ from opacus.accountants.analysis.bsr import (
     compute_bsr_kappa_from_coeffs,
     compute_bsr_mf_sensitivity_from_coeffs,
     generate_bsr_coeffs_from_sgd_workload,
+    resolve_bsr_fixed_batch_gaussian_contract,
 )
 
 
@@ -57,6 +60,24 @@ def _exact_sensitivity_oracle(coeffs: list[float], steps: int, k: int, b: int) -
                 continue
             best = max(best, _participation_objective(coeffs, steps, support))
     return best
+
+
+def _exact_gaussian_delta(*, eps: float, sigma: float) -> float:
+    return float(
+        norm.cdf((1.0 / (2.0 * sigma)) - eps * sigma)
+        - math.exp(eps) * norm.cdf((-1.0 / (2.0 * sigma)) - eps * sigma)
+    )
+
+
+def _exact_gaussian_epsilon(*, delta: float, sigma: float) -> float:
+    def _residual(eps: float) -> float:
+        return _exact_gaussian_delta(eps=eps, sigma=sigma) - float(delta)
+
+    lo = 0.0
+    hi = 1.0
+    while _residual(hi) > 0.0:
+        hi *= 2.0
+    return float(brentq(_residual, lo, hi))
 
 
 def test_contract_fixed_batch_sensitivity_matches_exact_oracle_small_grids() -> None:
@@ -150,6 +171,27 @@ def test_contract_fixed_epsilon_decreases_with_noise_multiplier() -> None:
         mf_sensitivity=1.5,
     )
     assert eps_big_noise < eps_small_noise
+
+
+def test_contract_fixed_prv_matches_exact_single_gaussian_oracle() -> None:
+    cases = [
+        {"noise_multiplier": 1.25, "target_delta": 1e-5, "mf_sensitivity": 1.4},
+        {"noise_multiplier": 0.9, "target_delta": 1e-6, "mf_sensitivity": 1.0},
+        {"noise_multiplier": 2.0, "target_delta": 1e-5, "mf_sensitivity": 2.5},
+    ]
+    for case in cases:
+        contract = resolve_bsr_fixed_batch_gaussian_contract(
+            noise_multiplier=case["noise_multiplier"],
+            mf_sensitivity=case["mf_sensitivity"],
+        )
+        sigma_eff = float(contract["effective_noise_multiplier"])
+        exact = _exact_gaussian_epsilon(
+            delta=float(case["target_delta"]),
+            sigma=sigma_eff,
+        )
+        prv = bsr_fixed_batch_epsilon_upper_bound(**case)
+        assert prv >= exact
+        assert prv - exact <= 0.02
 
 
 def test_contract_fixed_epsilon_decreases_for_extreme_noise_range() -> None:

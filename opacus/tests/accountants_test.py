@@ -16,6 +16,7 @@
 import unittest
 import math
 import itertools
+import warnings
 from unittest.mock import patch
 
 import hypothesis.strategies as st
@@ -1125,6 +1126,81 @@ class AccountingTest(unittest.TestCase):
         self.assertTrue(math.isfinite(eps))
         self.assertGreater(eps, 0.0)
 
+    def test_bandmf_cyclic_runtime_matches_direct_prv_contract(self) -> None:
+        accountant = BandMFAccountant()
+        accountant.history = [(1.1, 0.02, 120)]
+        eps = accountant.get_epsilon(
+            delta=1e-5,
+            mechanism_state={"bsr_sensitivity_scale": 1.4},
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="cyclic_poisson",
+                privacy_metadata={"bands": 10},
+            ),
+        )
+        contract = accountant.last_contract
+        direct = PRVAccountant()
+        direct.history = [
+            (
+                float(contract["effective_noise_multiplier"]),
+                float(contract["q"]),
+                int(contract["cycles"]),
+            )
+        ]
+        direct_eps = direct.get_epsilon(delta=1e-5)
+        self.assertAlmostEqual(eps, direct_eps, places=12)
+
+    def test_bsr_cyclic_runtime_matches_direct_prv_contract(self) -> None:
+        accountant = BSRAccountant()
+        accountant.history = [(1.1, 0.02, 120)]
+        eps = accountant.get_epsilon(
+            delta=1e-5,
+            mechanism_state={"bsr_sensitivity_scale": 1.4},
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="cyclic_poisson",
+                privacy_metadata={"bands": 10},
+            ),
+        )
+        contract = accountant.last_contract
+        direct = PRVAccountant()
+        direct.history = [
+            (
+                float(contract["effective_noise_multiplier"]),
+                float(contract["q"]),
+                int(contract["cycles"]),
+            )
+        ]
+        direct_eps = direct.get_epsilon(delta=1e-5)
+        self.assertAlmostEqual(eps, direct_eps, places=12)
+
+    def test_bsr_fixed_batch_runtime_matches_direct_prv_contract(self) -> None:
+        accountant = BSRAccountant()
+        accountant.history = [(1.25, 0.1, 20)]
+        eps = accountant.get_epsilon(
+            delta=1e-5,
+            mechanism_state={"bsr_mf_sensitivity": 1.4},
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="torch_sampler",
+                privacy_metadata={},
+            ),
+        )
+        contract = accountant.last_contract
+        direct = PRVAccountant()
+        direct.history = [
+            (
+                float(contract["effective_noise_multiplier"]),
+                1.0,
+                1,
+            )
+        ]
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=RuntimeWarning,
+                module=r"opacus\.accountants\.analysis\.prv\.prvs",
+            )
+            direct_eps = direct.get_epsilon(delta=1e-5)
+        self.assertAlmostEqual(eps, direct_eps, places=12)
+
     def test_bsr_cyclic_poisson_epsilon_invariant_within_same_round_bucket(self) -> None:
         # With fixed (q, noise, delta, bands), epsilon depends on rounds=ceil(steps/bands).
         eps_a = bsr_cyclic_poisson_epsilon_upper_bound(
@@ -1161,6 +1237,25 @@ class AccountingTest(unittest.TestCase):
             bands=5,
         )
         self.assertAlmostEqual(eps_a, eps_b, places=12)
+
+    def test_bsr_cyclic_prv_is_tighter_than_explicit_rdp(self) -> None:
+        common = {
+            "target_delta": 1e-5,
+            "steps": 120,
+            "sample_rate": 0.02,
+            "bands": 10,
+        }
+        prv_eps = bsr_cyclic_poisson_epsilon_upper_bound(
+            noise_multiplier=1.1,
+            accountant="prv",
+            **common,
+        )
+        rdp_eps = bsr_cyclic_poisson_epsilon_upper_bound(
+            noise_multiplier=1.1,
+            accountant="rdp",
+            **common,
+        )
+        self.assertLessEqual(prv_eps, rdp_eps)
 
     def test_bsr_cyclic_poisson_no_amplification_boundary_matches_gaussian(self) -> None:
         # No amplification boundary from JAX tests:
@@ -1221,6 +1316,7 @@ class AccountingTest(unittest.TestCase):
             noise_multiplier=1.25,
             target_delta=1e-5,
             mf_sensitivity=1.4,
+            accountant="rdp",
             rdp_orders=[1.5, 2, 3, 4, 8, 16, 32],
         )
         self.assertAlmostEqual(eps, 5.596661628831665, places=12)
@@ -1232,6 +1328,7 @@ class AccountingTest(unittest.TestCase):
             steps=120,
             sample_rate=0.02,
             bands=10,
+            accountant="rdp",
             rdp_orders=[1.5, 2, 3, 4, 8, 16, 32],
         )
         self.assertAlmostEqual(eps, 5.218712005463466, places=12)
