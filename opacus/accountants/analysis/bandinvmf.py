@@ -32,9 +32,9 @@ import numpy as np
 from scipy import optimize
 
 from opacus.accountants.analysis.bisr import (
-    compute_bisr_separated_participation_sensitivity_upper_bound_from_coeffs,
     generate_bisr_coeffs_from_sgd_workload,
 )
+from opacus.accountants.analysis.bsr import compute_bsr_mf_sensitivity_from_coeffs
 
 
 def _validate_workload_params(*, bands: int, momentum: float, weight_decay: float) -> None:
@@ -255,7 +255,7 @@ def compute_bandinvmf_objective_from_inv_coeffs(
 
     strategy = _toeplitz_inverse_coeffs(inv)
     strategy_envelope = _decreasing_envelope(np.maximum(strategy, 0.0))
-    sensitivity = compute_bisr_separated_participation_sensitivity_upper_bound_from_coeffs(
+    sensitivity = compute_bsr_mf_sensitivity_from_coeffs(
         coeffs=strategy_envelope.tolist(),
         steps=steps,
         max_participations=max_participations,

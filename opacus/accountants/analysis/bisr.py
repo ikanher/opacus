@@ -25,11 +25,10 @@ paper through the separated-participation quantity
 
     sens_{k,b}(C) <= max_{pi in Π_{k,b}} sqrt(sum_{i,j in pi} |(C^T C)[i,j]|).
 
-The implementation below exposes that paper-facing contract directly. Internally
-the current closed-form upper bound is realized through the absolute-majorant
-route: replace the signed BISR Toeplitz coefficients by their entrywise
-absolute values and evaluate the existing nonnegative-decreasing BSR sensitivity
-formula on that majorant.
+The implementation below exposes a canonical runtime-facing fixed-batch
+helper that takes inverse-side runtime coefficients, derives the finite-horizon
+factor-side object `C^p`, and evaluates Equation `sens_k_b` on that factor-side
+Toeplitz matrix.
 
 Source: Back to Square Roots: An Optimal Bound On The Matrix Factorization
 Error For Multiepoch Differentially Private SGD (Kalinin et al., 2025)
@@ -37,6 +36,8 @@ Error For Multiepoch Differentially Private SGD (Kalinin et al., 2025)
 
 import math
 from typing import Iterable
+
+import torch
 
 # These are reusable from the BSR implementation
 from opacus.accountants.analysis.bsr import (
@@ -105,18 +106,37 @@ def generate_bisr_coeffs_from_sgd_workload(
     return coeffs
 
 
-def compute_bisr_abs_majorant_coeffs(
+def _build_lower_toeplitz_matrix_from_coeffs(
+    *,
+    coeffs: list[float],
+    steps: int,
+) -> torch.Tensor:
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+
+    matrix = torch.zeros((steps, steps), dtype=torch.float64)
+    max_lag = len(coeffs) - 1
+    for row in range(steps):
+        for lag in range(min(row, max_lag) + 1):
+            matrix[row, row - lag] = float(coeffs[lag])
+
+    return matrix
+
+
+def derive_bisr_factor_coeffs_from_inverse_coeffs(
     *,
     coeffs: Iterable[float],
+    steps: int,
 ) -> list[float]:
     """
-    Compute entrywise absolute Toeplitz majorant coefficients.
+    Derive finite-horizon factor-side Toeplitz coefficients from inverse-side runtime coefficients.
 
-    This is the coefficient-wise absolute-value majorant used in the paper's
-    sensitivity bound: if ``C`` is the BISR Toeplitz factor, the majorant
-    factor ``C_abs`` is obtained by replacing each coefficient ``c_j`` with
-    ``|c_j|`` so that entrywise bounds can be reduced to the nonnegative BSR
-    closed form.
+    BISR runtime generation exposes the banded inverse-side coefficients of
+    ``(C^p)^{-1}``, matching the paper's Algorithm 1. The fixed-batch privacy
+    quantity, however, is written in terms of the factor-side matrix ``C^p``.
+    This helper constructs the finite-horizon lower-triangular Toeplitz inverse
+    matrix, inverts it in float64, and returns the first-column coefficients of
+    the resulting factor-side lower-triangular Toeplitz matrix.
     """
     coeff_list = [float(c) for c in coeffs]
     if len(coeff_list) == 0:
@@ -125,10 +145,23 @@ def compute_bisr_abs_majorant_coeffs(
     if not all(math.isfinite(c) for c in coeff_list):
         raise ValueError("coeffs must be finite")
 
-    return [abs(c) for c in coeff_list]
+    if int(steps) < 1:
+        raise ValueError("steps must be >= 1")
+
+    inverse_matrix = _build_lower_toeplitz_matrix_from_coeffs(
+        coeffs=coeff_list,
+        steps=int(steps),
+    )
+    factor_matrix = torch.linalg.inv(inverse_matrix)
+    factor_coeffs = [float(factor_matrix[row, 0]) for row in range(int(steps))]
+
+    if not all(math.isfinite(c) for c in factor_coeffs):
+        raise ValueError("derived factor coefficients must be finite")
+
+    return factor_coeffs
 
 
-def _compute_bisr_sensitivity_upper_bound_via_abs_majorant(
+def compute_bisr_fixed_batch_sensitivity_from_inverse_coeffs(
     *,
     coeffs: Iterable[float],
     steps: int,
@@ -136,73 +169,31 @@ def _compute_bisr_sensitivity_upper_bound_via_abs_majorant(
     min_separation: int,
 ) -> float:
     """
-    Internal absolute-majorant realization of the BISR fixed-batch bound.
+    Evaluate the fixed-batch BISR paper sensitivity from inverse-side runtime coefficients.
 
-    This helper is kept as a regression oracle for the paper-facing BISR
-    sensitivity surface. The intended production contract is
-    `compute_bisr_separated_participation_sensitivity_upper_bound_from_coeffs`,
-    not the proof-oriented majorant route itself.
+    The BISR paper states the fixed-batch non-amplified calibration in terms of
+
+        sens_{k,b}(C) <= max_{pi in Π_{k,b}} sqrt(sum_{i,j in pi} |(C^T C)[i,j]|).
+
+    The public BISR runtime coefficients correspond to the inverse-side object
+    ``(C^p)^{-1}`` from the paper's Algorithm 1. This helper derives the
+    finite-horizon factor-side coefficients for ``C^p`` and then evaluates the
+    separated-participation quantity from Equation `sens_k_b` on that factor-side
+    Toeplitz object. The resulting factor coefficients are nonnegative and
+    decreasing in the paper's regime, so the existing BSR closed form applies
+    directly.
     """
-    abs_coeffs = compute_bisr_abs_majorant_coeffs(coeffs=coeffs)
+    factor_coeffs = derive_bisr_factor_coeffs_from_inverse_coeffs(
+        coeffs=coeffs,
+        steps=steps,
+    )
     return float(
         compute_bsr_mf_sensitivity_from_coeffs(
-            coeffs=abs_coeffs,
+            coeffs=factor_coeffs,
             steps=steps,
             max_participations=max_participations,
             min_separation=min_separation,
         )
-    )
-
-
-def compute_bisr_separated_participation_sensitivity_upper_bound_from_coeffs(
-    *,
-    coeffs: Iterable[float],
-    steps: int,
-    max_participations: int,
-    min_separation: int,
-) -> float:
-    """
-    Upper-bound fixed-batch BISR sensitivity under separated participation.
-
-    This is the paper-facing fixed-batch BISR sensitivity contract. Given the
-    analytic inverse-band BISR Toeplitz coefficients, it returns an upper bound
-    on the separated-participation sensitivity for horizon `steps`, at most
-    `max_participations` participations, and minimum separation
-    `min_separation`.
-
-    The current implementation realizes the paper bound through the validated
-    absolute-majorant route:
-    1. form the entrywise absolute majorant of the signed BISR Toeplitz factor,
-    2. apply the closed-form nonnegative-decreasing Toeplitz sensitivity
-       formula already used for BSR.
-    """
-    return _compute_bisr_sensitivity_upper_bound_via_abs_majorant(
-        coeffs=coeffs,
-        steps=steps,
-        max_participations=max_participations,
-        min_separation=min_separation,
-    )
-
-
-def compute_bisr_mf_sensitivity_upper_bound_from_coeffs(
-    *,
-    coeffs: Iterable[float],
-    steps: int,
-    max_participations: int,
-    min_separation: int,
-) -> float:
-    """
-    Compatibility wrapper for the BISR fixed-batch sensitivity upper bound.
-
-    This legacy helper name is retained during the BISR paper-parity refactor.
-    New code should prefer
-    `compute_bisr_separated_participation_sensitivity_upper_bound_from_coeffs`.
-    """
-    return compute_bisr_separated_participation_sensitivity_upper_bound_from_coeffs(
-        coeffs=coeffs,
-        steps=steps,
-        max_participations=max_participations,
-        min_separation=min_separation,
     )
 
 
