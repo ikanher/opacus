@@ -21,6 +21,11 @@ def test_bsr_accountant_aliases_map_to_bsr_accounting_mode(accountant: str) -> N
     assert resolve_accounting_mode_from_accountant(accountant) == "bsr_accountant"
 
 
+@pytest.mark.parametrize("accountant", ["bandinvmf"])
+def test_bandinvmf_accountant_alias_maps_to_bsr_accounting_mode(accountant: str) -> None:
+    assert resolve_accounting_mode_from_accountant(accountant) == "bsr_accountant"
+
+
 @pytest.mark.parametrize("accountant", ["bnb", "bnb_accountant"])
 def test_bnb_accountant_aliases_map_to_bnb_accounting_mode(accountant: str) -> None:
     assert resolve_accounting_mode_from_accountant(accountant) == "bnb_accountant"

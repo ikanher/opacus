@@ -94,7 +94,7 @@ def validate_bnb_sampling_policy(
     sampling_semantics,
     mechanism: str,
 ) -> None:
-    if mechanism not in ("bandmf", "bsr", "bisr", "bnb") or sampling_semantics is None:
+    if mechanism not in ("bandmf", "bsr", "bisr", "bnb", "bandinvmf") or sampling_semantics is None:
         return
     mode = sampling_semantics.sampling_mode
     if mode == "b_min_sep":

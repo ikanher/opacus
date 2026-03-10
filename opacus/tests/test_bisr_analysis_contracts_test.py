@@ -12,21 +12,9 @@ from opacus.accountants.analysis.bisr import (
     compute_bisr_abs_majorant_coeffs,
     compute_bisr_kappa_from_coeffs,
     compute_bisr_mf_sensitivity_upper_bound_from_coeffs,
+    compute_bisr_separated_participation_sensitivity_upper_bound_from_coeffs,
     generate_bisr_coeffs_from_sgd_workload,
 )
-
-
-# Lean theorem mapping (spec -> test):
-# - `Mf.DP.BISR.tildeCCoeff_zero/one/two`:
-#     first coefficients match closed forms.
-# - `Mf.DP.BISR.bisrInvC_entry_abs_le_bisrAbsC`:
-#     entrywise abs-majorant inequality (`|c_j| <= abs(c_j)`).
-# - `Mf.DP.Sensitivity.sensitivityUpperBound_bisrInvC_le_bisrAbsC`:
-#     fixed-batch sensitivity bounded by abs-majorant sensitivity.
-# - `Mf.DP.CyclicBandMF.bisr_finiteHorizonKappa_nonneg`:
-#     cyclic `kappa(T)` is nonnegative and matches the finite-horizon prefix norm.
-# - `Mf.DP.CyclicBandMF.cyclicReduction_contract`:
-#     cyclic epsilon upper bound decreases as runtime noise increases.
 
 
 def _toeplitz_entry(coeffs: list[float], i: int, j: int) -> float:
@@ -69,7 +57,6 @@ def _exact_sensitivity(coeffs: list[float], steps: int, k: int, b: int) -> float
 
 
 def test_contract_bisr_coeff_low_order_identities() -> None:
-    # Lean: tildeCCoeff_zero/one/two
     alpha = 0.9
     beta = 0.4
     coeffs = generate_bisr_coeffs_from_sgd_workload(
@@ -83,7 +70,6 @@ def test_contract_bisr_coeff_low_order_identities() -> None:
 
 
 def test_contract_bisr_majorant_is_abs_entrywise() -> None:
-    # Lean: bisrInvC_entry_abs_le_bisrAbsC (entrywise majorant route).
     coeffs = generate_bisr_coeffs_from_sgd_workload(
         bands=8,
         momentum=0.3,
@@ -96,8 +82,29 @@ def test_contract_bisr_majorant_is_abs_entrywise() -> None:
         assert abs(c) <= m + 1e-12
 
 
+def test_contract_bisr_paper_facing_sensitivity_matches_majorant_route() -> None:
+    coeffs = generate_bisr_coeffs_from_sgd_workload(
+        bands=5,
+        momentum=0.3,
+        weight_decay=0.9,
+    )
+    for steps, k, b in [(5, 1, 1), (5, 2, 1), (6, 2, 2), (7, 3, 2)]:
+        paper_facing = compute_bisr_separated_participation_sensitivity_upper_bound_from_coeffs(
+            coeffs=coeffs,
+            steps=steps,
+            max_participations=k,
+            min_separation=b,
+        )
+        legacy = compute_bisr_mf_sensitivity_upper_bound_from_coeffs(
+            coeffs=coeffs,
+            steps=steps,
+            max_participations=k,
+            min_separation=b,
+        )
+        assert paper_facing == pytest.approx(legacy, rel=0.0, abs=1e-12)
+
+
 def test_contract_bisr_fixed_batch_upper_bound_dominates_exact_small_grids() -> None:
-    # Lean: sensitivityUpperBound_bisrInvC_le_bisrAbsC (finite oracle sanity).
     coeffs = generate_bisr_coeffs_from_sgd_workload(
         bands=5,
         momentum=0.3,
@@ -105,7 +112,7 @@ def test_contract_bisr_fixed_batch_upper_bound_dominates_exact_small_grids() -> 
     )
     for steps, k, b in [(5, 1, 1), (5, 2, 1), (6, 2, 2), (7, 3, 2)]:
         exact = _exact_sensitivity(coeffs, steps, k, b)
-        upper = compute_bisr_mf_sensitivity_upper_bound_from_coeffs(
+        upper = compute_bisr_separated_participation_sensitivity_upper_bound_from_coeffs(
             coeffs=coeffs,
             steps=steps,
             max_participations=k,

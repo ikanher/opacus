@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+
+import io
+
+import pytest
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+
+from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
+from opacus.optimizers import CorrelatedNoiseMechanism
+
+import opacus.privacy_engine as pe_mod
+
+
+def _loader(
+    *, n_samples: int = 32, in_dim: int = 4, n_classes: int = 3, batch_size: int = 8
+) -> DataLoader:
+    gen = torch.Generator().manual_seed(20260310)
+    x = torch.randn(n_samples, in_dim, generator=gen)
+    y = torch.randint(0, n_classes, size=(n_samples,), generator=gen)
+    return DataLoader(
+        TensorDataset(x, y),
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=True,
+    )
+
+
+def test_bandinvmf_make_private_generates_deterministic_runtime_state() -> None:
+    def _run_once() -> dict:
+        pe = PrivacyEngine()
+        model = nn.Linear(4, 3)
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=0.05, momentum=0.9, weight_decay=0.01
+        )
+        _private_model, dp_optimizer, _private_loader = pe.make_private(
+            module=model,
+            optimizer=optimizer,
+            data_loader=_loader(),
+            noise_multiplier=1.0,
+            max_grad_norm=1.0,
+            poisson_sampling=False,
+            clipping="flat",
+            grad_sample_mode="hooks",
+            total_steps=16,
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bandinvmf",
+                accounting_mode="bsr_accountant",
+                mechanism_state={"bsr_bands": 4},
+            ),
+        )
+        assert isinstance(dp_optimizer.noise_mechanism, CorrelatedNoiseMechanism)
+        return pe.noise_mechanism_config.mechanism_state
+
+    first = _run_once()
+    second = _run_once()
+    assert first["bandinvmf_inv_coeffs"] == pytest.approx(
+        second["bandinvmf_inv_coeffs"], rel=0.0, abs=1e-12
+    )
+    assert first["coeffs"] == pytest.approx(second["coeffs"], rel=0.0, abs=1e-12)
+
+
+def test_bandinvmf_make_private_with_epsilon_fixed_batch_passes_resolved_mf_sensitivity(
+    monkeypatch,
+) -> None:
+    captured = {}
+
+    def _fake_get_noise_multiplier(**kwargs):
+        captured.update(kwargs)
+        return 1.0
+
+    monkeypatch.setattr(pe_mod, "get_noise_multiplier", _fake_get_noise_multiplier)
+
+    pe = PrivacyEngine()
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(
+        model.parameters(), lr=0.05, momentum=0.9, weight_decay=0.01
+    )
+
+    _private_model, dp_optimizer, _private_loader = pe.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(batch_size=8, n_samples=32),
+        target_epsilon=8.0,
+        target_delta=1e-5,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping="flat",
+        grad_sample_mode="hooks",
+        total_steps=16,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bandinvmf",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"bsr_bands": 4},
+        ),
+    )
+
+    assert isinstance(dp_optimizer.noise_mechanism, CorrelatedNoiseMechanism)
+    assert captured["accountant"] == "bsr"
+    assert float(captured["bsr_mf_sensitivity"]) > 0.0
+    state = pe.noise_mechanism_config.mechanism_state
+    assert float(state["bsr_mf_sensitivity"]) > 0.0
+    assert "bandinvmf_inv_coeffs" in state
+
+
+def test_bandinvmf_make_private_with_epsilon_cyclic_passes_resolved_scale(monkeypatch) -> None:
+    captured = {}
+
+    def _fake_get_noise_multiplier(**kwargs):
+        captured.update(kwargs)
+        return 1.0
+
+    monkeypatch.setattr(pe_mod, "get_noise_multiplier", _fake_get_noise_multiplier)
+
+    pe = PrivacyEngine()
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(
+        model.parameters(), lr=0.05, momentum=0.9, weight_decay=0.01
+    )
+
+    semantics = SamplingSemantics(
+        sampling_mode="cyclic_poisson",
+        privacy_metadata={"bands": 4},
+    )
+    _private_model, dp_optimizer, _private_loader = pe.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(batch_size=8, n_samples=80),
+        target_epsilon=8.0,
+        target_delta=1e-5,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping="flat",
+        grad_sample_mode="hooks",
+        total_steps=16,
+        sampling_semantics=semantics,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bandinvmf",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"bsr_bands": 4},
+        ),
+    )
+
+    assert isinstance(dp_optimizer.noise_mechanism, CorrelatedNoiseMechanism)
+    assert float(captured["bsr_sensitivity_scale"]) > 0.0
+    state = pe.noise_mechanism_config.mechanism_state
+    assert float(state["bsr_sensitivity_scale"]) > 0.0
+
+
+def test_bandinvmf_checkpoint_resume_preserves_generated_runtime_state() -> None:
+    pe = PrivacyEngine()
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(
+        model.parameters(), lr=0.05, momentum=0.9, weight_decay=0.01
+    )
+    private_model, dp_optimizer, private_loader = pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        noise_multiplier=1.0,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping="flat",
+        grad_sample_mode="hooks",
+        total_steps=16,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bandinvmf",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"bsr_bands": 4},
+        ),
+    )
+    state_before = pe.noise_mechanism_config.mechanism_state
+    batch = next(iter(private_loader))
+    x, y = batch
+    dp_optimizer.zero_grad()
+    nn.functional.cross_entropy(private_model(x), y).backward()
+    assert dp_optimizer.pre_step() is True
+
+    restored_pe = PrivacyEngine()
+    restored_model = nn.Linear(4, 3)
+    restored_optimizer = torch.optim.SGD(
+        restored_model.parameters(), lr=0.05, momentum=0.9, weight_decay=0.01
+    )
+    restored_model, restored_dp_optimizer, _ = restored_pe.make_private(
+        module=restored_model,
+        optimizer=restored_optimizer,
+        data_loader=_loader(),
+        noise_multiplier=1.0,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping="flat",
+        grad_sample_mode="hooks",
+        total_steps=16,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bandinvmf",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"bsr_bands": 4},
+        ),
+    )
+
+    with io.BytesIO() as bio:
+        pe.save_checkpoint(path=bio, module=private_model, optimizer=dp_optimizer)
+        bio.seek(0)
+        restored_pe.load_checkpoint(
+            path=bio, module=restored_model, optimizer=restored_dp_optimizer
+        )
+
+    state_after = restored_pe.noise_mechanism_config.mechanism_state
+    assert state_after["bandinvmf_inv_coeffs"] == pytest.approx(
+        state_before["bandinvmf_inv_coeffs"], rel=0.0, abs=1e-12
+    )
+    assert state_after["coeffs"] == pytest.approx(
+        state_before["coeffs"], rel=0.0, abs=1e-12
+    )

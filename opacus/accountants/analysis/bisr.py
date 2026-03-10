@@ -17,9 +17,19 @@ from __future__ import annotations
 """
 BISR analysis helpers.
 
-This module provides coefficient generation and fixed-batch sensitivity upper
-bounds for BISR via an absolute-majorant route, plus cyclic-facing helpers
-for the finite-horizon normalization/reduction surface.
+BISR is the analytic inverse-band path from
+`paper/banded-inverse-square-root`: for SGD workloads with momentum and weight
+decay, it provides closed-form coefficients for a lower-triangular Toeplitz
+inverse correlation factor. The fixed-batch privacy surface is described in the
+paper through the separated-participation quantity
+
+    sens_{k,b}(C) <= max_{pi in Π_{k,b}} sqrt(sum_{i,j in pi} |(C^T C)[i,j]|).
+
+The implementation below exposes that paper-facing contract directly. Internally
+the current closed-form upper bound is realized through the absolute-majorant
+route: replace the signed BISR Toeplitz coefficients by their entrywise
+absolute values and evaluate the existing nonnegative-decreasing BSR sensitivity
+formula on that majorant.
 
 Source: Back to Square Roots: An Optimal Bound On The Matrix Factorization
 Error For Multiepoch Differentially Private SGD (Kalinin et al., 2025)
@@ -118,7 +128,7 @@ def compute_bisr_abs_majorant_coeffs(
     return [abs(c) for c in coeff_list]
 
 
-def compute_bisr_mf_sensitivity_upper_bound_from_coeffs(
+def _compute_bisr_sensitivity_upper_bound_via_abs_majorant(
     *,
     coeffs: Iterable[float],
     steps: int,
@@ -126,15 +136,12 @@ def compute_bisr_mf_sensitivity_upper_bound_from_coeffs(
     min_separation: int,
 ) -> float:
     """
-    Upper-bound fixed-batch BISR sensitivity through absolute-majorant Toeplitz path.
+    Internal absolute-majorant realization of the BISR fixed-batch bound.
 
-    The bound is computed by applying the existing closed-form BSR fixed-batch
-    sensitivity routine to `abs(coeffs)`.
-
-    Mathematically, this uses the paper's entrywise domination argument:
-    replace the signed BISR Toeplitz coefficients by their absolute majorant,
-    then evaluate the fixed-batch matrix-factorization sensitivity on that
-    nonnegative sequence.
+    This helper is kept as a regression oracle for the paper-facing BISR
+    sensitivity surface. The intended production contract is
+    `compute_bisr_separated_participation_sensitivity_upper_bound_from_coeffs`,
+    not the proof-oriented majorant route itself.
     """
     abs_coeffs = compute_bisr_abs_majorant_coeffs(coeffs=coeffs)
     return float(
@@ -144,6 +151,58 @@ def compute_bisr_mf_sensitivity_upper_bound_from_coeffs(
             max_participations=max_participations,
             min_separation=min_separation,
         )
+    )
+
+
+def compute_bisr_separated_participation_sensitivity_upper_bound_from_coeffs(
+    *,
+    coeffs: Iterable[float],
+    steps: int,
+    max_participations: int,
+    min_separation: int,
+) -> float:
+    """
+    Upper-bound fixed-batch BISR sensitivity under separated participation.
+
+    This is the paper-facing fixed-batch BISR sensitivity contract. Given the
+    analytic inverse-band BISR Toeplitz coefficients, it returns an upper bound
+    on the separated-participation sensitivity for horizon `steps`, at most
+    `max_participations` participations, and minimum separation
+    `min_separation`.
+
+    The current implementation realizes the paper bound through the validated
+    absolute-majorant route:
+    1. form the entrywise absolute majorant of the signed BISR Toeplitz factor,
+    2. apply the closed-form nonnegative-decreasing Toeplitz sensitivity
+       formula already used for BSR.
+    """
+    return _compute_bisr_sensitivity_upper_bound_via_abs_majorant(
+        coeffs=coeffs,
+        steps=steps,
+        max_participations=max_participations,
+        min_separation=min_separation,
+    )
+
+
+def compute_bisr_mf_sensitivity_upper_bound_from_coeffs(
+    *,
+    coeffs: Iterable[float],
+    steps: int,
+    max_participations: int,
+    min_separation: int,
+) -> float:
+    """
+    Compatibility wrapper for the BISR fixed-batch sensitivity upper bound.
+
+    This legacy helper name is retained during the BISR paper-parity refactor.
+    New code should prefer
+    `compute_bisr_separated_participation_sensitivity_upper_bound_from_coeffs`.
+    """
+    return compute_bisr_separated_participation_sensitivity_upper_bound_from_coeffs(
+        coeffs=coeffs,
+        steps=steps,
+        max_participations=max_participations,
+        min_separation=min_separation,
     )
 
 
@@ -157,8 +216,9 @@ def compute_bisr_kappa_from_coeffs(
 
     In the cyclic reduction used for correlated sampling, ``kappa(T)`` is the
     finite-horizon normalization term induced by the Toeplitz factor over a
-    run of ``T`` logical steps. For BISR we reuse the same Toeplitz-horizon
-    normalization computation as for BSR once the coefficient sequence is fixed.
+    run of ``T`` logical steps. BISR uses the same finite-horizon Toeplitz
+    column-norm computation as BSR once the analytic coefficient sequence is
+    fixed.
     """
     coeff_list = [float(c) for c in coeffs]
     if len(coeff_list) == 0:
@@ -188,9 +248,9 @@ def bisr_cyclic_poisson_epsilon_upper_bound(
     Upper-bound cyclic-poisson ``epsilon`` for BISR after cyclic reduction.
 
     This uses the same cyclic reduction surface as BSR: first convert the
-    correlated cyclic process to an equivalent finite-horizon sampled-Gaussian
-    problem with the BISR-induced normalization, then evaluate the standard
-    upper bound on ``epsilon`` at the requested ``delta``.
+    correlated cyclic process induced by the analytic BISR coefficients to an
+    equivalent finite-horizon sampled-Gaussian problem, then evaluate the
+    standard upper bound on ``epsilon`` at the requested ``delta``.
     """
     return float(
         bsr_cyclic_poisson_epsilon_upper_bound(

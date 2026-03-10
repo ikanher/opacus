@@ -18,7 +18,7 @@ import math
 from typing import Any, Dict, Optional
 
 from opacus.accountants.analysis.bisr import (
-    compute_bisr_mf_sensitivity_upper_bound_from_coeffs,
+    compute_bisr_separated_participation_sensitivity_upper_bound_from_coeffs,
 )
 from opacus.accountants.analysis.bsr import (
     compute_bsr_mf_sensitivity_from_coeffs,
@@ -504,7 +504,7 @@ class BSRAccountant(IAccountant):
         def _derive_from_coeffs() -> float:
             if mechanism == "bisr":
                 return float(
-                    compute_bisr_mf_sensitivity_upper_bound_from_coeffs(
+                    compute_bisr_separated_participation_sensitivity_upper_bound_from_coeffs(
                         coeffs=coeffs,
                         steps=sensitivity_steps,
                         max_participations=int(max_participations),
