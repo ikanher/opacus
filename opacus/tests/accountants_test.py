@@ -41,6 +41,9 @@ from opacus.accountants.analysis.bsr import (
     compute_bsr_kappa_from_coeffs,
     compute_bsr_mf_sensitivity_from_coeffs,
 )
+from opacus.accountants.analysis.bandmf import (
+    compute_bandmf_mf_sensitivity_from_coeffs,
+)
 from opacus.accountants.utils import get_noise_multiplier
 
 
@@ -813,6 +816,39 @@ class AccountingTest(unittest.TestCase):
             sensitivity_scale=1.0,
         )
         self.assertGreater(epsilon, 0.0)
+
+    def test_bandmf_accountant_fixed_batch_matches_direct_prv_contract(self) -> None:
+        coeffs = [1.0, 0.5, 0.25]
+        sample_rate = 0.2
+        steps = 10
+        accountant = BandMFAccountant()
+        accountant.history = [(1.3, sample_rate, steps)]
+        sampling_semantics = SamplingSemantics(
+            sampling_mode="torch_sampler",
+            privacy_metadata={},
+        )
+        mf_sensitivity = compute_bandmf_mf_sensitivity_from_coeffs(
+            coeffs=coeffs,
+            steps=steps,
+            max_participations=2,
+            min_separation=1,
+        )
+        epsilon = accountant.get_epsilon(
+            delta=1e-5,
+            mechanism_state={
+                "coeffs": coeffs,
+                "bsr_max_participations": 2,
+                "bsr_min_separation": 1,
+            },
+            sampling_semantics=sampling_semantics,
+        )
+        direct = bsr_fixed_batch_epsilon_upper_bound(
+            noise_multiplier=1.3,
+            target_delta=1e-5,
+            mf_sensitivity=mf_sensitivity,
+        )
+        self.assertAlmostEqual(epsilon, direct, places=12)
+        self.assertEqual(accountant.last_contract["sampling_mode"], "torch_sampler")
 
     def test_bsr_accountant_legacy_fixed_batch_alias_is_not_used(self) -> None:
         accountant = BSRAccountant()

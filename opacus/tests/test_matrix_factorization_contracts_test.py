@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import copy
+import io
 import logging
 import math
 
@@ -203,6 +204,27 @@ def test_sampling_semantics_cyclic_poisson_rejects_steps_below_bands() -> None:
             ),
             total_steps=5,
         )
+
+
+def test_sampling_semantics_fixed_batch_bandmf_uses_torch_sampler() -> None:
+    model = nn.Linear(4, 3)
+    private_model, dp_optimizer, private_loader = _make_private(
+        model,
+        poisson_sampling=False,
+        noise_seed=103,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bandmf",
+            accounting_mode="bandmf_accountant",
+            mechanism_state={"coeffs": [1.0, 0.2], "z_std": 0.01},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="torch_sampler",
+            privacy_metadata={},
+        ),
+    )
+    assert private_model is not None
+    assert dp_optimizer is not None
+    assert dp_optimizer.sampling_semantics.sampling_mode == "torch_sampler"
 
 
 def test_bsr_mechanism_requires_torch_sampler() -> None:
@@ -845,6 +867,104 @@ def test_make_private_with_epsilon_bandmf_cyclic_uses_analytical_autogen(
         weight_decay=0.9999,
     )
     assert state["coeffs"] == pytest.approx(expected, rel=0.0, abs=1e-12)
+
+
+def test_make_private_with_epsilon_bandmf_fixed_batch_resolves_mf_sensitivity() -> None:
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    pe = PrivacyEngine()
+
+    _, dp_optimizer, _ = pe.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        target_epsilon=1.0,
+        target_delta=1e-5,
+        total_steps=32,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bandmf",
+            accounting_mode="bandmf_accountant",
+            mechanism_state={"coeffs": [1.0, 0.4]},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="torch_sampler",
+            privacy_metadata={},
+        ),
+    )
+
+    assert float(dp_optimizer.noise_multiplier) > 0.0
+    state = dp_optimizer.noise_mechanism_config.mechanism_state
+    assert float(state["z_std"]) > 0.0
+    assert "bsr_sensitivity_scale" not in state
+
+
+def test_make_private_bandmf_fixed_batch_checkpoint_reuses_state() -> None:
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    pe = PrivacyEngine()
+
+    private_model, dp_optimizer, private_loader = pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        noise_multiplier=1.0,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping="flat",
+        grad_sample_mode="hooks",
+        total_steps=16,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bandmf",
+            accounting_mode="bandmf_accountant",
+            mechanism_state={"coeffs": [1.0, 0.2], "bsr_bands": 2},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="torch_sampler",
+            privacy_metadata={},
+        ),
+    )
+    state_before = pe.noise_mechanism_config.mechanism_state
+    x, y = next(iter(private_loader))
+    dp_optimizer.zero_grad()
+    nn.functional.cross_entropy(private_model(x), y).backward()
+    assert dp_optimizer.pre_step() is True
+
+    restored_pe = PrivacyEngine()
+    restored_model = nn.Linear(4, 3)
+    restored_optimizer = torch.optim.SGD(restored_model.parameters(), lr=0.05)
+    restored_model, restored_dp_optimizer, _ = restored_pe.make_private(
+        module=restored_model,
+        optimizer=restored_optimizer,
+        data_loader=_loader(),
+        noise_multiplier=1.0,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping="flat",
+        grad_sample_mode="hooks",
+        total_steps=16,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bandmf",
+            accounting_mode="bandmf_accountant",
+            mechanism_state={"coeffs": [1.0, 0.2], "bsr_bands": 2},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="torch_sampler",
+            privacy_metadata={},
+        ),
+    )
+
+    with io.BytesIO() as bio:
+        pe.save_checkpoint(path=bio, module=private_model, optimizer=dp_optimizer)
+        bio.seek(0)
+        restored_pe.load_checkpoint(
+            path=bio, module=restored_model, optimizer=restored_dp_optimizer
+        )
+
+    state_after = restored_pe.noise_mechanism_config.mechanism_state
+    assert state_after["coeffs"] == pytest.approx(state_before["coeffs"], rel=0.0, abs=1e-12)
+    assert state_after["z_std"] == pytest.approx(state_before["z_std"], rel=0.0, abs=1e-12)
 
 
 def test_make_private_with_epsilon_bsr_cyclic_uses_analytical_autogen(

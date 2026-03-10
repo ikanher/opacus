@@ -50,6 +50,9 @@ from opacus.accountants.analysis.bandinvmf import (
     derive_bandinvmf_runtime_coeffs_from_inv_coeffs,
     optimize_bandinvmf_inv_coeffs_for_sgd_workload,
 )
+from opacus.accountants.analysis.bandmf import (
+    compute_bandmf_mf_sensitivity_from_coeffs,
+)
 from opacus.accountants.analysis.bnb import (
     BNBCalibrationStatus,
     build_bnb_toeplitz_c_matrix_and_contract,
@@ -1060,6 +1063,74 @@ class PrivacyEngine:
         )
 
     @staticmethod
+    def _resolve_bandmf_mf_sensitivity_for_fixed_batch(
+        *,
+        mechanism_state: Dict[str, Any],
+        sampling_semantics: Optional[SamplingSemantics],
+        steps: int,
+        sample_rate: Optional[float],
+        kwargs: Dict[str, Any],
+    ) -> float:
+        metadata = (
+            sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
+        )
+        explicit = kwargs.get(
+            "bsr_mf_sensitivity",
+            metadata.get(
+                "bsr_mf_sensitivity",
+                mechanism_state.get("bsr_mf_sensitivity"),
+            ),
+        )
+        if explicit is not None:
+            return float(explicit)
+
+        coeffs = mechanism_state.get("coeffs")
+        if coeffs is None:
+            raise ValueError(
+                "fixed-batch bandmf accounting requires MF sensitivity or enough data "
+                "to derive it: `coeffs`, `max_participations`, `min_separation`"
+            )
+
+        sensitivity_steps = int(
+            kwargs.get(
+                "bsr_iterations_number",
+                metadata.get(
+                    "bsr_iterations_number",
+                    mechanism_state.get("bsr_iterations_number", steps),
+                ),
+            )
+        )
+        max_participations = int(
+            kwargs.get(
+                "bsr_max_participations",
+                metadata.get(
+                    "bsr_max_participations",
+                    mechanism_state.get(
+                        "bsr_max_participations",
+                        max(1, int(math.ceil(float(sample_rate) * float(sensitivity_steps)))),
+                    ),
+                ),
+            )
+        )
+        min_separation = int(
+            kwargs.get(
+                "bsr_min_separation",
+                metadata.get(
+                    "bsr_min_separation",
+                    mechanism_state.get("bsr_min_separation", 1),
+                ),
+            )
+        )
+        return float(
+            compute_bandmf_mf_sensitivity_from_coeffs(
+                coeffs=coeffs,
+                steps=sensitivity_steps,
+                max_participations=max_participations,
+                min_separation=min_separation,
+            )
+        )
+
+    @staticmethod
     def _resolve_bnb_b_min_sep_inputs(
         *,
         mechanism_state: Dict[str, Any],
@@ -1314,10 +1385,11 @@ class PrivacyEngine:
                 mechanism == "bandmf"
                 and
                 accounting_mode == "bandmf_accountant"
-                and sampling_semantics.sampling_mode != "cyclic_poisson"
+                and sampling_semantics.sampling_mode not in ("cyclic_poisson", "torch_sampler")
             ):
                 raise ValueError(
-                    "bandmf mechanism with bandmf_accountant supports sampling_mode='cyclic_poisson' only in this phase"
+                    "bandmf mechanism with bandmf_accountant supports sampling_mode in "
+                    "{'cyclic_poisson', 'torch_sampler'} only"
                 )
             if accounting_mode == "bnb_accountant" and sampling_semantics.sampling_mode != "balls_in_bins":
                 raise ValueError(
@@ -1400,7 +1472,7 @@ class PrivacyEngine:
             else None
         )
         if not poisson_sampling and sampling_mode in (None, "torch_sampler"):
-            if mechanism in ("bsr", "bisr", "bandinvmf"):
+            if mechanism in ("bandmf", "bsr", "bisr", "bandinvmf"):
                 return batch_size / dataset_size
 
             raise ValueError(
@@ -1595,11 +1667,19 @@ class PrivacyEngine:
                         kwargs=kwargs,
                     )
             if (
-                mechanism_config.mechanism in ("bsr", "bisr", "bandinvmf")
+                mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf")
                 and sampling_semantics is not None
                 and sampling_semantics.sampling_mode == "torch_sampler"
             ):
-                if mechanism_config.mechanism == "bisr":
+                if mechanism_config.mechanism == "bandmf":
+                    bsr_mf_sensitivity = self._resolve_bandmf_mf_sensitivity_for_fixed_batch(
+                        mechanism_state=mechanism_config.mechanism_state,
+                        sampling_semantics=sampling_semantics,
+                        steps=int(total_steps),
+                        sample_rate=sample_rate,
+                        kwargs=kwargs,
+                    )
+                elif mechanism_config.mechanism == "bisr":
                     bsr_mf_sensitivity = self._resolve_bisr_mf_sensitivity_for_fixed_batch(
                         mechanism_state=mechanism_config.mechanism_state,
                         sampling_semantics=sampling_semantics,
@@ -1691,11 +1771,19 @@ class PrivacyEngine:
                     kwargs=kwargs,
                 )
         if (
-            mechanism_config.mechanism in ("bsr", "bisr", "bandinvmf")
+            mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf")
             and sampling_semantics is not None
             and sampling_semantics.sampling_mode == "torch_sampler"
         ):
-            if mechanism_config.mechanism == "bisr":
+            if mechanism_config.mechanism == "bandmf":
+                bsr_mf_sensitivity = self._resolve_bandmf_mf_sensitivity_for_fixed_batch(
+                    mechanism_state=mechanism_config.mechanism_state,
+                    sampling_semantics=sampling_semantics,
+                    steps=implied_steps,
+                    sample_rate=sample_rate,
+                    kwargs=kwargs,
+                )
+            elif mechanism_config.mechanism == "bisr":
                 bsr_mf_sensitivity = self._resolve_bisr_mf_sensitivity_for_fixed_batch(
                     mechanism_state=mechanism_config.mechanism_state,
                     sampling_semantics=sampling_semantics,
@@ -2427,7 +2515,7 @@ class PrivacyEngine:
             kwargs=coeff_resolution_kwargs,
         )
         if (
-            mechanism_config.mechanism == "bandinvmf"
+            mechanism_config.mechanism in ("bandmf", "bandinvmf")
             and mechanism_config.mechanism_state.get("z_std") is None
         ):
             state = copy.deepcopy(mechanism_config.mechanism_state)

@@ -16,8 +16,13 @@ from __future__ import annotations
 
 import math
 
+from opacus.accountants.analysis.bandmf import (
+    compute_bandmf_mf_sensitivity_from_coeffs,
+)
 from opacus.accountants.analysis.bsr import (
     bsr_cyclic_poisson_epsilon_upper_bound,
+    bsr_fixed_batch_epsilon_upper_bound,
+    resolve_bsr_fixed_batch_gaussian_contract,
     resolve_bsr_cyclic_gaussian_contract,
 )
 
@@ -26,17 +31,15 @@ from .accountant import IAccountant
 
 class BandMFAccountant(IAccountant):
     """
-    Accountant adapter for cyclic-poisson BandMF accounting.
+    Accountant adapter for BandMF accounting.
 
-    This class keeps BandMF accounting intentionally separate from fixed-batch
-    BSR paths even though both reuse shared analysis helpers. The core runtime
-    contract is to transform history and sampling metadata into the cyclic
-    composition tuple ``(q, cycles)`` and a sensitivity normalization scale.
+    BandMF supports two accounting reductions:
+    1. fixed-batch Toeplitz sensitivity under ``(k, b)`` participation;
+    2. cyclic-poisson reduction via ``q = bands * sample_rate`` and a
+       sensitivity normalization scale.
 
-    Math branch:
-    ``q = b·p``, ``N_{cycles} = ⌈T / b⌉``.
-
-    Source: BandMF (Choquette-Choo et al., 2023), Section 5 and Theorems 4 and 5.
+    Source: BandMF (Choquette-Choo et al., 2023), fixed-participation and
+    cyclic Toeplitz accounting reductions.
     """
 
     def __init__(self):
@@ -70,6 +73,172 @@ class BandMFAccountant(IAccountant):
 
         return {"q": q, "cycles": cycles, "bands": int(bands), "steps": int(steps)}
 
+    @staticmethod
+    def _resolve_fixed_batch_contract_inputs(
+        *,
+        state: dict,
+        metadata: dict,
+        kwargs: dict,
+        total_steps: int,
+        sample_rate: float,
+    ) -> tuple[object, int, int, int, object, bool]:
+        mf_sensitivity = kwargs.get(
+            "bsr_mf_sensitivity",
+            metadata.get(
+                "bsr_mf_sensitivity",
+                state.get("bsr_mf_sensitivity"),
+            ),
+        )
+        explicit_mf_sensitivity_override = "bsr_mf_sensitivity" in kwargs
+        coeffs = state.get("coeffs")
+        max_participations = kwargs.get(
+            "bsr_max_participations",
+            metadata.get(
+                "bsr_max_participations",
+                state.get("bsr_max_participations"),
+            ),
+        )
+        min_separation = kwargs.get(
+            "bsr_min_separation",
+            metadata.get(
+                "bsr_min_separation",
+                state.get("bsr_min_separation"),
+            ),
+        )
+        sensitivity_steps = kwargs.get(
+            "bsr_iterations_number",
+            metadata.get(
+                "bsr_iterations_number",
+                state.get("bsr_iterations_number"),
+            ),
+        )
+
+        if sensitivity_steps is None:
+            sensitivity_steps = total_steps
+
+        sensitivity_steps = int(sensitivity_steps)
+        if sensitivity_steps < 1:
+            raise ValueError("bsr_iterations_number must be >= 1")
+
+        if max_participations is None:
+            max_participations = int(math.ceil(float(sample_rate) * float(sensitivity_steps)))
+            max_participations = max(1, int(max_participations))
+
+        if min_separation is None:
+            min_separation = 1
+
+        return (
+            coeffs,
+            int(max_participations),
+            int(min_separation),
+            int(sensitivity_steps),
+            mf_sensitivity,
+            bool(explicit_mf_sensitivity_override),
+        )
+
+    @staticmethod
+    def _resolve_fixed_batch_mf_sensitivity(
+        *,
+        coeffs,
+        max_participations: int,
+        min_separation: int,
+        sensitivity_steps: int,
+        mf_sensitivity,
+        explicit_mf_sensitivity_override: bool,
+    ) -> float:
+        def _derive_from_coeffs() -> float:
+            return float(
+                compute_bandmf_mf_sensitivity_from_coeffs(
+                    coeffs=coeffs,
+                    steps=sensitivity_steps,
+                    max_participations=int(max_participations),
+                    min_separation=int(min_separation),
+                )
+            )
+
+        if mf_sensitivity is None:
+            if coeffs is None:
+                raise ValueError(
+                    "fixed-batch bandmf accounting requires MF sensitivity or "
+                    "enough data to derive it: `coeffs`, `max_participations`, `min_separation`"
+                )
+            return _derive_from_coeffs()
+
+        mf_sensitivity = float(mf_sensitivity)
+        if not math.isfinite(mf_sensitivity) or mf_sensitivity <= 0.0:
+            raise ValueError("bsr_mf_sensitivity must be finite and > 0")
+
+        if explicit_mf_sensitivity_override and coeffs is not None:
+            derived = _derive_from_coeffs()
+            if not math.isclose(mf_sensitivity, derived, rel_tol=1e-9, abs_tol=1e-12):
+                raise ValueError(
+                    "provided bsr_mf_sensitivity is inconsistent with "
+                    "coeffs/max_participations/min_separation for the resolved "
+                    "bsr_iterations_number"
+                )
+
+        return float(mf_sensitivity)
+
+    def _get_epsilon_fixed_batch(
+        self,
+        *,
+        delta: float,
+        noise_multiplier: float,
+        sample_rate: float,
+        total_steps: int,
+        state: dict,
+        metadata: dict,
+        kwargs: dict,
+    ) -> float:
+        (
+            coeffs,
+            max_participations,
+            min_separation,
+            sensitivity_steps,
+            mf_sensitivity,
+            explicit_mf_sensitivity_override,
+        ) = self._resolve_fixed_batch_contract_inputs(
+            state=state,
+            metadata=metadata,
+            kwargs=kwargs,
+            total_steps=total_steps,
+            sample_rate=sample_rate,
+        )
+        resolved_mf_sensitivity = self._resolve_fixed_batch_mf_sensitivity(
+            coeffs=coeffs,
+            max_participations=max_participations,
+            min_separation=min_separation,
+            sensitivity_steps=sensitivity_steps,
+            mf_sensitivity=mf_sensitivity,
+            explicit_mf_sensitivity_override=explicit_mf_sensitivity_override,
+        )
+        reduced_contract = resolve_bsr_fixed_batch_gaussian_contract(
+            noise_multiplier=float(noise_multiplier),
+            mf_sensitivity=float(resolved_mf_sensitivity),
+        )
+        self.last_contract = {
+            "mechanism": "bandmf",
+            "accounting_mode": "fixed_batch_prv",
+            "sampling_mode": "torch_sampler",
+            "global_steps": int(total_steps),
+            "sample_rate": float(sample_rate),
+            "sensitivity_steps": int(sensitivity_steps),
+            "max_participations": int(max_participations),
+            "min_separation": int(min_separation),
+            "mf_sensitivity": float(resolved_mf_sensitivity),
+            "effective_noise_multiplier": float(
+                reduced_contract["effective_noise_multiplier"]
+            ),
+            "accountant_backend": "prv",
+        }
+        return float(
+            bsr_fixed_batch_epsilon_upper_bound(
+                noise_multiplier=float(noise_multiplier),
+                target_delta=float(delta),
+                mf_sensitivity=float(resolved_mf_sensitivity),
+            )
+        )
+
     def step(self, *, noise_multiplier: float, sample_rate: float):
         # `noise_multiplier` and `sample_rate` are recorded per step for composition.
         if len(self.history) >= 1:
@@ -98,15 +267,7 @@ class BandMFAccountant(IAccountant):
         **kwargs,
     ) -> float:
         """
-        Compute epsilon for cyclic BandMF under sampled-Gaussian composition.
-
-        Steps:
-        1. validate constant history,
-        2. read cyclic metadata (including ``bands``),
-        3. normalize runtime noise by ``bsr_sensitivity_scale``,
-        4. compose sampled-Gaussian RDP over the derived contract.
-
-        Source: BandMF (Choquette-Choo et al., 2023), Section 5 and Theorems 4 and 5.
+        Compute epsilon for BandMF under the sampling-selected accounting branch.
         """
         if not self.history:
             return 0.0
@@ -133,10 +294,17 @@ class BandMFAccountant(IAccountant):
             if sampling_semantics is not None
             else None
         )
- 
+        state = mechanism_state if isinstance(mechanism_state, dict) else {}
+
         if sampling_mode != "cyclic_poisson":
-            raise ValueError(
-                "bandmf accountant requires cyclic_poisson sampling semantics"
+            return self._get_epsilon_fixed_batch(
+                delta=delta,
+                noise_multiplier=float(noise_multiplier),
+                sample_rate=float(sample_rate),
+                total_steps=int(total_steps),
+                state=state,
+                metadata=metadata,
+                kwargs=kwargs,
             )
 
         bands = metadata.get("bands", None)
