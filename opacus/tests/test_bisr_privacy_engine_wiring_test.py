@@ -8,6 +8,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from opacus import NoiseMechanismConfig, PrivacyEngine
+from opacus.accountants.bsr import resolve_bisr_mf_sensitivity_for_fixed_batch
 from opacus.accountants.utils import get_noise_multiplier
 from opacus.optimizers import CorrelatedNoiseMechanism
 
@@ -107,7 +108,7 @@ def test_bisr_fixed_batch_noise_search_accepts_explicit_mf_sensitivity() -> None
         privacy_metadata={},
     )
 
-    resolved = pe._resolve_bisr_mf_sensitivity_for_fixed_batch(
+    resolved = resolve_bisr_mf_sensitivity_for_fixed_batch(
         mechanism_state=state,
         sampling_semantics=semantics,
         steps=2000,

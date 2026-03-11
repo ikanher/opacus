@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from opacus.privacy_engine import PrivacyEngine
+from opacus.accountants.bandmf import optimize_cyclic_bandmf_strategy_coeffs
 
 
 pytest.importorskip("jax_privacy")
@@ -17,7 +17,7 @@ def _jax_strategy(*, steps: int, bands: int) -> list[float]:
 
 
 def _opacus_auto_strategy(*, steps: int, bands: int) -> list[float]:
-    return PrivacyEngine._optimize_bsr_cyclic_coeffs(
+    return optimize_cyclic_bandmf_strategy_coeffs(
         bands=int(bands),
         steps=int(steps),
     )
@@ -31,7 +31,7 @@ def test_id_band_strategy_matches_jax_reference() -> None:
 
 
 def test_cyclic_bsr_auto_strategy_rejects_steps_below_bands() -> None:
-    with pytest.raises(ValueError, match="steps >= bands"):
+    with pytest.raises(ValueError, match="steps must be >= bands"):
         _opacus_auto_strategy(steps=5, bands=8)
 
 

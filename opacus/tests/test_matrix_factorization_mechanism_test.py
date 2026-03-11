@@ -106,6 +106,15 @@ def test_noise_mechanism_config_bandmf_requires_bandmf_accountant() -> None:
         )
 
 
+def test_noise_mechanism_config_gaussian_accepts_bnb_accountant() -> None:
+    cfg = NoiseMechanismConfig(
+        mechanism="gaussian",
+        accounting_mode="bnb_accountant",
+        mechanism_state={},
+    )
+    assert cfg.accounting_mode == "bnb_accountant"
+
+
 def test_noise_mechanism_config_rejects_correlated_alias() -> None:
     with pytest.raises(ValueError, match="mechanism must be one of"):
         NoiseMechanismConfig(

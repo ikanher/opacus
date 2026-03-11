@@ -17,7 +17,7 @@ def validate_bnb_runtime_consistency(
     coeffs_error_prefix: str,
 ) -> None:
     state = mechanism_state if isinstance(mechanism_state, dict) else {}
-    coeffs = state.get("coeffs")
+    coeffs = state.get("bnb_accountant_coeffs", state.get("coeffs"))
 
     if coeffs is None or not isinstance(coeffs, (list, tuple)) or len(coeffs) == 0:
         raise ValueError(f"{coeffs_error_prefix} requires non-empty `coeffs`")

@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
 from opacus.accountants.analysis.bnb import build_bnb_toeplitz_c_matrix_and_contract
+from opacus.optimizers import GaussianNoiseMechanism
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -218,6 +219,100 @@ def _run_balls_in_bins_mf_training_smoke(*, mechanism: str, coeffs: list[float])
     assert eps > 0.0
 
 
+def _run_balls_in_bins_gaussian_training_smoke() -> None:
+    model = nn.Sequential(
+        nn.Linear(4, 16),
+        nn.ReLU(),
+        nn.Linear(16, 3),
+    )
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    loader = _build_loader()
+    pe = PrivacyEngine()
+
+    private_model, dp_optimizer, private_loader = pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=loader,
+        noise_multiplier=0.6,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_generator=torch.Generator().manual_seed(41),
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="gaussian",
+            accounting_mode="bnb_accountant",
+            mechanism_state={},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 4, "bands": 1},
+        ),
+    )
+
+    x, y = next(iter(private_loader))
+    dp_optimizer.zero_grad()
+    loss = F.cross_entropy(private_model(x), y)
+    loss.backward()
+    dp_optimizer.step()
+    assert torch.isfinite(loss)
+    assert isinstance(dp_optimizer.noise_mechanism, GaussianNoiseMechanism)
+
+    eps = pe.get_epsilon(delta=0.2)
+    assert eps > 0.0
+
+
+def _run_balls_in_bins_mf_training_smoke_autocoeff(*, mechanism: str, bands: int) -> None:
+    model = nn.Sequential(
+        nn.Linear(4, 16),
+        nn.ReLU(),
+        nn.Linear(16, 3),
+    )
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=0.05,
+        momentum=0.3,
+        weight_decay=0.9,
+    )
+    loader = _build_loader()
+    pe = PrivacyEngine()
+
+    noise_multiplier = 0.6
+    max_grad_norm = 1.0
+    batch_size = loader.batch_size
+    assert batch_size is not None
+
+    private_model, dp_optimizer, private_loader = pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=loader,
+        noise_multiplier=noise_multiplier,
+        max_grad_norm=max_grad_norm,
+        poisson_sampling=False,
+        noise_generator=torch.Generator().manual_seed(31),
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism=mechanism,
+            accounting_mode="bnb_accountant",
+            mechanism_state={
+                "bsr_bands": bands,
+                "_noise_mechanism": mechanism,
+            },
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 4, "bands": bands},
+        ),
+    )
+
+    x, y = next(iter(private_loader))
+    dp_optimizer.zero_grad()
+    loss = F.cross_entropy(private_model(x), y)
+    loss.backward()
+    dp_optimizer.step()
+    assert torch.isfinite(loss)
+
+    eps = pe.get_epsilon(delta=0.2)
+    assert eps > 0.0
+
+
 def test_bnb_b_min_sep_training_smoke_loop() -> None:
     with pytest.raises(ValueError, match="b_min_sep sampling is temporarily disabled"):
         _run_bnb_training_smoke(
@@ -294,6 +389,18 @@ def test_bsr_balls_in_bins_training_smoke_loop() -> None:
 
 def test_bisr_balls_in_bins_training_smoke_loop() -> None:
     _run_balls_in_bins_mf_training_smoke(mechanism="bisr", coeffs=[1.0, -0.5])
+
+
+def test_bsr_balls_in_bins_training_smoke_loop_autocoeff() -> None:
+    _run_balls_in_bins_mf_training_smoke_autocoeff(mechanism="bsr", bands=2)
+
+
+def test_bisr_balls_in_bins_training_smoke_loop_autocoeff() -> None:
+    _run_balls_in_bins_mf_training_smoke_autocoeff(mechanism="bisr", bands=2)
+
+
+def test_gaussian_balls_in_bins_training_smoke_loop() -> None:
+    _run_balls_in_bins_gaussian_training_smoke()
 
 
 def test_target_epsilon_sampler_paths_smoke() -> None:

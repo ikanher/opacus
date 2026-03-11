@@ -29,7 +29,7 @@ def resolve_bnb_b_min_sep_inputs(
     mechanism_state: Dict[str, Any],
     sampling_semantics,
     kwargs: Dict[str, Any],
-) -> Tuple[Any, int, Dict[str, Any]]:
+) -> Tuple[Any, int, int, Dict[str, Any]]:
     state = mechanism_state if isinstance(mechanism_state, dict) else {}
     metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
     c_matrix = kwargs.get(
@@ -68,7 +68,17 @@ def resolve_bnb_b_min_sep_inputs(
             "`bnb_c_matrix`, `bnb_bands`, and `bnb_c_matrix_contract`"
         )
 
-    return c_matrix, int(bands), c_matrix_contract
+    cycle_length = kwargs.get(
+        "bnb_cycle_length",
+        metadata.get(
+            "bins",
+            state.get("bnb_cycle_length", state.get("bnb_bins")),
+        ),
+    )
+    if cycle_length is None:
+        cycle_length = bands
+
+    return c_matrix, int(bands), int(cycle_length), c_matrix_contract
 
 
 def validate_bnb_accounting_runtime_consistency(
@@ -217,6 +227,10 @@ class BNBAccountant(IAccountant):
         # `bands` is the min-separation/bin-width parameter in b-min-sep construction.
         c_matrix = kwargs.get("bnb_c_matrix", state.get("bnb_c_matrix"))
         bands = kwargs.get("bnb_bands", metadata.get("bands", state.get("bnb_bands")))
+        cycle_length = kwargs.get(
+            "bnb_cycle_length",
+            metadata.get("bins", state.get("bnb_cycle_length", state.get("bnb_bins"))),
+        )
         c_matrix_contract = kwargs.get(
             "bnb_c_matrix_contract",
             state.get("bnb_c_matrix_contract"),
@@ -262,6 +276,9 @@ class BNBAccountant(IAccountant):
             and bands is not None
             and c_matrix_contract is not None
         ):
+            if cycle_length is None:
+                cycle_length = bands
+
             self._validate_builtin_b_min_sep_consistency(
                 mechanism_state=state,
                 sampling_semantics=sampling_semantics,
@@ -273,6 +290,7 @@ class BNBAccountant(IAccountant):
                 estimate_b_min_sep_epsilon_monte_carlo(
                     c_matrix=c_matrix,
                     bands=int(bands),
+                    cycle_length=int(cycle_length),
                     noise_multiplier=float(noise_multiplier),
                     target_delta=float(delta),
                     num_samples=num_samples,

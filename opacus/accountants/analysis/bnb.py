@@ -34,6 +34,38 @@ _BNB_CALIBRATION_DEFAULTS: Dict[str, Any] = {
 }
 
 
+def normalize_bnb_accountant_coeffs(
+    *,
+    coeffs: Sequence[float],
+) -> list[float]:
+    """
+    Normalize a non-negative Toeplitz first column for amplified BNB accounting.
+
+    JAX's balls-in-bins Monte Carlo path consumes a non-negative accountant-side
+    ``c_col`` whose scale is separated from the total noise multiplier. This
+    helper mirrors that contract for amplified BSR parity by normalizing the
+    accountant-side coefficients to unit L2 norm while leaving runtime
+    mechanism coefficients unchanged.
+    """
+    coeff_list = [float(c) for c in coeffs]
+    if len(coeff_list) == 0:
+        raise ValueError("coeffs must be non-empty")
+
+    if not all(math.isfinite(c) for c in coeff_list):
+        raise ValueError("coeffs must be finite")
+
+    if any(c < 0.0 for c in coeff_list):
+        raise ValueError("coeffs must be nonnegative")
+
+    norm_sq = sum(c * c for c in coeff_list)
+    if norm_sq <= 0.0:
+        raise ValueError("coeffs must have positive L2 norm")
+
+    norm = math.sqrt(norm_sq)
+
+    return [c / norm for c in coeff_list]
+
+
 def resolve_bnb_calibration_kwargs(
     *,
     overrides: Dict[str, Any] | None = None,
@@ -260,18 +292,30 @@ def build_bnb_toeplitz_c_matrix_and_contract(
 
     Use this when callers need a one-shot, self-describing BNB state payload.
     """
+    h = int(horizon)
+    b = int(bands)
+    if h < 1:
+        raise ValueError("horizon must be >= 1")
+    if b < 1:
+        raise ValueError("bands must be >= 1")
+
+    padded_horizon = int(math.ceil(float(h) / float(b)) * b)
     c_matrix = build_lower_toeplitz_c_matrix_from_coeffs(
         coeffs=coeffs,
-        horizon=int(horizon),
+        horizon=int(padded_horizon),
         dtype=dtype,
         device=device,
     )
     contract = make_bnb_toeplitz_c_matrix_contract(
         c_matrix=c_matrix,
-        bands=int(bands),
-        horizon=int(horizon),
+        bands=b,
+        horizon=h,
         atol=float(atol),
     )
+    if padded_horizon != h:
+        contract["derivation"] = "lower_toeplitz_from_coeffs_right_padded"
+        contract["padded_horizon"] = int(padded_horizon)
+        contract["padding_columns"] = int(padded_horizon - h)
     return c_matrix, contract
 
 
@@ -322,22 +366,40 @@ def validate_bnb_c_matrix_contract(
     derivation = c_matrix_contract.get("derivation")
     if derivation is None:
         return
-    if derivation != "lower_toeplitz_from_coeffs":
+    if derivation not in (
+        "lower_toeplitz_from_coeffs",
+        "lower_toeplitz_from_coeffs_right_padded",
+    ):
         raise ValueError(
             "bnb consistency check failed: unsupported c_matrix_contract['derivation']; "
-            "supported values: {'lower_toeplitz_from_coeffs'}"
+            "supported values: {'lower_toeplitz_from_coeffs', 'lower_toeplitz_from_coeffs_right_padded'}"
         )
 
     horizon = int(c_matrix_contract.get("horizon", c_matrix.shape[1]))
-    if int(c_matrix.shape[0]) != horizon or int(c_matrix.shape[1]) != horizon:
+    padded_horizon = int(c_matrix_contract.get("padded_horizon", horizon))
+    padding_columns = int(c_matrix_contract.get("padding_columns", padded_horizon - horizon))
+    if padded_horizon < horizon:
+        raise ValueError(
+            "bnb consistency check failed: c_matrix_contract['padded_horizon'] "
+            "must be >= c_matrix_contract['horizon']"
+        )
+    if padded_horizon - horizon != padding_columns:
+        raise ValueError(
+            "bnb consistency check failed: c_matrix_contract padding metadata is inconsistent"
+        )
+    if derivation == "lower_toeplitz_from_coeffs" and padding_columns != 0:
+        raise ValueError(
+            "bnb consistency check failed: unpadded derivation cannot declare padding_columns"
+        )
+    if int(c_matrix.shape[0]) != padded_horizon or int(c_matrix.shape[1]) != padded_horizon:
         raise ValueError(
             "bnb consistency check failed: lower_toeplitz_from_coeffs requires "
-            f"square c_matrix with shape [{horizon}, {horizon}]"
+            f"square c_matrix with shape [{padded_horizon}, {padded_horizon}]"
         )
 
     expected = build_lower_toeplitz_c_matrix_from_coeffs(
         coeffs=coeffs,
-        horizon=int(horizon),
+        horizon=int(padded_horizon),
         dtype=torch.float64,
         device=c_matrix.device,
     )
@@ -671,44 +733,51 @@ def select_evr_candidate_ladder_two_sided(
 def build_b_min_sep_gaussian_mixture(
     *,
     c_matrix: torch.Tensor,
-    bands: int,
+    bands: int | None = None,
+    cycle_length: int | None = None,
     reduce_dimensionality: bool = False,
 ) -> GaussianMixture:
     """
     Build the BMinSep Gaussian mixture induced by matrix ``C``.
 
-    Under b-min-separation participation, one sample's contribution induces a
-    finite set of possible mean shifts in the matrix mechanism output. This
-    function constructs that finite mixture by summing ``bands``-aligned stripes
-    of ``C`` and assigning uniform component probabilities.
+    Under cycle-aligned participation such as balls-in-bins, one sample's
+    contribution induces a finite set of possible mean shifts in the matrix
+    mechanism output. For cycle length ``b``, the positive distribution is a
+    uniform mixture over the ``b`` possible starting offsets. Each mode is the
+    sum of the columns of ``C`` whose indices share the same residue modulo
+    ``b``.
 
-    This mirrors the Monte Carlo construction used for BMinSep accounting in
-    the accompanying paper workflow.
+    This matches the current JAX balls-in-bins Monte Carlo construction, where
+    the sensitive example is assigned one cycle offset uniformly at random and
+    then participates in every iteration with that offset.
 
     Source: BMinSep (Dong and Ganesh, 2025 draft), Section 5, Equations (2)-(4).
     """
     if c_matrix.ndim != 2:
         raise ValueError("c_matrix must have shape [d, m]")
 
-    if bands <= 0:
-        raise ValueError("bands must be > 0")
+    grouping = (
+        int(cycle_length)
+        if cycle_length is not None
+        else (int(bands) if bands is not None else None)
+    )
+    if grouping is None:
+        raise ValueError("cycle_length or bands must be provided")
+    if grouping <= 0:
+        raise ValueError("cycle_length must be > 0")
 
-    d, m = c_matrix.shape
-    if m % bands != 0:
-        raise ValueError(
-            "bands must evenly divide c_matrix.shape[1] "
-            f"(got m={m}, bands={bands})"
-        )
+    d, _m = c_matrix.shape
+    modes = torch.stack(
+        [c_matrix[:, offset::grouping].sum(dim=1) for offset in range(grouping)],
+        dim=0,
+    )  # [grouping, d]
 
-    # `bands` is the b-min-separation/bin-width parameter.
-    num_components = m // bands
-    modes = c_matrix.reshape(d, bands, num_components).sum(dim=1)  # [d, k]
     if reduce_dimensionality:
         # Keep the same behavior class as notebook-style dimensionality reduction.
-        modes = torch.linalg.qr(modes, mode="r").R
+        modes = torch.linalg.qr(modes.T, mode="r").R.T
 
-    modes = modes.T.contiguous()  # [k, d']
-    probs = torch.full((num_components,), 1.0 / float(num_components), dtype=modes.dtype)
+    modes = modes.contiguous()  # [b, d']
+    probs = torch.full((grouping,), 1.0 / float(grouping), dtype=modes.dtype)
 
     return GaussianMixture(modes=modes, probs=probs)
 
@@ -796,7 +865,8 @@ def compute_llr_samples(
 def sample_b_min_sep_llr(
     *,
     c_matrix: torch.Tensor,
-    bands: int,
+    bands: int | None = None,
+    cycle_length: int | None = None,
     sigma: float,
     num_samples: int,
     seed: int = 0,
@@ -824,6 +894,7 @@ def sample_b_min_sep_llr(
     up_gm = build_b_min_sep_gaussian_mixture(
         c_matrix=c_matrix,
         bands=bands,
+        cycle_length=cycle_length,
         reduce_dimensionality=reduce_dimensionality,
     )
     zero_mode = torch.zeros(
@@ -1005,7 +1076,8 @@ def _resolve_epsilon_upper_bound(
 def estimate_b_min_sep_epsilon_monte_carlo(
     *,
     c_matrix: torch.Tensor,
-    bands: int,
+    bands: int | None = None,
+    cycle_length: int | None = None,
     noise_multiplier: float,
     target_delta: float,
     num_samples: int,
@@ -1035,6 +1107,7 @@ def estimate_b_min_sep_epsilon_monte_carlo(
     llr_samples = sample_b_min_sep_llr(
         c_matrix=c_matrix,
         bands=bands,
+        cycle_length=cycle_length,
         sigma=float(noise_multiplier),
         num_samples=int(num_samples),
         seed=int(seed),
@@ -1052,7 +1125,8 @@ def estimate_b_min_sep_epsilon_monte_carlo(
 def estimate_b_min_sep_delta_monte_carlo(
     *,
     c_matrix: torch.Tensor,
-    bands: int,
+    bands: int | None = None,
+    cycle_length: int | None = None,
     noise_multiplier: float,
     epsilon: float,
     num_samples: int,
@@ -1083,6 +1157,7 @@ def estimate_b_min_sep_delta_monte_carlo(
     llr_samples = sample_b_min_sep_llr(
         c_matrix=c_matrix,
         bands=bands,
+        cycle_length=cycle_length,
         sigma=float(noise_multiplier),
         num_samples=int(num_samples),
         seed=int(seed),
@@ -1205,7 +1280,8 @@ def find_sigma_binary_search(
 def calibrate_b_min_sep_noise_multiplier_monte_carlo(
     *,
     c_matrix: torch.Tensor,
-    bands: int,
+    bands: int | None = None,
+    cycle_length: int | None = None,
     target_epsilon: float,
     target_delta: float,
     num_samples: int,
@@ -1240,6 +1316,7 @@ def calibrate_b_min_sep_noise_multiplier_monte_carlo(
         return estimate_b_min_sep_delta_monte_carlo(
             c_matrix=c_matrix,
             bands=bands,
+            cycle_length=cycle_length,
             noise_multiplier=float(sigma),
             epsilon=float(target_epsilon),
             num_samples=int(num_samples),

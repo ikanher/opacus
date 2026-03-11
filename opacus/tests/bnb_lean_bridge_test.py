@@ -107,7 +107,7 @@ def test_evr_split_union_bound_bridge_matches_runtime_fields() -> None:
 
 def test_b_min_sep_mixture_branch_sum_decomposition_bridge() -> None:
     # Bridge to Lean branch/suffix decomposition spirit:
-    # modes are per-component sums across the band axis.
+    # modes are per-offset sums across the cycle axis.
     c = torch.tensor(
         [
             [1.0, 10.0, 2.0, 20.0, 3.0, 30.0],
@@ -117,10 +117,10 @@ def test_b_min_sep_mixture_branch_sum_decomposition_bridge() -> None:
     )
     bands = 3
     gm = build_b_min_sep_gaussian_mixture(c_matrix=c, bands=bands)
-    d, m = c.shape
-    k = m // bands
-    reshaped = c.reshape(d, bands, k)  # [d, bands, k]
-    expected_modes = reshaped.sum(dim=1).T.contiguous()  # [k, d]
+    expected_modes = torch.stack(
+        [c[:, offset::bands].sum(dim=1) for offset in range(bands)],
+        dim=0,
+    )
     assert torch.allclose(gm.modes, expected_modes)
 
 

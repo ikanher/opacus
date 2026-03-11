@@ -33,6 +33,7 @@ from opacus.accountants.analysis.bnb import (
     find_sigma_binary_search,
     make_bnb_calibration_report,
     make_bnb_toeplitz_c_matrix_contract,
+    normalize_bnb_accountant_coeffs,
     parse_bnb_calibration_report,
     generate_mixture_samples,
     sample_b_min_sep_llr,
@@ -90,6 +91,37 @@ class BNBAnalysisTest(unittest.TestCase):
         self.assertEqual(contract["horizon"], 4)
         self.assertEqual(contract["derivation"], "lower_toeplitz_from_coeffs")
 
+    def test_build_bnb_toeplitz_c_matrix_and_contract_right_pads_nondivisible_horizon(self) -> None:
+        coeffs = [1.0, 0.2, 0.1, 0.05]
+        c, contract = build_bnb_toeplitz_c_matrix_and_contract(
+            coeffs=coeffs,
+            bands=4,
+            horizon=98,
+        )
+        self.assertEqual(tuple(c.shape), (100, 100))
+        self.assertEqual(contract["bands"], 4)
+        self.assertEqual(contract["matrix_columns"], 100)
+        self.assertEqual(contract["horizon"], 98)
+        self.assertEqual(contract["padded_horizon"], 100)
+        self.assertEqual(contract["padding_columns"], 2)
+        self.assertEqual(contract["derivation"], "lower_toeplitz_from_coeffs_right_padded")
+
+    def test_normalize_bnb_accountant_coeffs_returns_unit_l2_coeffs(self) -> None:
+        coeffs = normalize_bnb_accountant_coeffs(coeffs=[1.0, 2.0, 2.0])
+        self.assertAlmostEqual(sum(c * c for c in coeffs), 1.0, places=12)
+        self.assertTrue(all(c >= 0.0 for c in coeffs))
+
+    def test_build_b_min_sep_gaussian_mixture_accepts_paper_padded_shape(self) -> None:
+        coeffs = [1.0, 0.2, 0.1, 0.05]
+        c, _contract = build_bnb_toeplitz_c_matrix_and_contract(
+            coeffs=coeffs,
+            bands=4,
+            horizon=98,
+        )
+        gm = build_b_min_sep_gaussian_mixture(c_matrix=c, bands=4)
+        self.assertEqual(gm.modes.shape[0], 4)
+        self.assertEqual(gm.modes.shape[1], 100)
+
     def test_gaussian_mixture_requires_probs_sum_to_one(self) -> None:
         with self.assertRaisesRegex(ValueError, "sum to 1"):
             GaussianMixture(
@@ -105,20 +137,52 @@ class BNBAnalysisTest(unittest.TestCase):
             ]
         )
         gm = build_b_min_sep_gaussian_mixture(c_matrix=c, bands=3)
-        expected_modes = torch.tensor([[6.0, 15.0], [60.0, 150.0]])
+        expected_modes = torch.tensor(
+            [
+                [21.0, 54.0],
+                [13.0, 46.0],
+                [32.0, 65.0],
+            ]
+        )
         self.assertTrue(torch.allclose(gm.modes, expected_modes))
-        self.assertTrue(torch.allclose(gm.probs, torch.tensor([0.5, 0.5])))
+        self.assertTrue(
+            torch.allclose(gm.probs, torch.tensor([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]))
+        )
 
-    def test_build_b_min_sep_reduced_dimensionality(self) -> None:
-        # d > k so reduction should project to k-dimensional subspace.
-        c = torch.arange(1, 11, dtype=torch.float32).reshape(5, 2)
+    def test_build_b_min_sep_mixture_can_separate_cycle_length_from_matrix_bandwidth(self) -> None:
+        c = torch.tensor(
+            [
+                [1.0, 10.0, 2.0, 20.0, 3.0, 30.0],
+                [4.0, 40.0, 5.0, 50.0, 6.0, 60.0],
+            ]
+        )
         gm = build_b_min_sep_gaussian_mixture(
             c_matrix=c,
-            bands=1,
+            bands=2,
+            cycle_length=3,
+        )
+        expected_modes = torch.tensor(
+            [
+                [21.0, 54.0],
+                [13.0, 46.0],
+                [32.0, 65.0],
+            ]
+        )
+        self.assertTrue(torch.allclose(gm.modes, expected_modes))
+        self.assertTrue(
+            torch.allclose(gm.probs, torch.tensor([1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]))
+        )
+
+    def test_build_b_min_sep_reduced_dimensionality(self) -> None:
+        # d > b so reduction should project to b-dimensional subspace.
+        c = torch.arange(1, 16, dtype=torch.float32).reshape(5, 3)
+        gm = build_b_min_sep_gaussian_mixture(
+            c_matrix=c,
+            bands=3,
             reduce_dimensionality=True,
         )
-        self.assertEqual(gm.modes.shape[0], 2)
-        self.assertEqual(gm.modes.shape[1], 2)
+        self.assertEqual(gm.modes.shape[0], 3)
+        self.assertEqual(gm.modes.shape[1], 3)
 
     def test_generate_mixture_samples_is_seed_reproducible(self) -> None:
         gm = GaussianMixture(

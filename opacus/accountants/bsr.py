@@ -14,22 +14,363 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from typing import Any, Dict, Optional
 
+from torch import optim
+
 from opacus.accountants.analysis.bisr import (
     compute_bisr_fixed_batch_sensitivity_from_inverse_coeffs,
+    compute_bisr_kappa_from_coeffs,
+    generate_bisr_coeffs_from_sgd_workload,
 )
 from opacus.accountants.analysis.bsr import (
     compute_bsr_mf_sensitivity_from_coeffs,
     compute_bsr_kappa_from_coeffs,
     bsr_fixed_batch_epsilon_upper_bound,
     bsr_cyclic_poisson_epsilon_upper_bound,
+    generate_bsr_coeffs_from_sgd_workload,
     resolve_bsr_cyclic_gaussian_contract,
     resolve_bsr_fixed_batch_gaussian_contract,
 )
+from opacus.mechanism_contracts import NoiseMechanismConfig
 
 from .accountant import IAccountant
+
+
+def resolve_uniform_sgd_workload_from_optimizer(
+    *,
+    optimizer: optim.Optimizer,
+) -> tuple[float, float]:
+    momenta: list[float] = []
+    decays: list[float] = []
+
+    for group in optimizer.param_groups:
+        momenta.append(float(group.get("momentum", 0.0)))
+        decays.append(float(group.get("weight_decay", 0.0)))
+
+    if len(momenta) == 0:
+        raise ValueError("optimizer must contain at least one parameter group")
+
+    m0 = float(momenta[0])
+    d0 = float(decays[0])
+    for m in momenta[1:]:
+        if not math.isclose(float(m), m0, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(
+                "bsr analytical auto-coeff generation requires uniform optimizer momentum "
+                "across parameter groups"
+            )
+
+    for d in decays[1:]:
+        if not math.isclose(float(d), d0, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError(
+                "bsr analytical auto-coeff generation requires uniform optimizer weight_decay "
+                "across parameter groups"
+            )
+
+    return m0, d0
+
+
+def ensure_bsr_family_cyclic_coeffs(
+    *,
+    mechanism_config: NoiseMechanismConfig,
+    sampling_semantics,
+    steps: int,
+    optimizer: optim.Optimizer,
+    kwargs: Dict[str, Any],
+) -> NoiseMechanismConfig:
+    if mechanism_config.mechanism not in ("bsr", "bisr"):
+        return mechanism_config
+
+    state = copy.deepcopy(mechanism_config.mechanism_state)
+    state["_noise_mechanism"] = mechanism_config.mechanism
+    coeffs = state.get("coeffs")
+    if isinstance(coeffs, (list, tuple)) and len(coeffs) > 0:
+        return NoiseMechanismConfig(
+            mechanism=mechanism_config.mechanism,
+            accounting_mode=mechanism_config.accounting_mode,
+            mechanism_state=state,
+        )
+
+    if (
+        sampling_semantics is None
+        or sampling_semantics.sampling_mode != "cyclic_poisson"
+    ):
+        return mechanism_config
+
+    metadata = (
+        sampling_semantics.privacy_metadata
+        if sampling_semantics is not None
+        else {}
+    )
+    metadata_bands = metadata.get("bands")
+    explicit_bands = kwargs.get("bsr_bands")
+    if explicit_bands is not None and metadata_bands is not None:
+        if int(explicit_bands) != int(metadata_bands):
+            raise ValueError(
+                "conflicting canonical inputs: `bsr_bands` must match "
+                "sampling_semantics privacy_metadata['bands']"
+            )
+
+    bands = kwargs.get("bsr_bands", metadata.get("bands", state.get("bsr_bands")))
+    if bands is None:
+        raise ValueError(
+            "auto coeff generation requires bands via `mechanism_state['bsr_bands']`, "
+            "`sampling_semantics.privacy_metadata['bands']`, or `bsr_bands`"
+        )
+
+    bands = int(bands)
+    if bands <= 0:
+        raise ValueError("bands must be > 0")
+
+    if int(steps) < bands:
+        raise ValueError(
+            f"{mechanism_config.mechanism} coefficient resolution requires steps >= bands; "
+            f"got steps={int(steps)}, bands={bands}"
+        )
+
+    momentum, weight_decay = resolve_uniform_sgd_workload_from_optimizer(
+        optimizer=optimizer
+    )
+    if mechanism_config.mechanism == "bisr":
+        state["coeffs"] = generate_bisr_coeffs_from_sgd_workload(
+            bands=bands,
+            momentum=momentum,
+            weight_decay=weight_decay,
+        )
+    else:
+        state["coeffs"] = generate_bsr_coeffs_from_sgd_workload(
+            bands=bands,
+            momentum=momentum,
+            weight_decay=weight_decay,
+        )
+    state["bsr_bands"] = bands
+    state["coeff_source"] = "analytical_auto"
+
+    return NoiseMechanismConfig(
+        mechanism=mechanism_config.mechanism,
+        accounting_mode=mechanism_config.accounting_mode,
+        mechanism_state=state,
+    )
+
+
+def ensure_bsr_family_fixed_analytical_coeffs(
+    *,
+    mechanism_config: NoiseMechanismConfig,
+    optimizer: optim.Optimizer,
+    sampling_semantics,
+    kwargs: Dict[str, Any],
+) -> NoiseMechanismConfig:
+    if mechanism_config.mechanism not in ("bsr", "bisr"):
+        return mechanism_config
+
+    state = copy.deepcopy(mechanism_config.mechanism_state)
+    coeffs = state.get("coeffs")
+    if isinstance(coeffs, (list, tuple)) and len(coeffs) > 0:
+        return mechanism_config
+
+    metadata = (
+        sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
+    )
+    metadata_bands = metadata.get("bands")
+    explicit_bands = kwargs.get("bsr_bands")
+    if explicit_bands is not None and metadata_bands is not None:
+        if int(explicit_bands) != int(metadata_bands):
+            raise ValueError(
+                "conflicting canonical inputs: `bsr_bands` must match "
+                "sampling_semantics privacy_metadata['bands']"
+            )
+    bands = kwargs.get("bsr_bands", metadata.get("bands", state.get("bsr_bands")))
+    if bands is None:
+        raise ValueError(
+            f"{mechanism_config.mechanism} analytical auto-coeff generation requires bands via "
+            "`mechanism_state['bsr_bands']`, `sampling_semantics.privacy_metadata['bands']`, "
+            "or `bsr_bands`"
+        )
+
+    bands = int(bands)
+    if bands < 1:
+        raise ValueError(f"{mechanism_config.mechanism} bands must be >= 1")
+
+    steps_hint = kwargs.get("total_steps", metadata.get("total_steps"))
+    if steps_hint is not None and int(steps_hint) < bands:
+        raise ValueError(
+            f"{mechanism_config.mechanism} analytical auto-coeff generation requires steps >= bands; "
+            f"got steps={int(steps_hint)}, bands={bands}"
+        )
+
+    momentum, weight_decay = resolve_uniform_sgd_workload_from_optimizer(
+        optimizer=optimizer
+    )
+    if mechanism_config.mechanism == "bisr":
+        state["coeffs"] = generate_bisr_coeffs_from_sgd_workload(
+            bands=bands,
+            momentum=momentum,
+            weight_decay=weight_decay,
+        )
+    else:
+        state["coeffs"] = generate_bsr_coeffs_from_sgd_workload(
+            bands=bands,
+            momentum=momentum,
+            weight_decay=weight_decay,
+        )
+    state["bsr_bands"] = bands
+    state["coeff_source"] = "analytical_auto"
+
+    return NoiseMechanismConfig(
+        mechanism=mechanism_config.mechanism,
+        accounting_mode=mechanism_config.accounting_mode,
+        mechanism_state=state,
+    )
+
+
+def resolve_bisr_sensitivity_scale_for_cyclic(
+    *,
+    mechanism_state: Dict[str, Any],
+    sampling_semantics,
+    steps: int,
+    kwargs: Dict[str, Any],
+) -> float:
+    metadata = (
+        sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
+    )
+    explicit_scale = kwargs.get(
+        "bsr_sensitivity_scale",
+        metadata.get("bsr_sensitivity_scale", mechanism_state.get("bsr_sensitivity_scale")),
+    )
+    if explicit_scale is not None:
+        sensitivity_scale = float(explicit_scale)
+        if (not math.isfinite(sensitivity_scale)) or sensitivity_scale <= 0.0:
+            raise ValueError("bsr_sensitivity_scale must be finite and > 0")
+        return float(sensitivity_scale)
+
+    bands = kwargs.get(
+        "bsr_bands",
+        metadata.get("bands", mechanism_state.get("bsr_bands")),
+    )
+    if bands is None:
+        coeffs = mechanism_state.get("coeffs")
+        bands = len(coeffs) if coeffs is not None else None
+
+    if bands is None:
+        raise ValueError(
+            "cyclic_poisson bisr requires `bands` in sampling semantics metadata, "
+            "`bsr_bands`, or derivable from coeffs"
+        )
+
+    bands = int(bands)
+    if bands <= 0:
+        raise ValueError("bands must be > 0")
+
+    coeffs = mechanism_state.get("coeffs")
+    if coeffs is None:
+        raise ValueError(
+            "cyclic-poisson bisr accounting requires either `bsr_sensitivity_scale` "
+            "or `mechanism_state['coeffs']`"
+        )
+
+    scale_steps = int(
+        kwargs.get(
+            "bsr_iterations_number",
+            metadata.get(
+                "bsr_iterations_number",
+                mechanism_state.get("bsr_iterations_number", steps),
+            ),
+        )
+    )
+    if scale_steps < 1:
+        raise ValueError("bsr_iterations_number must be >= 1")
+
+    if scale_steps < bands:
+        raise ValueError(
+            "cyclic_poisson bisr requires steps >= bands; "
+            f"got steps={scale_steps}, bands={bands}"
+        )
+
+    sensitivity_scale = float(
+        compute_bisr_kappa_from_coeffs(
+            coeffs=coeffs,
+            steps=scale_steps,
+        )
+    )
+    if (not math.isfinite(sensitivity_scale)) or sensitivity_scale <= 0.0:
+        raise ValueError("resolved bsr_sensitivity_scale must be finite and > 0")
+
+    return float(sensitivity_scale)
+
+
+def resolve_bisr_mf_sensitivity_for_fixed_batch(
+    *,
+    mechanism_state: Dict[str, Any],
+    sampling_semantics,
+    steps: int,
+    sample_rate: Optional[float],
+    kwargs: Dict[str, Any],
+) -> float:
+    metadata = (
+        sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
+    )
+    if sample_rate is None:
+        raise ValueError("sample_rate must be provided for bisr fixed-batch sensitivity resolution")
+
+    explicit = kwargs.get(
+        "bsr_mf_sensitivity",
+        metadata.get("bsr_mf_sensitivity", mechanism_state.get("bsr_mf_sensitivity")),
+    )
+    if explicit is not None:
+        value = float(explicit)
+        if (not math.isfinite(value)) or value <= 0.0:
+            raise ValueError("bsr_mf_sensitivity must be finite and > 0")
+        return value
+
+    coeffs = mechanism_state.get("coeffs")
+    if coeffs is None:
+        raise ValueError(
+            "bisr fixed-batch accounting requires either `bsr_mf_sensitivity` "
+            "or `mechanism_state['coeffs']`"
+        )
+
+    sensitivity_steps = int(
+        kwargs.get(
+            "bsr_iterations_number",
+            metadata.get(
+                "bsr_iterations_number",
+                mechanism_state.get("bsr_iterations_number", steps),
+            ),
+        )
+    )
+    if sensitivity_steps < 1:
+        raise ValueError("bsr_iterations_number must be >= 1")
+
+    default_k = max(1, int(math.ceil(float(sample_rate) * float(sensitivity_steps))))
+    max_participations = int(
+        kwargs.get(
+            "bsr_max_participations",
+            metadata.get(
+                "bsr_max_participations",
+                mechanism_state.get("bsr_max_participations", default_k),
+            ),
+        )
+    )
+    min_separation = int(
+        kwargs.get(
+            "bsr_min_separation",
+            metadata.get(
+                "bsr_min_separation",
+                mechanism_state.get("bsr_min_separation", 1),
+            ),
+        )
+    )
+
+    return float(
+        compute_bisr_fixed_batch_sensitivity_from_inverse_coeffs(
+            coeffs=coeffs,
+            steps=sensitivity_steps,
+            max_participations=max_participations,
+            min_separation=min_separation,
+        )
+    )
 
 
 def resolve_bsr_mf_sensitivity_for_fixed_batch(

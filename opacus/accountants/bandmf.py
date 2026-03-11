@@ -14,10 +14,16 @@
 
 from __future__ import annotations
 
+import copy
 import math
+from typing import Any, Dict
+
+from torch import optim
 
 from opacus.accountants.analysis.bandmf import (
     compute_bandmf_mf_sensitivity_from_coeffs,
+    generate_bandmf_coeffs_from_sgd_workload,
+    optimize_bandmf_strategy_coeffs,
 )
 from opacus.accountants.analysis.bsr import (
     bsr_cyclic_poisson_epsilon_upper_bound,
@@ -25,8 +31,139 @@ from opacus.accountants.analysis.bsr import (
     resolve_bsr_fixed_batch_gaussian_contract,
     resolve_bsr_cyclic_gaussian_contract,
 )
+from opacus.mechanism_contracts import NoiseMechanismConfig
 
+from .bsr import resolve_uniform_sgd_workload_from_optimizer
 from .accountant import IAccountant
+
+
+def optimize_cyclic_bandmf_strategy_coeffs(
+    *,
+    bands: int,
+    steps: int,
+    max_optimizer_steps: int = 250,
+) -> list[float]:
+    return optimize_bandmf_strategy_coeffs(
+        steps=int(steps),
+        bands=int(bands),
+        max_optimizer_steps=int(max_optimizer_steps),
+    )
+
+
+def ensure_bandmf_fixed_analytical_coeffs(
+    *,
+    mechanism_config: NoiseMechanismConfig,
+    optimizer: optim.Optimizer,
+    sampling_semantics,
+    kwargs: Dict[str, Any],
+) -> NoiseMechanismConfig:
+    if mechanism_config.mechanism != "bandmf":
+        return mechanism_config
+
+    state = copy.deepcopy(mechanism_config.mechanism_state)
+    coeffs = state.get("coeffs")
+    if isinstance(coeffs, (list, tuple)) and len(coeffs) > 0:
+        return mechanism_config
+
+    metadata = (
+        sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
+    )
+    metadata_bands = metadata.get("bands")
+    explicit_bands = kwargs.get("bsr_bands")
+    if explicit_bands is not None and metadata_bands is not None:
+        if int(explicit_bands) != int(metadata_bands):
+            raise ValueError(
+                "conflicting canonical inputs: `bsr_bands` must match "
+                "sampling_semantics privacy_metadata['bands']"
+            )
+
+    bands = kwargs.get("bsr_bands", metadata.get("bands", state.get("bsr_bands")))
+    if bands is None:
+        raise ValueError(
+            "bandmf analytical auto-coeff generation requires bands via "
+            "`mechanism_state['bsr_bands']`, `sampling_semantics.privacy_metadata['bands']`, "
+            "or `bsr_bands`"
+        )
+
+    bands = int(bands)
+    if bands < 1:
+        raise ValueError("bandmf bands must be >= 1")
+
+    steps_hint = kwargs.get("total_steps", metadata.get("total_steps"))
+    if steps_hint is None:
+        raise ValueError(
+            "paper-faithful bandmf auto-coeff generation requires total_steps "
+            "or sampling metadata total_steps"
+        )
+
+    if int(steps_hint) < bands:
+        raise ValueError(
+            "bandmf analytical auto-coeff generation requires steps >= bands; "
+            f"got steps={int(steps_hint)}, bands={bands}"
+        )
+
+    momentum, weight_decay = resolve_uniform_sgd_workload_from_optimizer(
+        optimizer=optimizer
+    )
+    state["coeffs"] = generate_bandmf_coeffs_from_sgd_workload(
+        bands=bands,
+        momentum=momentum,
+        weight_decay=weight_decay,
+        steps=int(steps_hint),
+    )
+    state["bsr_bands"] = bands
+    state["coeff_source"] = "analytical_auto"
+
+    return NoiseMechanismConfig(
+        mechanism=mechanism_config.mechanism,
+        accounting_mode=mechanism_config.accounting_mode,
+        mechanism_state=state,
+    )
+
+
+def resolve_bandmf_mf_sensitivity_for_fixed_batch(
+    *,
+    mechanism_state: Dict[str, Any],
+    sampling_semantics,
+    steps: int,
+    sample_rate: float | None,
+    kwargs: Dict[str, Any],
+) -> float:
+    metadata = (
+        sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
+    )
+    explicit = kwargs.get(
+        "bsr_mf_sensitivity",
+        metadata.get(
+            "bsr_mf_sensitivity",
+            mechanism_state.get("bsr_mf_sensitivity"),
+        ),
+    )
+    if explicit is not None:
+        return float(explicit)
+
+    (
+        coeffs,
+        max_participations,
+        min_separation,
+        sensitivity_steps,
+        mf_sensitivity,
+        explicit_mf_sensitivity_override,
+    ) = BandMFAccountant._resolve_fixed_batch_contract_inputs(
+        state=mechanism_state,
+        metadata=metadata,
+        kwargs=kwargs,
+        total_steps=int(steps),
+        sample_rate=float(sample_rate) if sample_rate is not None else 0.0,
+    )
+    return BandMFAccountant._resolve_fixed_batch_mf_sensitivity(
+        coeffs=coeffs,
+        max_participations=max_participations,
+        min_separation=min_separation,
+        sensitivity_steps=sensitivity_steps,
+        mf_sensitivity=mf_sensitivity,
+        explicit_mf_sensitivity_override=explicit_mf_sensitivity_override,
+    )
 
 
 class BandMFAccountant(IAccountant):

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import pytest
 
+from opacus.accountants.bsr import (
+    resolve_bsr_mf_sensitivity_for_fixed_batch,
+    resolve_bsr_sensitivity_scale_for_cyclic,
+)
 from opacus.mechanism_contracts import SamplingSemantics
-from opacus.privacy_engine import PrivacyEngine
 
 
 def test_fixed_batch_mf_sensitivity_precedence_kwargs_over_metadata_and_state() -> None:
@@ -17,7 +20,7 @@ def test_fixed_batch_mf_sensitivity_precedence_kwargs_over_metadata_and_state() 
         privacy_metadata={"bsr_mf_sensitivity": 5.0},
     )
 
-    got = PrivacyEngine._resolve_bsr_mf_sensitivity_for_fixed_batch(
+    got = resolve_bsr_mf_sensitivity_for_fixed_batch(
         mechanism_state=mechanism_state,
         sampling_semantics=sampling_semantics,
         steps=200,
@@ -36,7 +39,7 @@ def test_fixed_batch_mf_sensitivity_precedence_metadata_over_state() -> None:
         privacy_metadata={"bsr_mf_sensitivity": 5.0},
     )
 
-    got = PrivacyEngine._resolve_bsr_mf_sensitivity_for_fixed_batch(
+    got = resolve_bsr_mf_sensitivity_for_fixed_batch(
         mechanism_state=mechanism_state,
         sampling_semantics=sampling_semantics,
         steps=200,
@@ -54,14 +57,14 @@ def test_fixed_batch_mf_sensitivity_horizon_override_changes_result() -> None:
         "bsr_iterations_number": 2,
     }
 
-    eps_short = PrivacyEngine._resolve_bsr_mf_sensitivity_for_fixed_batch(
+    eps_short = resolve_bsr_mf_sensitivity_for_fixed_batch(
         mechanism_state=mechanism_state,
         sampling_semantics=None,
         steps=2,
         sample_rate=0.5,
         kwargs={},
     )
-    eps_long = PrivacyEngine._resolve_bsr_mf_sensitivity_for_fixed_batch(
+    eps_long = resolve_bsr_mf_sensitivity_for_fixed_batch(
         mechanism_state=mechanism_state,
         sampling_semantics=None,
         steps=2,
@@ -80,7 +83,7 @@ def test_fixed_batch_mf_sensitivity_rejects_inconsistent_explicit_value() -> Non
     }
 
     with pytest.raises(ValueError, match="provided bsr_mf_sensitivity is inconsistent"):
-        PrivacyEngine._resolve_bsr_mf_sensitivity_for_fixed_batch(
+        resolve_bsr_mf_sensitivity_for_fixed_batch(
             mechanism_state=mechanism_state,
             sampling_semantics=None,
             steps=10,
@@ -90,7 +93,7 @@ def test_fixed_batch_mf_sensitivity_rejects_inconsistent_explicit_value() -> Non
 
 
 def test_fixed_batch_mf_sensitivity_derives_from_sample_rate_when_metadata_missing() -> None:
-    got = PrivacyEngine._resolve_bsr_mf_sensitivity_for_fixed_batch(
+    got = resolve_bsr_mf_sensitivity_for_fixed_batch(
         mechanism_state={"coeffs": [1.0, 0.5]},
         sampling_semantics=None,
         steps=100,
@@ -110,7 +113,7 @@ def test_cyclic_scale_precedence_kwargs_over_metadata_and_state() -> None:
         privacy_metadata={"bsr_sensitivity_scale": 4.0},
     )
 
-    got = PrivacyEngine._resolve_bsr_sensitivity_scale_for_cyclic(
+    got = resolve_bsr_sensitivity_scale_for_cyclic(
         mechanism_state=mechanism_state,
         sampling_semantics=sampling_semantics,
         steps=100,
@@ -121,13 +124,13 @@ def test_cyclic_scale_precedence_kwargs_over_metadata_and_state() -> None:
 
 def test_cyclic_scale_horizon_override_is_stable_when_both_horizons_are_valid() -> None:
     mechanism_state = {"coeffs": [1.0, 2.0, 3.0]}
-    short = PrivacyEngine._resolve_bsr_sensitivity_scale_for_cyclic(
+    short = resolve_bsr_sensitivity_scale_for_cyclic(
         mechanism_state=mechanism_state,
         sampling_semantics=None,
         steps=3,
         kwargs={},
     )
-    long = PrivacyEngine._resolve_bsr_sensitivity_scale_for_cyclic(
+    long = resolve_bsr_sensitivity_scale_for_cyclic(
         mechanism_state=mechanism_state,
         sampling_semantics=None,
         steps=3,
@@ -138,7 +141,7 @@ def test_cyclic_scale_horizon_override_is_stable_when_both_horizons_are_valid() 
 
 def test_cyclic_scale_rejects_non_positive_override() -> None:
     with pytest.raises(ValueError, match="bsr_sensitivity_scale must be finite and > 0"):
-        PrivacyEngine._resolve_bsr_sensitivity_scale_for_cyclic(
+        resolve_bsr_sensitivity_scale_for_cyclic(
             mechanism_state={"coeffs": [1.0, 0.2]},
             sampling_semantics=None,
             steps=10,
@@ -148,7 +151,7 @@ def test_cyclic_scale_rejects_non_positive_override() -> None:
 
 def test_fixed_batch_mf_sensitivity_rejects_non_finite_override() -> None:
     with pytest.raises(ValueError, match="bsr_mf_sensitivity must be finite and > 0"):
-        PrivacyEngine._resolve_bsr_mf_sensitivity_for_fixed_batch(
+        resolve_bsr_mf_sensitivity_for_fixed_batch(
             mechanism_state={
                 "coeffs": [1.0],
                 "bsr_max_participations": 1,
@@ -163,7 +166,7 @@ def test_fixed_batch_mf_sensitivity_rejects_non_finite_override() -> None:
 
 def test_fixed_batch_mf_sensitivity_rejects_invalid_horizon_override() -> None:
     with pytest.raises(ValueError, match="bsr_iterations_number must be >= 1"):
-        PrivacyEngine._resolve_bsr_mf_sensitivity_for_fixed_batch(
+        resolve_bsr_mf_sensitivity_for_fixed_batch(
             mechanism_state={
                 "coeffs": [1.0],
                 "bsr_max_participations": 1,
@@ -178,7 +181,7 @@ def test_fixed_batch_mf_sensitivity_rejects_invalid_horizon_override() -> None:
 
 def test_cyclic_scale_rejects_non_finite_override() -> None:
     with pytest.raises(ValueError, match="bsr_sensitivity_scale must be finite and > 0"):
-        PrivacyEngine._resolve_bsr_sensitivity_scale_for_cyclic(
+        resolve_bsr_sensitivity_scale_for_cyclic(
             mechanism_state={"coeffs": [1.0, 0.2]},
             sampling_semantics=None,
             steps=10,
@@ -188,7 +191,7 @@ def test_cyclic_scale_rejects_non_finite_override() -> None:
 
 def test_cyclic_scale_rejects_invalid_horizon_override() -> None:
     with pytest.raises(ValueError, match="bsr_iterations_number must be >= 1"):
-        PrivacyEngine._resolve_bsr_sensitivity_scale_for_cyclic(
+        resolve_bsr_sensitivity_scale_for_cyclic(
             mechanism_state={"coeffs": [1.0, 0.2]},
             sampling_semantics=None,
             steps=10,
@@ -198,7 +201,7 @@ def test_cyclic_scale_rejects_invalid_horizon_override() -> None:
 
 def test_cyclic_scale_rejects_steps_below_bands() -> None:
     with pytest.raises(ValueError, match="steps >= bands"):
-        PrivacyEngine._resolve_bsr_sensitivity_scale_for_cyclic(
+        resolve_bsr_sensitivity_scale_for_cyclic(
             mechanism_state={"coeffs": [1.0, 0.2, 0.1]},
             sampling_semantics=SamplingSemantics(
                 sampling_mode="cyclic_poisson",
@@ -214,7 +217,7 @@ def test_cyclic_scale_rejects_fixed_batch_only_kwargs() -> None:
         ValueError,
         match="cyclic-poisson bandmf accounting received fixed-batch-only parameters",
     ):
-        PrivacyEngine._resolve_bsr_sensitivity_scale_for_cyclic(
+        resolve_bsr_sensitivity_scale_for_cyclic(
             mechanism_state={"coeffs": [1.0, 0.2]},
             sampling_semantics=SamplingSemantics(
                 sampling_mode="cyclic_poisson",
@@ -230,7 +233,7 @@ def test_fixed_batch_mf_sensitivity_rejects_cyclic_only_kwargs() -> None:
         ValueError,
         match="fixed-batch bsr accounting received cyclic-only parameters",
     ):
-        PrivacyEngine._resolve_bsr_mf_sensitivity_for_fixed_batch(
+        resolve_bsr_mf_sensitivity_for_fixed_batch(
             mechanism_state={
                 "coeffs": [1.0],
                 "bsr_max_participations": 1,
@@ -247,7 +250,7 @@ def test_fixed_batch_mf_sensitivity_rejects_cyclic_only_kwargs() -> None:
 
 
 def test_cyclic_scale_ignores_legacy_sensitivity_scale_alias() -> None:
-    baseline = PrivacyEngine._resolve_bsr_sensitivity_scale_for_cyclic(
+    baseline = resolve_bsr_sensitivity_scale_for_cyclic(
         mechanism_state={"coeffs": [1.0, 0.2]},
         sampling_semantics=SamplingSemantics(
             sampling_mode="cyclic_poisson",
@@ -256,7 +259,7 @@ def test_cyclic_scale_ignores_legacy_sensitivity_scale_alias() -> None:
         steps=10,
         kwargs={},
     )
-    resolved = PrivacyEngine._resolve_bsr_sensitivity_scale_for_cyclic(
+    resolved = resolve_bsr_sensitivity_scale_for_cyclic(
         mechanism_state={"coeffs": [1.0, 0.2]},
         sampling_semantics=SamplingSemantics(
             sampling_mode="cyclic_poisson",

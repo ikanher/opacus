@@ -24,6 +24,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
+from opacus.accountants.analysis.bandmf import generate_bandmf_coeffs_from_sgd_workload
 from opacus.accountants.analysis.bsr import generate_bsr_coeffs_from_sgd_workload
 from opacus.optimizers import CorrelatedNoiseMechanism, GaussianNoiseMechanism
 from opacus.utils.uniform_sampler import (
@@ -823,14 +824,7 @@ def test_make_private_with_epsilon_bsr_explicit_coeffs_take_precedence() -> None
     assert state["coeffs"] == explicit
 
 
-def test_make_private_with_epsilon_bandmf_cyclic_uses_analytical_autogen(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def _fail_optimize(*args, **kwargs):
-        raise AssertionError("_optimize_bsr_cyclic_coeffs should not be called on analytical cyclic path")
-
-    monkeypatch.setattr(PrivacyEngine, "_optimize_bsr_cyclic_coeffs", staticmethod(_fail_optimize))
-
+def test_make_private_with_epsilon_bandmf_cyclic_uses_bandmf_autogen() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(
         model.parameters(),
@@ -861,10 +855,11 @@ def test_make_private_with_epsilon_bandmf_cyclic_uses_analytical_autogen(
     )
 
     state = dp_optimizer.noise_mechanism_config.mechanism_state
-    expected = generate_bsr_coeffs_from_sgd_workload(
+    expected = generate_bandmf_coeffs_from_sgd_workload(
         bands=3,
         momentum=0.9,
         weight_decay=0.9999,
+        steps=32,
     )
     assert state["coeffs"] == pytest.approx(expected, rel=0.0, abs=1e-12)
 
@@ -967,14 +962,7 @@ def test_make_private_bandmf_fixed_batch_checkpoint_reuses_state() -> None:
     assert state_after["z_std"] == pytest.approx(state_before["z_std"], rel=0.0, abs=1e-12)
 
 
-def test_make_private_with_epsilon_bsr_cyclic_uses_analytical_autogen(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def _fail_optimize(*args, **kwargs):
-        raise AssertionError("_optimize_bsr_cyclic_coeffs should not be called on analytical cyclic path")
-
-    monkeypatch.setattr(PrivacyEngine, "_optimize_bsr_cyclic_coeffs", staticmethod(_fail_optimize))
-
+def test_make_private_with_epsilon_bsr_cyclic_uses_analytical_autogen() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(
         model.parameters(),
@@ -1013,14 +1001,7 @@ def test_make_private_with_epsilon_bsr_cyclic_uses_analytical_autogen(
     assert state["coeffs"] == pytest.approx(expected, rel=0.0, abs=1e-12)
 
 
-def test_make_private_with_epsilon_bsr_cyclic_large_bands_stays_fast_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def _fail_optimize(*args, **kwargs):
-        raise AssertionError("_optimize_bsr_cyclic_coeffs should not be called on analytical cyclic path")
-
-    monkeypatch.setattr(PrivacyEngine, "_optimize_bsr_cyclic_coeffs", staticmethod(_fail_optimize))
-
+def test_make_private_with_epsilon_bsr_cyclic_large_bands_stays_fast_path() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(
         model.parameters(),
@@ -2207,6 +2188,48 @@ def test_make_private_with_epsilon_bnb_balls_in_bins_succeeds() -> None:
     assert getattr(dp_optimizer, "accounting_mode") == "bnb_accountant"
 
 
+@pytest.mark.parametrize("mechanism", ["bsr", "bisr"])
+def test_make_private_with_epsilon_balls_in_bins_mf_autocoeff_succeeds(mechanism: str) -> None:
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=0.05,
+        momentum=0.3,
+        weight_decay=0.9,
+    )
+    pe = PrivacyEngine()
+
+    _private_model, dp_optimizer, _private_loader = pe.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        target_epsilon=1.0,
+        target_delta=0.2,
+        epochs=1,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism=mechanism,
+            accounting_mode="bnb_accountant",
+            mechanism_state={
+                "bsr_bands": 2,
+                "_noise_mechanism": mechanism,
+            },
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 4, "bands": 2},
+        ),
+        bnb_num_samples=2_000,
+        bnb_require_evr_pass=False,
+    )
+    assert getattr(dp_optimizer, "accounting_mode") == "bnb_accountant"
+    state = getattr(dp_optimizer, "noise_mechanism_config").mechanism_state
+    assert list(state["coeffs"])
+    assert state["bnb_c_matrix"] is not None
+    assert state["bnb_c_matrix_contract"] is not None
+
+
 def test_make_private_with_epsilon_bnb_requires_explicit_sampling_semantics() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
@@ -2544,7 +2567,7 @@ def test_bsr_config_builds_noise_mechanism() -> None:
     assert dp_optimizer.noise_mechanism.z_std == 0.03
 
 
-def test_bsr_config_requires_coeffs_and_z_std() -> None:
+def test_bsr_config_requires_bands_or_coeffs_and_autocalibrates_z_std() -> None:
     with pytest.raises(ValueError, match="requires bands"):
         _make_private(
             nn.Linear(4, 3),
@@ -2557,17 +2580,19 @@ def test_bsr_config_requires_coeffs_and_z_std() -> None:
             ),
         )
 
-    with pytest.raises(ValueError, match="z_std"):
-        _make_private(
-            nn.Linear(4, 3),
-            poisson_sampling=False,
-            noise_seed=109,
-            noise_mechanism_config=NoiseMechanismConfig(
-                mechanism="bsr",
-                accounting_mode="bsr_accountant",
-                mechanism_state={"coeffs": [1.0, 0.2]},
-            ),
-        )
+    _, dp_optimizer, _ = _make_private(
+        nn.Linear(4, 3),
+        poisson_sampling=False,
+        noise_seed=109,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"coeffs": [1.0, 0.2]},
+        ),
+    )
+    assert isinstance(dp_optimizer.noise_mechanism, CorrelatedNoiseMechanism)
+    assert tuple(dp_optimizer.noise_mechanism.coeffs) == (1.0, 0.2)
+    assert float(dp_optimizer.noise_mechanism.z_std) > 0.0
 
 
 def test_config_conflicts_with_explicit_noise_mechanism() -> None:

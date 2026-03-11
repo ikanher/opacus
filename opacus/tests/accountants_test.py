@@ -44,6 +44,10 @@ from opacus.accountants.analysis.bsr import (
 from opacus.accountants.analysis.bandmf import (
     compute_bandmf_mf_sensitivity_from_coeffs,
 )
+from opacus.accountants.analysis.bnb import (
+    build_bnb_toeplitz_c_matrix_and_contract,
+    normalize_bnb_accountant_coeffs,
+)
 from opacus.accountants.utils import get_noise_multiplier
 
 
@@ -1139,6 +1143,169 @@ class AccountingTest(unittest.TestCase):
         )
 
         self.assertGreater(noise_multiplier, 0.0)
+
+    def test_get_noise_multiplier_bandmf_balls_in_bins_uses_bnb_accountant(self) -> None:
+        delta = 0.2
+        sample_rate = 0.25
+        epsilon = 0.5
+        epochs = 1
+        coeffs = [1.0, 0.2]
+        c_matrix = _lower_toeplitz_from_coeffs(coeffs, horizon=4)
+
+        noise_multiplier = get_noise_multiplier(
+            target_epsilon=epsilon,
+            target_delta=delta,
+            sample_rate=sample_rate,
+            epochs=epochs,
+            accountant="bnb",
+            mechanism_state={
+                "coeffs": coeffs,
+                "bsr_bands": 2,
+                "bnb_c_matrix": c_matrix,
+                "bnb_c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+                "_noise_mechanism": "bandmf",
+            },
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 4, "bands": 2},
+            ),
+        )
+
+        self.assertGreater(noise_multiplier, 0.0)
+
+    def test_get_noise_multiplier_bsr_balls_in_bins_separates_cycle_length_from_matrix_bandwidth(self) -> None:
+        delta = 0.2
+        sample_rate = 0.25
+        epsilon = 0.5
+        epochs = 1
+        coeffs = [1.0, 0.2]
+        c_matrix = _lower_toeplitz_from_coeffs(coeffs, horizon=8)
+
+        noise_multiplier = get_noise_multiplier(
+            target_epsilon=epsilon,
+            target_delta=delta,
+            sample_rate=sample_rate,
+            epochs=epochs,
+            accountant="bnb",
+            mechanism_state={
+                "coeffs": coeffs,
+                "bsr_bands": 2,
+                "bnb_bands": 2,
+                "bnb_cycle_length": 4,
+                "bnb_c_matrix": c_matrix,
+                "bnb_c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+                "_noise_mechanism": "bsr",
+            },
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 4, "bands": 2},
+            ),
+        )
+
+        self.assertGreater(noise_multiplier, 0.0)
+
+    def test_bsr_balls_in_bins_can_validate_normalized_accountant_coeffs(self) -> None:
+        coeffs = [1.0, 0.2]
+        accountant_coeffs = normalize_bnb_accountant_coeffs(coeffs=coeffs)
+        c_matrix, contract = build_bnb_toeplitz_c_matrix_and_contract(
+            coeffs=accountant_coeffs,
+            bands=2,
+            horizon=8,
+        )
+
+        noise_multiplier = get_noise_multiplier(
+            target_epsilon=0.5,
+            target_delta=0.2,
+            sample_rate=0.25,
+            epochs=1,
+            accountant="bnb",
+            epsilon_tolerance=0.2,
+            bnb_num_samples=200,
+            bnb_max_iterations=8,
+            mechanism_state={
+                "coeffs": coeffs,
+                "bnb_accountant_coeffs": accountant_coeffs,
+                "bsr_bands": 2,
+                "bnb_bands": 2,
+                "bnb_cycle_length": 4,
+                "bnb_c_matrix": c_matrix,
+                "bnb_c_matrix_contract": contract,
+                "_noise_mechanism": "bsr",
+            },
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 4, "bands": 2},
+            ),
+        )
+
+        self.assertGreater(noise_multiplier, 0.0)
+
+    def test_get_noise_multiplier_gaussian_balls_in_bins_uses_bnb_accountant(self) -> None:
+        delta = 0.2
+        sample_rate = 0.25
+        epsilon = 0.5
+        epochs = 1
+        coeffs = [1.0]
+        c_matrix = _lower_toeplitz_from_coeffs(coeffs, horizon=4)
+
+        noise_multiplier = get_noise_multiplier(
+            target_epsilon=epsilon,
+            target_delta=delta,
+            sample_rate=sample_rate,
+            epochs=epochs,
+            accountant="bnb",
+            mechanism_state={
+                "coeffs": coeffs,
+                "bnb_bands": 1,
+                "bnb_c_matrix": c_matrix,
+                "bnb_c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=1),
+                "_noise_mechanism": "gaussian",
+            },
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 4, "bands": 1},
+            ),
+        )
+
+        self.assertGreater(noise_multiplier, 0.0)
+
+    def test_gaussian_balls_in_bins_noise_differs_from_prv_poisson(self) -> None:
+        target_epsilon = 0.5
+        target_delta = 0.2
+        sample_rate = 0.25
+        epochs = 1
+        coeffs = [1.0]
+        c_matrix = _lower_toeplitz_from_coeffs(coeffs, horizon=4)
+
+        bnb_noise = get_noise_multiplier(
+            target_epsilon=target_epsilon,
+            target_delta=target_delta,
+            sample_rate=sample_rate,
+            epochs=epochs,
+            accountant="bnb",
+            mechanism_state={
+                "coeffs": coeffs,
+                "bnb_bands": 1,
+                "bnb_c_matrix": c_matrix,
+                "bnb_c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=1),
+                "_noise_mechanism": "gaussian",
+            },
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 4, "bands": 1},
+            ),
+        )
+        prv_noise = get_noise_multiplier(
+            target_epsilon=target_epsilon,
+            target_delta=target_delta,
+            sample_rate=sample_rate,
+            epochs=epochs,
+            accountant="prv",
+        )
+
+        self.assertGreater(bnb_noise, 0.0)
+        self.assertGreater(prv_noise, 0.0)
+        self.assertFalse(math.isclose(bnb_noise, prv_noise, rel_tol=1e-6, abs_tol=1e-9))
 
     def test_bsr_accountant_default_calibration(self) -> None:
         target_epsilon = 1.0

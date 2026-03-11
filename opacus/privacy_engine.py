@@ -32,30 +32,30 @@ from opacus.accountants.bnb import (
     validate_bnb_sampling_policy as validate_bnb_sampling_policy_helper,
 )
 from opacus.accountants.bsr import (
+    ensure_bsr_family_cyclic_coeffs as ensure_bsr_family_cyclic_coeffs_helper,
+    ensure_bsr_family_fixed_analytical_coeffs as ensure_bsr_family_fixed_analytical_coeffs_helper,
+    resolve_bisr_mf_sensitivity_for_fixed_batch as resolve_bisr_mf_sensitivity_for_fixed_batch_helper,
+    resolve_bisr_sensitivity_scale_for_cyclic as resolve_bisr_sensitivity_scale_for_cyclic_helper,
     resolve_bsr_mf_sensitivity_for_fixed_batch as resolve_bsr_mf_sensitivity_for_fixed_batch_helper,
     resolve_bsr_sensitivity_scale_for_cyclic as resolve_bsr_sensitivity_scale_for_cyclic_helper,
+)
+from opacus.accountants.bandinvmf import (
+    ensure_bandinvmf_runtime_state as ensure_bandinvmf_runtime_state_helper,
+    resolve_bandinvmf_mf_sensitivity_for_fixed_batch as resolve_bandinvmf_mf_sensitivity_for_fixed_batch_helper,
+    resolve_bandinvmf_sensitivity_scale_for_cyclic as resolve_bandinvmf_sensitivity_scale_for_cyclic_helper,
+)
+from opacus.accountants.bandmf import (
+    ensure_bandmf_fixed_analytical_coeffs as ensure_bandmf_fixed_analytical_coeffs_helper,
+    resolve_bandmf_mf_sensitivity_for_fixed_batch as resolve_bandmf_mf_sensitivity_for_fixed_batch_helper,
 )
 from opacus.accountants.utils import get_noise_multiplier
 from opacus.accountants.analysis.bsr import (
     calibrate_bsr_z_std,
-    generate_bsr_coeffs_from_sgd_workload,
-)
-from opacus.accountants.analysis.bisr import (
-    compute_bisr_kappa_from_coeffs,
-    compute_bisr_separated_participation_sensitivity_upper_bound_from_coeffs,
-    generate_bisr_coeffs_from_sgd_workload,
-)
-from opacus.accountants.analysis.bandinvmf import (
-    derive_bandinvmf_inv_coeffs_from_runtime_coeffs,
-    derive_bandinvmf_runtime_coeffs_from_inv_coeffs,
-    optimize_bandinvmf_inv_coeffs_for_sgd_workload,
-)
-from opacus.accountants.analysis.bandmf import (
-    compute_bandmf_mf_sensitivity_from_coeffs,
 )
 from opacus.accountants.analysis.bnb import (
     BNBCalibrationStatus,
     build_bnb_toeplitz_c_matrix_and_contract,
+    normalize_bnb_accountant_coeffs,
     calibrate_b_min_sep_noise_multiplier_monte_carlo,
     describe_bnb_calibration_report,
     make_bnb_calibration_report,
@@ -119,162 +119,6 @@ class PrivacyEngine:
     """
 
     @staticmethod
-    def _optimize_bsr_cyclic_coeffs(
-        *,
-        bands: int,
-        steps: int,
-        max_optimizer_steps: int = 250,
-    ) -> list[float]:
-        if bands < 1:
-            raise ValueError("cyclic_poisson bands must be > 0")
-        if steps < 1:
-            raise ValueError("cyclic_poisson steps must be >= 1")
-        if steps < bands:
-            raise ValueError(
-                "cyclic_poisson bandmf requires steps >= bands; "
-                f"got steps={steps}, bands={bands}"
-            )
-
-        dtype = torch.float64
-        k = torch.arange(int(bands), dtype=dtype)
-        init = torch.cumprod(
-            torch.where(k == 0, torch.ones_like(k), (2 * k - 1) / (2 * k)),
-            dim=0,
-        )
-        params = torch.nn.Parameter(init.clone())
-        opt = torch.optim.LBFGS(
-            [params],
-            max_iter=int(max_optimizer_steps),
-            line_search_fn="strong_wolfe",
-        )
-
-        def _reconcile(c: torch.Tensor, n: int) -> torch.Tensor:
-            if c.numel() >= n:
-                return c[:n]
-            return torch.cat(
-                [c, torch.zeros((n - c.numel(),), dtype=c.dtype, device=c.device)],
-                dim=0,
-            )
-
-        def _mean_error_from_strategy(c: torch.Tensor, n: int) -> torch.Tensor:
-            rhs_val = torch.ones((), dtype=c.dtype, device=c.device)
-            b_vals: list[torch.Tensor] = []
-            for t in range(n):
-                acc = rhs_val
-                max_lag = min(t, c.numel() - 1)
-                for lag in range(1, max_lag + 1):
-                    acc = acc - c[lag] * b_vals[t - lag]
-                b_vals.append(acc / c[0])
-            b = torch.stack(b_vals)
-            return torch.cumsum(b * b, dim=0).mean()
-
-        def _loss(v: torch.Tensor) -> torch.Tensor:
-            c = _reconcile(v, int(steps))
-            penalty = torch.relu(torch.tensor(1e-9, dtype=c.dtype, device=c.device) - c[0]) * 1e9
-            return _mean_error_from_strategy(c, int(steps)) * torch.sum(c * c) + penalty
-
-        def closure() -> torch.Tensor:
-            opt.zero_grad(set_to_none=True)
-            loss = _loss(params)
-            loss.backward()
-
-            return loss
-
-        opt.step(closure)
-        with torch.no_grad():
-            c = params.detach() / (torch.linalg.norm(params.detach()) + 1e-24)
-            if c[0] < 0:
-                c = -c
-
-        return [float(x) for x in c.tolist()]
-
-    @staticmethod
-    def _ensure_bsr_cyclic_coeffs(
-        *,
-        mechanism_config: NoiseMechanismConfig,
-        sampling_semantics: Optional[SamplingSemantics],
-        steps: int,
-        optimizer: optim.Optimizer,
-        kwargs: Dict[str, Any],
-    ) -> NoiseMechanismConfig:
-        """
-        Ensure cyclic MF mechanisms have coefficient vectors available.
-        Math: ensure C-factor coefficients exist for cyclic runtime so correlated mechanism C and noise are defined.
-        """
-        if mechanism_config.mechanism not in ("bandmf", "bsr", "bisr"):
-            return mechanism_config
-
-        state = copy.deepcopy(mechanism_config.mechanism_state)
-        state["_noise_mechanism"] = mechanism_config.mechanism
-        coeffs = state.get("coeffs")
-        if isinstance(coeffs, (list, tuple)) and len(coeffs) > 0:
-            return NoiseMechanismConfig(
-                mechanism=mechanism_config.mechanism,
-                accounting_mode=mechanism_config.accounting_mode,
-                mechanism_state=state,
-            )
-
-        if mechanism_config.mechanism in ("bsr", "bisr") and (
-            sampling_semantics is None
-            or sampling_semantics.sampling_mode != "cyclic_poisson"
-        ):
-            return mechanism_config
-
-        metadata = (
-            sampling_semantics.privacy_metadata
-            if sampling_semantics is not None
-            else {}
-        )
-        # `bands` is the band/min-separation parameter (`b`) used by cyclic schedules.
-        metadata_bands = metadata.get("bands")
-        explicit_bands = kwargs.get("bsr_bands")
-        if explicit_bands is not None and metadata_bands is not None:
-            if int(explicit_bands) != int(metadata_bands):
-                raise ValueError(
-                    "conflicting canonical inputs: `bsr_bands` must match "
-                    "sampling_semantics privacy_metadata['bands']"
-                )
-        bands = kwargs.get("bsr_bands", metadata.get("bands", state.get("bsr_bands")))
-        if bands is None:
-            raise ValueError(
-                "auto coeff generation requires bands via `mechanism_state['bsr_bands']`, "
-                "`sampling_semantics.privacy_metadata['bands']`, or `bsr_bands`"
-            )
-
-        bands = int(bands)
-        if bands <= 0:
-            raise ValueError("bands must be > 0")
-        if int(steps) < bands:
-            raise ValueError(
-                f"{mechanism_config.mechanism} coefficient resolution requires steps >= bands; "
-                f"got steps={int(steps)}, bands={bands}"
-            )
-
-        momentum, weight_decay = PrivacyEngine._resolve_uniform_sgd_workload_from_optimizer(
-            optimizer=optimizer
-        )
-        if mechanism_config.mechanism == "bisr":
-            state["coeffs"] = generate_bisr_coeffs_from_sgd_workload(
-                bands=bands,
-                momentum=momentum,
-                weight_decay=weight_decay,
-            )
-        else:
-            state["coeffs"] = generate_bsr_coeffs_from_sgd_workload(
-                bands=bands,
-                momentum=momentum,
-                weight_decay=weight_decay,
-            )
-        state["bsr_bands"] = bands
-        state["coeff_source"] = "analytical_auto"
-
-        return NoiseMechanismConfig(
-            mechanism=mechanism_config.mechanism,
-            accounting_mode=mechanism_config.accounting_mode,
-            mechanism_state=state,
-        )
-
-    @staticmethod
     def _annotate_mechanism_state(
         *,
         mechanism: str,
@@ -285,38 +129,7 @@ class PrivacyEngine:
         return state
 
     @staticmethod
-    def _resolve_uniform_sgd_workload_from_optimizer(
-        *,
-        optimizer: optim.Optimizer,
-    ) -> tuple[float, float]:
-        momenta: list[float] = []
-        decays: list[float] = []
-        for group in optimizer.param_groups:
-            momenta.append(float(group.get("momentum", 0.0)))
-            decays.append(float(group.get("weight_decay", 0.0)))
-
-        if len(momenta) == 0:
-            raise ValueError("optimizer must contain at least one parameter group")
-
-        m0 = float(momenta[0])
-        d0 = float(decays[0])
-        for m in momenta[1:]:
-            if not math.isclose(float(m), m0, rel_tol=0.0, abs_tol=1e-12):
-                raise ValueError(
-                    "bsr analytical auto-coeff generation requires uniform optimizer momentum "
-                    "across parameter groups"
-                )
-        for d in decays[1:]:
-            if not math.isclose(float(d), d0, rel_tol=0.0, abs_tol=1e-12):
-                raise ValueError(
-                    "bsr analytical auto-coeff generation requires uniform optimizer weight_decay "
-                    "across parameter groups"
-                )
-
-        return m0, d0
-
-    @staticmethod
-    def _ensure_bsr_fixed_analytical_coeffs(
+    def _ensure_bnb_balls_in_bins_mf_state(
         *,
         mechanism_config: NoiseMechanismConfig,
         optimizer: optim.Optimizer,
@@ -324,86 +137,29 @@ class PrivacyEngine:
         kwargs: Dict[str, Any],
     ) -> NoiseMechanismConfig:
         """
-        Ensure fixed-batch BSR has analytical coefficients from SGD workload params.
-        Math: fixed-batch BSR uses analytically generated Toeplitz coefficients ``c_0,…,c_{b-1}`` from SGD workload parameters ``(α, β)``.
-        Source: BSR (Kalinin and Lampert, 2024), Section 3.1, Equation (9), Theorem 1.
+        Ensure balls-in-bins BNB MF runs have analytical coeffs and Toeplitz state.
+
+        This fills the gap between fixed/cyclic MF auto-coeff generation and the
+        BNB accountant path: amplified `bsr`/`bisr` runs may provide only
+        `bsr_bands`, in which case we derive coefficients from the optimizer
+        workload metadata and materialize the BNB Toeplitz contract before the
+        accountant validates runtime inputs.
         """
-        # Contract split:
-        # - `bsr` fixed-batch path uses analytical workload coefficients.
-        # - `bsr` cyclic path auto-resolves coefficients analytically via
-        #   `_ensure_bsr_cyclic_coeffs`.
-        # - `bandmf` auto-resolves coefficients with L-BFGS via
-        #   `_ensure_bsr_cyclic_coeffs`.
         if mechanism_config.mechanism not in ("bsr", "bisr"):
+            return mechanism_config
+        if mechanism_config.accounting_mode != "bnb_accountant":
+            return mechanism_config
+        if (
+            sampling_semantics is None
+            or sampling_semantics.sampling_mode != "balls_in_bins"
+        ):
             return mechanism_config
 
         state = copy.deepcopy(mechanism_config.mechanism_state)
+        state["_noise_mechanism"] = mechanism_config.mechanism
+        metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
+
         coeffs = state.get("coeffs")
-        if isinstance(coeffs, (list, tuple)) and len(coeffs) > 0:
-            return mechanism_config
-
-        metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
-        # `bands` is the truncation width for the BSR Toeplitz factor.
-        metadata_bands = metadata.get("bands")
-        explicit_bands = kwargs.get("bsr_bands")
-        if explicit_bands is not None and metadata_bands is not None:
-            if int(explicit_bands) != int(metadata_bands):
-                raise ValueError(
-                    "conflicting canonical inputs: `bsr_bands` must match "
-                    "sampling_semantics privacy_metadata['bands']"
-                )
-        bands = kwargs.get("bsr_bands", metadata.get("bands", state.get("bsr_bands")))
-        if bands is None:
-            raise ValueError(
-                f"{mechanism_config.mechanism} analytical auto-coeff generation requires bands via "
-                "`mechanism_state['bsr_bands']`, `sampling_semantics.privacy_metadata['bands']`, "
-                "or `bsr_bands`"
-            )
-
-        bands = int(bands)
-        if bands < 1:
-            raise ValueError(f"{mechanism_config.mechanism} bands must be >= 1")
-        steps_hint = kwargs.get("total_steps", metadata.get("total_steps"))
-        if steps_hint is not None and int(steps_hint) < bands:
-            raise ValueError(
-                f"{mechanism_config.mechanism} analytical auto-coeff generation requires steps >= bands; "
-                f"got steps={int(steps_hint)}, bands={bands}"
-            )
-
-        momentum, weight_decay = PrivacyEngine._resolve_uniform_sgd_workload_from_optimizer(
-            optimizer=optimizer
-        )
-        if mechanism_config.mechanism == "bisr":
-            state["coeffs"] = generate_bisr_coeffs_from_sgd_workload(
-                bands=bands,
-                momentum=momentum,
-                weight_decay=weight_decay,
-            )
-        else:
-            state["coeffs"] = generate_bsr_coeffs_from_sgd_workload(
-                bands=bands,
-                momentum=momentum,
-                weight_decay=weight_decay,
-            )
-        state["bsr_bands"] = bands
-        state["coeff_source"] = "analytical_auto"
-
-        return NoiseMechanismConfig(
-            mechanism=mechanism_config.mechanism,
-            accounting_mode=mechanism_config.accounting_mode,
-            mechanism_state=state,
-        )
-
-    @staticmethod
-    def _resolve_bandinvmf_runtime_contract_inputs(
-        *,
-        mechanism_state: Dict[str, Any],
-        sampling_semantics: Optional[SamplingSemantics],
-        kwargs: Dict[str, Any],
-        steps_hint: int,
-        sample_rate_hint: Optional[float],
-    ) -> tuple[int, int, int, int]:
-        metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
         metadata_bands = metadata.get("bands")
         explicit_bands = kwargs.get("bsr_bands")
         if explicit_bands is not None and metadata_bands is not None:
@@ -414,138 +170,134 @@ class PrivacyEngine:
                 )
         bands = kwargs.get(
             "bsr_bands",
-            metadata.get("bands", mechanism_state.get("bsr_bands")),
+            metadata.get("bands", state.get("bnb_bands", state.get("bsr_bands"))),
         )
         if bands is None:
             raise ValueError(
-                "bandinvmf runtime state generation requires bands via "
+                f"{mechanism_config.mechanism} analytical auto-coeff generation requires bands via "
                 "`mechanism_state['bsr_bands']`, `sampling_semantics.privacy_metadata['bands']`, "
                 "or `bsr_bands`"
             )
-
         bands = int(bands)
         if bands < 1:
-            raise ValueError("bandinvmf bands must be >= 1")
-        if int(steps_hint) < bands:
+            raise ValueError(f"{mechanism_config.mechanism} bands must be >= 1")
+
+        bins = kwargs.get("bnb_b", metadata.get("bins", state.get("bnb_cycle_length", state.get("bnb_bins"))))
+        if bins is None:
             raise ValueError(
-                "bandinvmf runtime state generation requires steps >= bands; "
-                f"got steps={int(steps_hint)}, bands={bands}"
+                "balls-in-bins MF state generation requires `bnb_b` or "
+                "sampling_semantics privacy_metadata['bins']"
             )
+        bins = int(bins)
+        if bins < 1:
+            raise ValueError("balls-in-bins bins must be >= 1")
 
-        default_k = 1
-        if sample_rate_hint is not None:
-            default_k = max(1, int(math.ceil(float(sample_rate_hint) * float(steps_hint))))
-
-        max_participations = int(
-            kwargs.get(
-                "bsr_max_participations",
-                metadata.get(
-                    "bsr_max_participations",
-                    mechanism_state.get("bsr_max_participations", default_k),
-                ),
-            )
-        )
-        min_separation = int(
-            kwargs.get(
-                "bsr_min_separation",
-                metadata.get(
-                    "bsr_min_separation",
-                    mechanism_state.get("bsr_min_separation", 1),
-                ),
-            )
-        )
-        optimizer_steps = int(
-            kwargs.get(
-                "bsr_iterations_number",
-                metadata.get(
-                    "bsr_iterations_number",
-                    mechanism_state.get("bsr_iterations_number", 20),
-                ),
-            )
-        )
-        if max_participations < 1:
-            raise ValueError("bsr_max_participations must be >= 1")
-        if min_separation < 1:
-            raise ValueError("bsr_min_separation must be >= 1")
-        if optimizer_steps < 1:
-            raise ValueError("bsr_iterations_number must be >= 1")
-
-        return bands, max_participations, min_separation, optimizer_steps
-
-    @staticmethod
-    def _ensure_bandinvmf_runtime_state(
-        *,
-        mechanism_config: NoiseMechanismConfig,
-        optimizer: optim.Optimizer,
-        sampling_semantics: Optional[SamplingSemantics],
-        steps_hint: int,
-        sample_rate_hint: Optional[float],
-        kwargs: Dict[str, Any],
-    ) -> NoiseMechanismConfig:
-        """
-        Ensure BandInvMF runtime state contains both inverse-band and Toeplitz views.
-
-        BandInvMF is optimized in the inverse-band parameterization initialized
-        from analytic BISR. The runtime correlated mechanism then consumes the
-        derived Toeplitz noising coefficients.
-        """
-        if mechanism_config.mechanism != "bandinvmf":
-            return mechanism_config
-
-        state = copy.deepcopy(mechanism_config.mechanism_state)
-        state["_noise_mechanism"] = mechanism_config.mechanism
-        inv_coeffs = state.get("bandinvmf_inv_coeffs")
-        coeffs = state.get("coeffs")
-
-        if isinstance(inv_coeffs, (list, tuple)) and len(inv_coeffs) > 0:
-            state["bandinvmf_inv_coeffs"] = [float(c) for c in inv_coeffs]
-            if not (isinstance(coeffs, (list, tuple)) and len(coeffs) > 0):
-                state["coeffs"] = derive_bandinvmf_runtime_coeffs_from_inv_coeffs(
-                    inv_coeffs=state["bandinvmf_inv_coeffs"]
-                )
-            state.setdefault("coeff_source", "optimized_inv_explicit")
-        elif isinstance(coeffs, (list, tuple)) and len(coeffs) > 0:
-            state["coeffs"] = [float(c) for c in coeffs]
-            state["bandinvmf_inv_coeffs"] = derive_bandinvmf_inv_coeffs_from_runtime_coeffs(
-                coeffs=state["coeffs"]
-            )
-            state.setdefault("coeff_source", "runtime_coeffs_explicit")
-        else:
-            (
-                bands,
-                max_participations,
-                min_separation,
-                optimizer_steps,
-            ) = PrivacyEngine._resolve_bandinvmf_runtime_contract_inputs(
-                mechanism_state=state,
-                sampling_semantics=sampling_semantics,
-                kwargs=kwargs,
-                steps_hint=int(steps_hint),
-                sample_rate_hint=sample_rate_hint,
-            )
+        if not (isinstance(coeffs, (list, tuple)) and len(coeffs) > 0):
             momentum, weight_decay = PrivacyEngine._resolve_uniform_sgd_workload_from_optimizer(
                 optimizer=optimizer
             )
-            state["bandinvmf_inv_coeffs"] = optimize_bandinvmf_inv_coeffs_for_sgd_workload(
-                bands=bands,
-                momentum=momentum,
-                weight_decay=weight_decay,
-                steps=int(steps_hint),
-                max_participations=max_participations,
-                min_separation=min_separation,
-                optimizer_steps=optimizer_steps,
+            if mechanism_config.mechanism == "bisr":
+                state["coeffs"] = generate_bisr_coeffs_from_sgd_workload(
+                    bands=bands,
+                    momentum=momentum,
+                    weight_decay=weight_decay,
+                )
+            elif mechanism_config.mechanism == "bandmf":
+                steps_hint = kwargs.get(
+                    "total_steps",
+                    metadata.get("total_steps", state.get("bnb_horizon", bins)),
+                )
+                state["coeffs"] = generate_bandmf_coeffs_from_sgd_workload(
+                    bands=bands,
+                    momentum=momentum,
+                    weight_decay=weight_decay,
+                    steps=int(steps_hint),
+                )
+            else:
+                state["coeffs"] = generate_bsr_coeffs_from_sgd_workload(
+                    bands=bands,
+                    momentum=momentum,
+                    weight_decay=weight_decay,
+                )
+            state["coeff_source"] = "analytical_auto"
+
+        state["bsr_bands"] = bands
+        state["bnb_bands"] = bands
+        state["bnb_bins"] = bins
+        state["bnb_cycle_length"] = bins
+
+        accountant_coeffs = None
+        if mechanism_config.mechanism == "bsr":
+            accountant_coeffs = normalize_bnb_accountant_coeffs(
+                coeffs=list(state["coeffs"])
             )
-            state["coeffs"] = derive_bandinvmf_runtime_coeffs_from_inv_coeffs(
-                inv_coeffs=state["bandinvmf_inv_coeffs"]
+            state["bnb_accountant_coeffs"] = list(accountant_coeffs)
+
+        if (
+            mechanism_config.mechanism == "bsr"
+            or (
+                state.get("bnb_c_matrix") is None
+                and isinstance(state.get("coeffs"), (list, tuple))
+                and len(state.get("coeffs")) > 0
             )
-            state["coeff_source"] = "optimized_auto"
-            state["bandinvmf_optimizer_steps"] = int(optimizer_steps)
-            state["bsr_bands"] = int(bands)
-            state["bsr_max_participations"] = int(max_participations)
-            state["bsr_min_separation"] = int(min_separation)
-            state["bandinvmf_steps_hint"] = int(steps_hint)
-            if sample_rate_hint is not None:
-                state["bandinvmf_sample_rate_hint"] = float(sample_rate_hint)
+        ):
+            horizon = state.get("bnb_horizon", kwargs.get("total_steps", kwargs.get("steps", bins)))
+            c_matrix, c_matrix_contract = build_bnb_toeplitz_c_matrix_and_contract(
+                coeffs=list(accountant_coeffs if accountant_coeffs is not None else state["coeffs"]),
+                bands=int(bands),
+                horizon=int(horizon),
+            )
+            state["bnb_c_matrix"] = c_matrix
+            state["bnb_c_matrix_contract"] = c_matrix_contract
+
+        return NoiseMechanismConfig(
+            mechanism=mechanism_config.mechanism,
+            accounting_mode=mechanism_config.accounting_mode,
+            mechanism_state=state,
+        )
+
+    @staticmethod
+    def _ensure_bnb_balls_in_bins_gaussian_state(
+        *,
+        mechanism_config: NoiseMechanismConfig,
+        sampling_semantics: Optional[SamplingSemantics],
+        kwargs: Dict[str, Any],
+    ) -> NoiseMechanismConfig:
+        if (
+            mechanism_config.mechanism != "gaussian"
+            or mechanism_config.accounting_mode != "bnb_accountant"
+        ):
+            return mechanism_config
+        if sampling_semantics is None or sampling_semantics.sampling_mode != "balls_in_bins":
+            return mechanism_config
+
+        state = copy.deepcopy(mechanism_config.mechanism_state)
+        state["_noise_mechanism"] = "gaussian"
+        metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
+        bins = metadata.get("bins", metadata.get("b", state.get("bnb_cycle_length", state.get("bnb_bins"))))
+        if bins is None:
+            raise ValueError(
+                "gaussian balls_in_bins accounting requires privacy_metadata['bins']"
+            )
+
+        bins = int(bins)
+        if bins < 1:
+            raise ValueError("gaussian balls_in_bins bins must be >= 1")
+
+        state["coeffs"] = [1.0]
+        state["bsr_bands"] = 1
+        state["bnb_bands"] = 1
+        state["bnb_bins"] = bins
+        state["bnb_cycle_length"] = bins
+        if state.get("bnb_c_matrix") is None:
+            horizon = state.get("bnb_horizon", kwargs.get("total_steps", kwargs.get("steps", bins)))
+            c_matrix, c_matrix_contract = build_bnb_toeplitz_c_matrix_and_contract(
+                coeffs=[1.0],
+                bands=1,
+                horizon=horizon,
+            )
+            state["bnb_c_matrix"] = c_matrix
+            state["bnb_c_matrix_contract"] = c_matrix_contract
 
         return NoiseMechanismConfig(
             mechanism=mechanism_config.mechanism,
@@ -851,284 +603,6 @@ class PrivacyEngine:
             expected_batch_size = int(expected_batch_size / world_size)
 
         return float(sample_rate), int(expected_batch_size)
-
-    @staticmethod
-    def _resolve_bsr_mf_sensitivity_for_fixed_batch(
-        *,
-        mechanism_state: Dict[str, Any],
-        sampling_semantics: Optional[SamplingSemantics],
-        steps: int,
-        sample_rate: Optional[float],
-        kwargs: Dict[str, Any],
-    ) -> float:
-        return resolve_bsr_mf_sensitivity_for_fixed_batch_helper(
-            mechanism_state=mechanism_state,
-            sampling_semantics=sampling_semantics,
-            steps=steps,
-            sample_rate=sample_rate,
-            kwargs=kwargs,
-        )
-
-    @staticmethod
-    def _resolve_bsr_sensitivity_scale_for_cyclic(
-        *,
-        mechanism_state: Dict[str, Any],
-        sampling_semantics: Optional[SamplingSemantics],
-        steps: int,
-        kwargs: Dict[str, Any],
-    ) -> float:
-        return resolve_bsr_sensitivity_scale_for_cyclic_helper(
-            mechanism_state=mechanism_state,
-            sampling_semantics=sampling_semantics,
-            steps=steps,
-            kwargs=kwargs,
-        )
-
-    @staticmethod
-    def _resolve_bisr_sensitivity_scale_for_cyclic(
-        *,
-        mechanism_state: Dict[str, Any],
-        sampling_semantics: Optional[SamplingSemantics],
-        steps: int,
-        kwargs: Dict[str, Any],
-    ) -> float:
-        metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
-        explicit_scale = kwargs.get(
-            "bsr_sensitivity_scale",
-            metadata.get("bsr_sensitivity_scale", mechanism_state.get("bsr_sensitivity_scale")),
-        )
-        if explicit_scale is not None:
-            sensitivity_scale = float(explicit_scale)
-            if (not math.isfinite(sensitivity_scale)) or sensitivity_scale <= 0.0:
-                raise ValueError("bsr_sensitivity_scale must be finite and > 0")
-            return float(sensitivity_scale)
-
-        bands = kwargs.get(
-            "bsr_bands",
-            metadata.get("bands", mechanism_state.get("bsr_bands")),
-        )
-        if bands is None:
-            coeffs = mechanism_state.get("coeffs")
-            bands = len(coeffs) if coeffs is not None else None
-
-        if bands is None:
-            raise ValueError(
-                "cyclic_poisson bisr requires `bands` in sampling semantics metadata, "
-                "`bsr_bands`, or derivable from coeffs"
-            )
-
-        bands = int(bands)
-        if bands <= 0:
-            raise ValueError("bands must be > 0")
-
-        coeffs = mechanism_state.get("coeffs")
-        if coeffs is None:
-            raise ValueError(
-                "cyclic-poisson bisr accounting requires either `bsr_sensitivity_scale` "
-                "or `mechanism_state['coeffs']`"
-            )
-
-        scale_steps = int(
-            kwargs.get(
-                "bsr_iterations_number",
-                metadata.get(
-                    "bsr_iterations_number",
-                    mechanism_state.get("bsr_iterations_number", steps),
-                ),
-            )
-        )
-        if scale_steps < 1:
-            raise ValueError("bsr_iterations_number must be >= 1")
-        if scale_steps < bands:
-            raise ValueError(
-                "cyclic_poisson bisr requires steps >= bands; "
-                f"got steps={scale_steps}, bands={bands}"
-            )
-
-        sensitivity_scale = float(
-            compute_bisr_kappa_from_coeffs(
-                coeffs=coeffs,
-                steps=scale_steps,
-            )
-        )
-        if (not math.isfinite(sensitivity_scale)) or sensitivity_scale <= 0.0:
-            raise ValueError("resolved bsr_sensitivity_scale must be finite and > 0")
-
-        return float(sensitivity_scale)
-
-    @staticmethod
-    def _resolve_bisr_mf_sensitivity_for_fixed_batch(
-        *,
-        mechanism_state: Dict[str, Any],
-        sampling_semantics: Optional[SamplingSemantics],
-        steps: int,
-        sample_rate: Optional[float],
-        kwargs: Dict[str, Any],
-    ) -> float:
-        metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
-        if sample_rate is None:
-            raise ValueError("sample_rate must be provided for bisr fixed-batch sensitivity resolution")
-        explicit = kwargs.get(
-            "bsr_mf_sensitivity",
-            metadata.get("bsr_mf_sensitivity", mechanism_state.get("bsr_mf_sensitivity")),
-        )
-        if explicit is not None:
-            value = float(explicit)
-            if (not math.isfinite(value)) or value <= 0.0:
-                raise ValueError("bsr_mf_sensitivity must be finite and > 0")
-            return value
-
-        coeffs = mechanism_state.get("coeffs")
-        if coeffs is None:
-            raise ValueError(
-                "bisr fixed-batch accounting requires either `bsr_mf_sensitivity` "
-                "or `mechanism_state['coeffs']`"
-            )
-
-        sensitivity_steps = int(
-            kwargs.get(
-                "bsr_iterations_number",
-                metadata.get(
-                    "bsr_iterations_number",
-                    mechanism_state.get("bsr_iterations_number", steps),
-                ),
-            )
-        )
-        if sensitivity_steps < 1:
-            raise ValueError("bsr_iterations_number must be >= 1")
-
-        default_k = max(1, int(math.ceil(float(sample_rate) * float(sensitivity_steps))))
-        max_participations = int(
-            kwargs.get(
-                "bsr_max_participations",
-                metadata.get(
-                    "bsr_max_participations",
-                    mechanism_state.get("bsr_max_participations", default_k),
-                ),
-            )
-        )
-        min_separation = int(
-            kwargs.get(
-                "bsr_min_separation",
-                metadata.get(
-                    "bsr_min_separation",
-                    mechanism_state.get("bsr_min_separation", 1),
-                ),
-            )
-        )
-
-        return float(
-            compute_bisr_separated_participation_sensitivity_upper_bound_from_coeffs(
-                coeffs=coeffs,
-                steps=sensitivity_steps,
-                max_participations=max_participations,
-                min_separation=min_separation,
-            )
-        )
-
-    @staticmethod
-    def _resolve_bandinvmf_sensitivity_scale_for_cyclic(
-        *,
-        mechanism_state: Dict[str, Any],
-        sampling_semantics: Optional[SamplingSemantics],
-        steps: int,
-        kwargs: Dict[str, Any],
-    ) -> float:
-        filtered_state = dict(mechanism_state)
-        filtered_state.pop("bsr_mf_sensitivity", None)
-        filtered_state.pop("bsr_max_participations", None)
-        filtered_state.pop("bsr_min_separation", None)
-        return resolve_bsr_sensitivity_scale_for_cyclic_helper(
-            mechanism_state=filtered_state,
-            sampling_semantics=sampling_semantics,
-            steps=steps,
-            kwargs=kwargs,
-        )
-
-    @staticmethod
-    def _resolve_bandinvmf_mf_sensitivity_for_fixed_batch(
-        *,
-        mechanism_state: Dict[str, Any],
-        sampling_semantics: Optional[SamplingSemantics],
-        steps: int,
-        sample_rate: Optional[float],
-        kwargs: Dict[str, Any],
-    ) -> float:
-        return resolve_bsr_mf_sensitivity_for_fixed_batch_helper(
-            mechanism_state=mechanism_state,
-            sampling_semantics=sampling_semantics,
-            steps=steps,
-            sample_rate=sample_rate,
-            kwargs=kwargs,
-        )
-
-    @staticmethod
-    def _resolve_bandmf_mf_sensitivity_for_fixed_batch(
-        *,
-        mechanism_state: Dict[str, Any],
-        sampling_semantics: Optional[SamplingSemantics],
-        steps: int,
-        sample_rate: Optional[float],
-        kwargs: Dict[str, Any],
-    ) -> float:
-        metadata = (
-            sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
-        )
-        explicit = kwargs.get(
-            "bsr_mf_sensitivity",
-            metadata.get(
-                "bsr_mf_sensitivity",
-                mechanism_state.get("bsr_mf_sensitivity"),
-            ),
-        )
-        if explicit is not None:
-            return float(explicit)
-
-        coeffs = mechanism_state.get("coeffs")
-        if coeffs is None:
-            raise ValueError(
-                "fixed-batch bandmf accounting requires MF sensitivity or enough data "
-                "to derive it: `coeffs`, `max_participations`, `min_separation`"
-            )
-
-        sensitivity_steps = int(
-            kwargs.get(
-                "bsr_iterations_number",
-                metadata.get(
-                    "bsr_iterations_number",
-                    mechanism_state.get("bsr_iterations_number", steps),
-                ),
-            )
-        )
-        max_participations = int(
-            kwargs.get(
-                "bsr_max_participations",
-                metadata.get(
-                    "bsr_max_participations",
-                    mechanism_state.get(
-                        "bsr_max_participations",
-                        max(1, int(math.ceil(float(sample_rate) * float(sensitivity_steps)))),
-                    ),
-                ),
-            )
-        )
-        min_separation = int(
-            kwargs.get(
-                "bsr_min_separation",
-                metadata.get(
-                    "bsr_min_separation",
-                    mechanism_state.get("bsr_min_separation", 1),
-                ),
-            )
-        )
-        return float(
-            compute_bandmf_mf_sensitivity_from_coeffs(
-                coeffs=coeffs,
-                steps=sensitivity_steps,
-                max_participations=max_participations,
-                min_separation=min_separation,
-            )
-        )
 
     @staticmethod
     def _resolve_bnb_b_min_sep_inputs(
@@ -1441,10 +915,10 @@ class PrivacyEngine:
         if (
             sampling_semantics is not None
             and sampling_semantics.sampling_mode == "balls_in_bins"
-            and mechanism not in ("bandmf", "bsr", "bisr", "bnb", "bandinvmf")
+            and mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bnb", "bandinvmf")
         ):
             raise ValueError(
-                "balls_in_bins sampling is supported only for mechanism in {'bandmf', 'bsr', 'bisr', 'bnb', 'bandinvmf'}"
+                "balls_in_bins sampling is supported only for mechanism in {'gaussian', 'bandmf', 'bsr', 'bisr', 'bnb', 'bandinvmf'}"
             )
 
         if (
@@ -1550,9 +1024,14 @@ class PrivacyEngine:
         mechanism_config: NoiseMechanismConfig,
         sampling_semantics: Optional[SamplingSemantics],
         kwargs: Dict[str, Any],
-    ) -> Tuple[Optional[torch.Tensor], Optional[int], Optional[Dict[str, Any]]]:
+    ) -> Tuple[
+        Optional[torch.Tensor],
+        Optional[int],
+        Optional[int],
+        Optional[Dict[str, Any]],
+    ]:
         if mechanism_config.accounting_mode != "bnb_accountant":
-            return None, None, None
+            return None, None, None, None
 
         if (
             sampling_semantics is None
@@ -1589,7 +1068,7 @@ class PrivacyEngine:
                 mechanism_state["bnb_c_matrix_contract"] = c_matrix_contract
                 mechanism_state["bnb_bands"] = int(bands)
 
-        bnb_c_matrix, bnb_bands, bnb_c_matrix_contract = self._resolve_bnb_b_min_sep_inputs(
+        bnb_c_matrix, bnb_bands, _bnb_cycle_length, bnb_c_matrix_contract = self._resolve_bnb_b_min_sep_inputs(
             mechanism_state=mechanism_state,
             sampling_semantics=sampling_semantics,
             kwargs=kwargs,
@@ -1603,7 +1082,7 @@ class PrivacyEngine:
             c_matrix_contract=bnb_c_matrix_contract,
         )
 
-        return bnb_c_matrix, int(bnb_bands), bnb_c_matrix_contract
+        return bnb_c_matrix, int(bnb_bands), int(_bnb_cycle_length), bnb_c_matrix_contract
 
     def _resolve_non_bnb_noise_multiplier_for_target_epsilon(
         self,
@@ -1646,21 +1125,21 @@ class PrivacyEngine:
                 and sampling_semantics.sampling_mode == "cyclic_poisson"
             ):
                 if mechanism_config.mechanism == "bisr":
-                    nm_kwargs["bsr_sensitivity_scale"] = self._resolve_bisr_sensitivity_scale_for_cyclic(
+                    nm_kwargs["bsr_sensitivity_scale"] = resolve_bisr_sensitivity_scale_for_cyclic_helper(
                         mechanism_state=mechanism_config.mechanism_state,
                         sampling_semantics=sampling_semantics,
                         steps=int(total_steps),
                         kwargs=kwargs,
                     )
                 elif mechanism_config.mechanism == "bandinvmf":
-                    nm_kwargs["bsr_sensitivity_scale"] = self._resolve_bandinvmf_sensitivity_scale_for_cyclic(
+                    nm_kwargs["bsr_sensitivity_scale"] = resolve_bandinvmf_sensitivity_scale_for_cyclic_helper(
                         mechanism_state=mechanism_config.mechanism_state,
                         sampling_semantics=sampling_semantics,
                         steps=int(total_steps),
                         kwargs=kwargs,
                     )
                 else:
-                    nm_kwargs["bsr_sensitivity_scale"] = self._resolve_bsr_sensitivity_scale_for_cyclic(
+                    nm_kwargs["bsr_sensitivity_scale"] = resolve_bsr_sensitivity_scale_for_cyclic_helper(
                         mechanism_state=mechanism_config.mechanism_state,
                         sampling_semantics=sampling_semantics,
                         steps=int(total_steps),
@@ -1672,7 +1151,7 @@ class PrivacyEngine:
                 and sampling_semantics.sampling_mode == "torch_sampler"
             ):
                 if mechanism_config.mechanism == "bandmf":
-                    bsr_mf_sensitivity = self._resolve_bandmf_mf_sensitivity_for_fixed_batch(
+                    bsr_mf_sensitivity = resolve_bandmf_mf_sensitivity_for_fixed_batch_helper(
                         mechanism_state=mechanism_config.mechanism_state,
                         sampling_semantics=sampling_semantics,
                         steps=int(total_steps),
@@ -1680,7 +1159,7 @@ class PrivacyEngine:
                         kwargs=kwargs,
                     )
                 elif mechanism_config.mechanism == "bisr":
-                    bsr_mf_sensitivity = self._resolve_bisr_mf_sensitivity_for_fixed_batch(
+                    bsr_mf_sensitivity = resolve_bisr_mf_sensitivity_for_fixed_batch_helper(
                         mechanism_state=mechanism_config.mechanism_state,
                         sampling_semantics=sampling_semantics,
                         steps=int(total_steps),
@@ -1688,7 +1167,7 @@ class PrivacyEngine:
                         kwargs=kwargs,
                     )
                 elif mechanism_config.mechanism == "bandinvmf":
-                    bsr_mf_sensitivity = self._resolve_bandinvmf_mf_sensitivity_for_fixed_batch(
+                    bsr_mf_sensitivity = resolve_bandinvmf_mf_sensitivity_for_fixed_batch_helper(
                         mechanism_state=mechanism_config.mechanism_state,
                         sampling_semantics=sampling_semantics,
                         steps=int(total_steps),
@@ -1696,7 +1175,7 @@ class PrivacyEngine:
                         kwargs=kwargs,
                     )
                 else:
-                    bsr_mf_sensitivity = self._resolve_bsr_mf_sensitivity_for_fixed_batch(
+                    bsr_mf_sensitivity = resolve_bsr_mf_sensitivity_for_fixed_batch_helper(
                         mechanism_state=mechanism_config.mechanism_state,
                         sampling_semantics=sampling_semantics,
                         steps=int(total_steps),
@@ -1757,14 +1236,14 @@ class PrivacyEngine:
             and sampling_semantics.sampling_mode == "cyclic_poisson"
         ):
             if mechanism_config.mechanism == "bisr":
-                nm_kwargs["bsr_sensitivity_scale"] = self._resolve_bisr_sensitivity_scale_for_cyclic(
+                nm_kwargs["bsr_sensitivity_scale"] = resolve_bisr_sensitivity_scale_for_cyclic_helper(
                     mechanism_state=mechanism_config.mechanism_state,
                     sampling_semantics=sampling_semantics,
                     steps=implied_steps,
                     kwargs=kwargs,
                 )
             else:
-                nm_kwargs["bsr_sensitivity_scale"] = self._resolve_bsr_sensitivity_scale_for_cyclic(
+                nm_kwargs["bsr_sensitivity_scale"] = resolve_bsr_sensitivity_scale_for_cyclic_helper(
                     mechanism_state=mechanism_config.mechanism_state,
                     sampling_semantics=sampling_semantics,
                     steps=implied_steps,
@@ -1776,7 +1255,7 @@ class PrivacyEngine:
             and sampling_semantics.sampling_mode == "torch_sampler"
         ):
             if mechanism_config.mechanism == "bandmf":
-                bsr_mf_sensitivity = self._resolve_bandmf_mf_sensitivity_for_fixed_batch(
+                bsr_mf_sensitivity = resolve_bandmf_mf_sensitivity_for_fixed_batch_helper(
                     mechanism_state=mechanism_config.mechanism_state,
                     sampling_semantics=sampling_semantics,
                     steps=implied_steps,
@@ -1784,7 +1263,7 @@ class PrivacyEngine:
                     kwargs=kwargs,
                 )
             elif mechanism_config.mechanism == "bisr":
-                bsr_mf_sensitivity = self._resolve_bisr_mf_sensitivity_for_fixed_batch(
+                bsr_mf_sensitivity = resolve_bisr_mf_sensitivity_for_fixed_batch_helper(
                     mechanism_state=mechanism_config.mechanism_state,
                     sampling_semantics=sampling_semantics,
                     steps=implied_steps,
@@ -1792,7 +1271,7 @@ class PrivacyEngine:
                     kwargs=kwargs,
                 )
             else:
-                bsr_mf_sensitivity = self._resolve_bsr_mf_sensitivity_for_fixed_batch(
+                bsr_mf_sensitivity = resolve_bsr_mf_sensitivity_for_fixed_batch_helper(
                     mechanism_state=mechanism_config.mechanism_state,
                     sampling_semantics=sampling_semantics,
                     steps=implied_steps,
@@ -1851,15 +1330,16 @@ class PrivacyEngine:
         sampling_semantics: Optional[SamplingSemantics],
         bnb_c_matrix: Optional[torch.Tensor],
         bnb_bands: Optional[int],
+        bnb_cycle_length: Optional[int],
         kwargs: Dict[str, Any],
     ) -> Tuple[float, float]:
         """
         Resolve sigma for BNB via Monte Carlo + EVR calibration.
         Math: BNB calibration searches σ using Monte Carlo δ estimates with EVR/Hoeffding confidence control.
         """
-        if bnb_c_matrix is None or bnb_bands is None:
+        if bnb_c_matrix is None or bnb_bands is None or bnb_cycle_length is None:
             raise ValueError(
-                "bnb calibration requires resolved runtime inputs (`c_matrix`, `bands`)"
+                "bnb calibration requires resolved runtime inputs (`c_matrix`, `bands`, `cycle_length`)"
             )
 
         if total_steps:
@@ -1906,6 +1386,7 @@ class PrivacyEngine:
         noise_multiplier = calibrate_b_min_sep_noise_multiplier_monte_carlo(
             c_matrix=bnb_c_matrix,
             bands=int(bnb_bands),
+            cycle_length=int(bnb_cycle_length),
             target_epsilon=float(target_epsilon),
             target_delta=float(target_delta),
             num_samples=int(calibration_cfg["bnb_num_samples"]),
@@ -1931,6 +1412,7 @@ class PrivacyEngine:
                         else None
                     ),
                     "bands": int(bnb_bands),
+                    "cycle_length": int(bnb_cycle_length),
                     "target_epsilon": float(target_epsilon),
                     "target_delta": float(target_delta),
                     "num_samples": int(calibration_cfg["bnb_num_samples"]),
@@ -1958,6 +1440,7 @@ class PrivacyEngine:
         sampling_semantics: Optional[SamplingSemantics],
         bnb_c_matrix: Optional[torch.Tensor],
         bnb_bands: Optional[int],
+        bnb_cycle_length: Optional[int],
         kwargs: Dict[str, Any],
     ) -> Tuple[float, float]:
         """
@@ -1979,6 +1462,7 @@ class PrivacyEngine:
                 sampling_semantics=sampling_semantics,
                 bnb_c_matrix=bnb_c_matrix,
                 bnb_bands=bnb_bands,
+                bnb_cycle_length=bnb_cycle_length,
                 kwargs=kwargs,
             )
 
@@ -2002,12 +1486,13 @@ class PrivacyEngine:
         mechanism: str,
         bnb_c_matrix: Optional[torch.Tensor],
         bnb_bands: Optional[int],
+        bnb_cycle_length: Optional[int],
         noise_multiplier: float,
         target_epsilon: float,
         target_delta: float,
         kwargs: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        if bnb_c_matrix is None or bnb_bands is None:
+        if bnb_c_matrix is None or bnb_bands is None or bnb_cycle_length is None:
             return None
 
         calibration_cfg = resolve_bnb_calibration_kwargs(
@@ -2021,6 +1506,7 @@ class PrivacyEngine:
         llr_samples = sample_b_min_sep_llr(
             c_matrix=bnb_c_matrix,
             bands=int(bnb_bands),
+            cycle_length=int(bnb_cycle_length),
             num_samples=num_samples,
             seed=seed,
             sigma=float(noise_multiplier),
@@ -2500,13 +1986,30 @@ class PrivacyEngine:
         coeff_resolution_kwargs = dict(kwargs)
         if total_steps is not None:
             coeff_resolution_kwargs["total_steps"] = int(total_steps)
-        mechanism_config = self._ensure_bsr_fixed_analytical_coeffs(
+        mechanism_config = ensure_bsr_family_fixed_analytical_coeffs_helper(
             mechanism_config=mechanism_config,
             optimizer=optimizer,
             sampling_semantics=sampling_semantics,
             kwargs=coeff_resolution_kwargs,
         )
-        mechanism_config = self._ensure_bandinvmf_runtime_state(
+        mechanism_config = ensure_bandmf_fixed_analytical_coeffs_helper(
+            mechanism_config=mechanism_config,
+            optimizer=optimizer,
+            sampling_semantics=sampling_semantics,
+            kwargs=coeff_resolution_kwargs,
+        )
+        mechanism_config = self._ensure_bnb_balls_in_bins_gaussian_state(
+            mechanism_config=mechanism_config,
+            sampling_semantics=sampling_semantics,
+            kwargs=coeff_resolution_kwargs,
+        )
+        mechanism_config = self._ensure_bnb_balls_in_bins_mf_state(
+            mechanism_config=mechanism_config,
+            optimizer=optimizer,
+            sampling_semantics=sampling_semantics,
+            kwargs=coeff_resolution_kwargs,
+        )
+        mechanism_config = ensure_bandinvmf_runtime_state_helper(
             mechanism_config=mechanism_config,
             optimizer=optimizer,
             sampling_semantics=sampling_semantics,
@@ -2515,7 +2018,7 @@ class PrivacyEngine:
             kwargs=coeff_resolution_kwargs,
         )
         if (
-            mechanism_config.mechanism in ("bandmf", "bandinvmf")
+            mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf")
             and mechanism_config.mechanism_state.get("z_std") is None
         ):
             state = copy.deepcopy(mechanism_config.mechanism_state)
@@ -2539,7 +2042,7 @@ class PrivacyEngine:
             )
         ):
             strategy_steps = int(total_steps) if total_steps is not None else int(len(data_loader))
-            mechanism_config = self._ensure_bsr_cyclic_coeffs(
+            mechanism_config = ensure_bsr_family_cyclic_coeffs_helper(
                 mechanism_config=mechanism_config,
                 sampling_semantics=sampling_semantics,
                 steps=strategy_steps,
@@ -2728,7 +2231,24 @@ class PrivacyEngine:
             coeff_resolution_kwargs["total_steps"] = int(total_steps)
         elif epochs is not None:
             coeff_resolution_kwargs["total_steps"] = int(float(epochs) * float(len(data_loader)))
-        mechanism_config = self._ensure_bsr_fixed_analytical_coeffs(
+        mechanism_config = ensure_bsr_family_fixed_analytical_coeffs_helper(
+            mechanism_config=mechanism_config,
+            optimizer=optimizer,
+            sampling_semantics=local_sampling_semantics,
+            kwargs=coeff_resolution_kwargs,
+        )
+        mechanism_config = ensure_bandmf_fixed_analytical_coeffs_helper(
+            mechanism_config=mechanism_config,
+            optimizer=optimizer,
+            sampling_semantics=local_sampling_semantics,
+            kwargs=coeff_resolution_kwargs,
+        )
+        mechanism_config = self._ensure_bnb_balls_in_bins_gaussian_state(
+            mechanism_config=mechanism_config,
+            sampling_semantics=local_sampling_semantics,
+            kwargs=coeff_resolution_kwargs,
+        )
+        mechanism_config = self._ensure_bnb_balls_in_bins_mf_state(
             mechanism_config=mechanism_config,
             optimizer=optimizer,
             sampling_semantics=local_sampling_semantics,
@@ -2745,7 +2265,7 @@ class PrivacyEngine:
             if total_steps is not None
             else (1.0 / float(len(data_loader)))
         )
-        mechanism_config = self._ensure_bandinvmf_runtime_state(
+        mechanism_config = ensure_bandinvmf_runtime_state_helper(
             mechanism_config=mechanism_config,
             optimizer=optimizer,
             sampling_semantics=local_sampling_semantics,
@@ -2794,7 +2314,7 @@ class PrivacyEngine:
                 correlated_denominator=float(correlated_denominator),
             )
 
-        bnb_c_matrix, bnb_bands, _ = self._resolve_bnb_runtime_inputs_for_epsilon(
+        bnb_c_matrix, bnb_bands, bnb_cycle_length, _ = self._resolve_bnb_runtime_inputs_for_epsilon(
             mechanism_config=mechanism_config,
             sampling_semantics=local_sampling_semantics,
             kwargs=kwargs,
@@ -2813,7 +2333,7 @@ class PrivacyEngine:
                 strategy_steps = int(total_steps)
             else:
                 strategy_steps = int(float(epochs) * float(len(data_loader)))
-            mechanism_config = self._ensure_bsr_cyclic_coeffs(
+            mechanism_config = ensure_bsr_family_cyclic_coeffs_helper(
                 mechanism_config=mechanism_config,
                 sampling_semantics=local_sampling_semantics,
                 steps=strategy_steps,
@@ -2847,6 +2367,7 @@ class PrivacyEngine:
             sampling_semantics=local_sampling_semantics,
             bnb_c_matrix=bnb_c_matrix,
             bnb_bands=bnb_bands,
+            bnb_cycle_length=bnb_cycle_length,
             kwargs=kwargs,
         )
         logger.info(
@@ -2880,21 +2401,21 @@ class PrivacyEngine:
                 scale_steps = int(epochs / sample_rate)
 
             if mechanism_config.mechanism == "bisr":
-                resolved_scale = self._resolve_bisr_sensitivity_scale_for_cyclic(
+                resolved_scale = resolve_bisr_sensitivity_scale_for_cyclic_helper(
                     mechanism_state=mechanism_config.mechanism_state,
                     sampling_semantics=local_sampling_semantics,
                     steps=scale_steps,
                     kwargs=kwargs,
                 )
             elif mechanism_config.mechanism == "bandinvmf":
-                resolved_scale = self._resolve_bandinvmf_sensitivity_scale_for_cyclic(
+                resolved_scale = resolve_bandinvmf_sensitivity_scale_for_cyclic_helper(
                     mechanism_state=mechanism_config.mechanism_state,
                     sampling_semantics=local_sampling_semantics,
                     steps=scale_steps,
                     kwargs=kwargs,
                 )
             else:
-                resolved_scale = self._resolve_bsr_sensitivity_scale_for_cyclic(
+                resolved_scale = resolve_bsr_sensitivity_scale_for_cyclic_helper(
                     mechanism_state=mechanism_config.mechanism_state,
                     sampling_semantics=local_sampling_semantics,
                     steps=scale_steps,
@@ -2929,7 +2450,7 @@ class PrivacyEngine:
                 mf_steps = int(epochs / sample_rate)
 
             if mechanism_config.mechanism == "bisr":
-                resolved_mf_sensitivity = self._resolve_bisr_mf_sensitivity_for_fixed_batch(
+                resolved_mf_sensitivity = resolve_bisr_mf_sensitivity_for_fixed_batch_helper(
                     mechanism_state=mechanism_config.mechanism_state,
                     sampling_semantics=local_sampling_semantics,
                     steps=mf_steps,
@@ -2937,7 +2458,7 @@ class PrivacyEngine:
                     kwargs=kwargs,
                 )
             elif mechanism_config.mechanism == "bandinvmf":
-                resolved_mf_sensitivity = self._resolve_bandinvmf_mf_sensitivity_for_fixed_batch(
+                resolved_mf_sensitivity = resolve_bandinvmf_mf_sensitivity_for_fixed_batch_helper(
                     mechanism_state=mechanism_config.mechanism_state,
                     sampling_semantics=local_sampling_semantics,
                     steps=mf_steps,
@@ -2945,7 +2466,7 @@ class PrivacyEngine:
                     kwargs=kwargs,
                 )
             else:
-                resolved_mf_sensitivity = self._resolve_bsr_mf_sensitivity_for_fixed_batch(
+                resolved_mf_sensitivity = resolve_bsr_mf_sensitivity_for_fixed_batch_helper(
                     mechanism_state=mechanism_config.mechanism_state,
                     sampling_semantics=local_sampling_semantics,
                     steps=mf_steps,
@@ -2967,6 +2488,7 @@ class PrivacyEngine:
             mechanism=mechanism_config.mechanism,
             bnb_c_matrix=bnb_c_matrix,
             bnb_bands=bnb_bands,
+            bnb_cycle_length=bnb_cycle_length,
             noise_multiplier=float(noise_multiplier),
             target_epsilon=target_epsilon,
             target_delta=target_delta,
