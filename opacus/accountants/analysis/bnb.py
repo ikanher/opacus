@@ -19,7 +19,10 @@ from concurrent.futures import ThreadPoolExecutor
 import math
 from typing import Any, Dict, Sequence
 
+import numpy as np
+import scipy
 import torch
+from torch.distributions import Bernoulli, kl_divergence
 
 BNB_VERIFICATION_CONTRACT = "evr_union_bound_alpha_split_v1"
 
@@ -901,6 +904,312 @@ def compute_llr_samples(
     )
 
     return _mixture_logpdf(points, up_gm, sigma) - _mixture_logpdf(points, lo_gm, sigma)
+
+
+def _hoeffding_bound(num_samples: int, tau: float, delta: float) -> float:
+    if tau < 1.0:
+        raise ValueError("tau must be >= 1")
+
+    q = torch.tensor(float(delta), dtype=torch.float64)
+    p = torch.tensor(float(tau) * float(delta), dtype=torch.float64)
+    kl = kl_divergence(Bernoulli(probs=q), Bernoulli(probs=p))
+
+    return float(torch.exp(-float(num_samples) * kl))
+
+
+def get_bnb_overall_delta(
+    *,
+    num_samples: int,
+    base_delta: float,
+) -> float:
+    if base_delta <= 0.0 or base_delta > 1.0:
+        raise ValueError("base_delta must be in (0, 1]")
+
+    if num_samples <= 0:
+        raise ValueError("num_samples must be positive")
+
+    def _overall_delta_from_tau(tau: float) -> float:
+        q = _hoeffding_bound(int(num_samples), float(tau), float(base_delta))
+        return float(tau) * float(base_delta) + q * (1.0 - float(tau) * float(base_delta))
+
+    best_tau = scipy.optimize.minimize_scalar(
+        _overall_delta_from_tau,
+        bounds=(1.0, 1.0 / float(base_delta)),
+        method="bounded",
+    ).x
+
+    return min(_overall_delta_from_tau(float(best_tau)), 1.0)
+
+
+def get_bnb_base_delta(
+    *,
+    num_samples: int,
+    target_delta: float,
+) -> float:
+    if num_samples <= 0:
+        raise ValueError("num_samples must be positive")
+
+    if target_delta < 0.0 or target_delta > 1.0:
+        raise ValueError("target_delta must be in [0, 1]")
+
+    tol = 1e-4 * float(target_delta)
+    base_delta = scipy.optimize.minimize_scalar(
+        lambda d: abs(get_bnb_overall_delta(num_samples=int(num_samples), base_delta=float(d)) - float(target_delta)),
+        bounds=(0.0, float(target_delta)),
+        method="bounded",
+        options={"xatol": tol},
+    ).x
+
+    if get_bnb_overall_delta(num_samples=int(num_samples), base_delta=float(base_delta)) < float(target_delta):
+        return float(base_delta)
+
+    conservative_base_delta = float(base_delta) - tol
+    if conservative_base_delta > 0.0 and get_bnb_overall_delta(
+        num_samples=int(num_samples), base_delta=conservative_base_delta
+    ) < float(target_delta):
+        return conservative_base_delta
+
+    raise ValueError("Failed to find a valid base_delta. num_samples may be too small.")
+
+
+def _build_balls_in_bins_modes_matrix(
+    *,
+    coeffs: Sequence[float],
+    cycle_length: int,
+    horizon: int,
+) -> np.ndarray:
+
+    def _convolve_full_1d(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros(lhs.numel() + rhs.numel() - 1, dtype=torch.float64)
+        for idx in range(lhs.numel()):
+            out[idx : idx + rhs.numel()] += lhs[idx] * rhs
+
+        return out
+
+    def _toeplitz(c: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
+        rows = int(c.numel())
+        cols = int(r.numel())
+        out = torch.empty((rows, cols), dtype=torch.float64)
+        for i in range(rows):
+            for j in range(cols):
+                out[i, j] = r[j - i] if j >= i else c[i - j]
+
+        return out
+
+    coeff_array = np.asarray([float(c) for c in coeffs], dtype=np.float64)
+    if coeff_array.ndim != 1 or coeff_array.size == 0:
+        raise ValueError("coeffs must be a non-empty 1-D sequence")
+
+    if np.any(coeff_array < 0.0):
+        raise ValueError("coeffs must be nonnegative")
+
+    if cycle_length <= 0:
+        raise ValueError("cycle_length must be positive")
+
+    if horizon <= 0:
+        raise ValueError("horizon must be positive")
+
+    if coeff_array.size > horizon:
+        coeff_array = coeff_array[:horizon]
+
+    coeff_t = torch.tensor(coeff_array, dtype=torch.float64)
+    x_t = (torch.arange(horizon) % int(cycle_length) == 0).to(dtype=torch.float64)
+    first_mode = _convolve_full_1d(
+        coeff_t,
+        x_t[: horizon - coeff_t.numel() + 1],
+    )
+
+    if coeff_array.size > 1:
+        bot_block = _toeplitz(
+            coeff_t[:-1],
+            torch.zeros(coeff_t.numel() - 1, dtype=torch.float64),
+        )
+        bot_prod = torch.mv(bot_block, x_t[-coeff_t.numel() + 1 :])
+        first_mode[-coeff_t.numel() + 1 :] += bot_prod
+
+    elementary_vector = torch.zeros(int(cycle_length), dtype=torch.float64)
+    elementary_vector[0] = coeff_t[0]
+
+    return _toeplitz(elementary_vector, first_mode).cpu().numpy()
+
+
+def _generate_balls_in_bins_samples_chunk(
+    *,
+    coeffs: Sequence[float],
+    cycle_length: int,
+    horizon: int,
+    sigma: float,
+    num_samples: int,
+    seed: int,
+    positive_sample: bool,
+    modes_matrix: np.ndarray | None = None,
+) -> np.ndarray:
+    if sigma <= 0.0:
+        raise ValueError("sigma must be > 0")
+
+    if num_samples <= 0:
+        raise ValueError("num_samples must be > 0")
+
+    if modes_matrix is None:
+        modes_matrix = _build_balls_in_bins_modes_matrix(
+            coeffs=coeffs,
+            cycle_length=cycle_length,
+            horizon=horizon,
+        )
+
+    rng = np.random.default_rng(int(seed))
+    if positive_sample:
+        starting_indices = rng.integers(0, int(cycle_length), size=int(num_samples))
+        means = modes_matrix[starting_indices]
+    else:
+        means = np.zeros((int(num_samples), int(horizon)), dtype=np.float64)
+
+    noise = rng.normal(loc=0.0, scale=float(sigma), size=(int(num_samples), int(horizon)))
+
+    return means + noise
+
+
+def _compute_balls_in_bins_privacy_loss_chunk(
+    *,
+    samples: np.ndarray,
+    sigma: float,
+    modes_matrix: np.ndarray,
+) -> np.ndarray:
+    if sigma <= 0.0:
+        raise ValueError("sigma must be > 0")
+
+    if samples.ndim != 2:
+        raise ValueError("samples must have shape [n, horizon]")
+
+    dot_products = np.matmul(samples, modes_matrix.T)
+    squared_mode_norms = np.sum(modes_matrix * modes_matrix, axis=1)
+    per_mode_privacy_loss = (2.0 * dot_products - squared_mode_norms[None, :]) / (2.0 * float(sigma) ** 2)
+    per_mode_privacy_loss_t = torch.from_numpy(per_mode_privacy_loss)
+
+    return (
+        torch.logsumexp(per_mode_privacy_loss_t, dim=1)
+        - math.log(float(modes_matrix.shape[0]))
+    ).cpu().numpy()
+
+
+def sample_balls_in_bins_llr_chunks(
+    *,
+    coeffs: Sequence[float],
+    cycle_length: int,
+    horizon: int,
+    sigma: float,
+    num_samples: int,
+    seed: int = 0,
+    chunk_size: int | None = None,
+    num_workers: int = 0,
+    positive_sample: bool = True,
+) -> list[np.ndarray]:
+    _validate_bnb_chunking(
+        num_samples=int(num_samples),
+        chunk_size=chunk_size,
+        num_workers=int(num_workers),
+    )
+    specs = _derive_bnb_chunk_specs(
+        num_samples=int(num_samples),
+        seed=int(seed),
+        chunk_size=chunk_size,
+    )
+    modes_matrix = _build_balls_in_bins_modes_matrix(
+        coeffs=coeffs,
+        cycle_length=int(cycle_length),
+        horizon=int(horizon),
+    )
+
+    def _one(chunk_num_samples: int, chunk_seed: int) -> np.ndarray:
+        samples = _generate_balls_in_bins_samples_chunk(
+            coeffs=coeffs,
+            cycle_length=int(cycle_length),
+            horizon=int(horizon),
+            sigma=float(sigma),
+            num_samples=int(chunk_num_samples),
+            seed=int(chunk_seed),
+            positive_sample=bool(positive_sample),
+            modes_matrix=modes_matrix,
+        )
+        llr = _compute_balls_in_bins_privacy_loss_chunk(
+            samples=samples,
+            sigma=float(sigma),
+            modes_matrix=modes_matrix,
+        )
+        if not positive_sample:
+            llr = -llr
+
+        return llr
+
+    if len(specs) == 1:
+        chunk_num_samples, chunk_seed = specs[0]
+        return [_one(int(chunk_num_samples), int(chunk_seed))]
+
+    if num_workers <= 1:
+        return [_one(int(chunk_num_samples), int(chunk_seed)) for chunk_num_samples, chunk_seed in specs]
+
+    max_workers = min(int(num_workers), len(specs))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(_one, int(chunk_num_samples), int(chunk_seed))
+            for chunk_num_samples, chunk_seed in specs
+        ]
+        return [future.result() for future in futures]
+
+
+def estimate_balls_in_bins_epsilon_monte_carlo(
+    *,
+    coeffs: Sequence[float],
+    cycle_length: int,
+    horizon: int,
+    noise_multiplier: float,
+    target_delta: float,
+    num_samples: int,
+    seed: int = 0,
+    tolerance: float = 1e-4,
+    max_iterations: int = 200,
+    chunk_size: int | None = None,
+    num_workers: int = 0,
+) -> float:
+    if target_delta < 0.0 or target_delta >= 1.0:
+        raise ValueError("target_delta must be in [0, 1)")
+    base_delta = get_bnb_base_delta(num_samples=int(num_samples), target_delta=float(target_delta))
+    positive_chunks = sample_balls_in_bins_llr_chunks(
+        coeffs=coeffs,
+        cycle_length=int(cycle_length),
+        horizon=int(horizon),
+        sigma=float(noise_multiplier),
+        num_samples=int(num_samples),
+        seed=int(seed),
+        chunk_size=chunk_size,
+        num_workers=int(num_workers),
+        positive_sample=True,
+    )
+    negative_chunks = sample_balls_in_bins_llr_chunks(
+        coeffs=coeffs,
+        cycle_length=int(cycle_length),
+        horizon=int(horizon),
+        sigma=float(noise_multiplier),
+        num_samples=int(num_samples),
+        seed=int(seed) + 1,
+        chunk_size=chunk_size,
+        num_workers=int(num_workers),
+        positive_sample=False,
+    )
+    positive_epsilon = estimate_epsilon_from_llr_chunks(
+        target_delta=float(base_delta),
+        llr_chunks=[torch.as_tensor(chunk, dtype=torch.float64) for chunk in positive_chunks],
+        tolerance=float(tolerance),
+        max_iterations=int(max_iterations),
+    )
+    negative_epsilon = estimate_epsilon_from_llr_chunks(
+        target_delta=float(base_delta),
+        llr_chunks=[torch.as_tensor(chunk, dtype=torch.float64) for chunk in negative_chunks],
+        tolerance=float(tolerance),
+        max_iterations=int(max_iterations),
+    )
+
+    return float(max(float(positive_epsilon), float(negative_epsilon)))
 
 
 def _compute_llr_samples_chunk(

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Tuple
 from opacus.accountants.analysis.bnb import (
+    estimate_balls_in_bins_epsilon_monte_carlo,
     estimate_b_min_sep_epsilon_monte_carlo,
     resolve_bnb_calibration_kwargs,
 )
@@ -276,12 +277,7 @@ class BNBAccountant(IAccountant):
         max_iterations = int(calibration_cfg["bnb_max_iterations"])
         chunk_size = calibration_cfg["bnb_chunk_size"]
         num_workers = int(calibration_cfg["bnb_num_workers"])
-        if (
-            sampling_mode in ("b_min_sep", "balls_in_bins")
-            and c_matrix is not None
-            and bands is not None
-            and c_matrix_contract is not None
-        ):
+        if sampling_mode == "b_min_sep" and c_matrix is not None and bands is not None and c_matrix_contract is not None:
             if cycle_length is None:
                 cycle_length = bands
 
@@ -302,6 +298,44 @@ class BNBAccountant(IAccountant):
                     num_samples=num_samples,
                     seed=seed,
                     reduce_dimensionality=reduce_dimensionality,
+                    tolerance=float(tolerance),
+                    max_iterations=max_iterations,
+                    chunk_size=chunk_size,
+                    num_workers=num_workers,
+                )
+            )
+
+        if sampling_mode == "balls_in_bins" and c_matrix is not None and bands is not None and c_matrix_contract is not None:
+            if cycle_length is None:
+                cycle_length = bands
+
+            self._validate_builtin_b_min_sep_consistency(
+                mechanism_state=state,
+                sampling_semantics=sampling_semantics,
+                c_matrix=c_matrix,
+                bands=int(bands),
+                c_matrix_contract=c_matrix_contract,
+            )
+            accountant_coeffs = kwargs.get(
+                "bnb_accountant_coeffs",
+                state.get("bnb_accountant_coeffs", state.get("coeffs")),
+            )
+            if accountant_coeffs is None:
+                raise ValueError(
+                    "balls_in_bins accounting requires accountant-side coefficients "
+                    "via `bnb_accountant_coeffs` or `coeffs`"
+                )
+
+            horizon = int(c_matrix.shape[1])
+            return float(
+                estimate_balls_in_bins_epsilon_monte_carlo(
+                    coeffs=accountant_coeffs,
+                    cycle_length=int(cycle_length),
+                    horizon=horizon,
+                    noise_multiplier=float(noise_multiplier),
+                    target_delta=float(delta),
+                    num_samples=num_samples,
+                    seed=seed,
                     tolerance=float(tolerance),
                     max_iterations=max_iterations,
                     chunk_size=chunk_size,

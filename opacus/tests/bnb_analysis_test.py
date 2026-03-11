@@ -23,6 +23,7 @@ from opacus.accountants.analysis.bnb import (
     GaussianMixture,
     build_bnb_toeplitz_c_matrix_and_contract,
     build_b_min_sep_gaussian_mixture,
+    estimate_balls_in_bins_epsilon_monte_carlo,
     build_lower_toeplitz_c_matrix_from_coeffs,
     calibrate_sigma_evr_binary_search,
     compute_llr_sample_chunks,
@@ -39,7 +40,9 @@ from opacus.accountants.analysis.bnb import (
     normalize_bnb_accountant_coeffs,
     parse_bnb_calibration_report,
     generate_mixture_samples,
+    get_bnb_base_delta,
     sample_b_min_sep_llr,
+    sample_balls_in_bins_llr_chunks,
     select_evr_candidate_ladder,
     select_evr_candidate_ladder_two_sided,
     split_confidence_alpha,
@@ -644,6 +647,60 @@ class BNBAnalysisTest(unittest.TestCase):
             num_workers=0,
         )
         self.assertTrue(torch.allclose(llr_chunked_1, llr_chunked_2))
+
+    def test_get_bnb_base_delta_is_below_target_delta(self) -> None:
+        base_delta = get_bnb_base_delta(num_samples=50_000, target_delta=0.2)
+        self.assertGreater(base_delta, 0.0)
+        self.assertLess(base_delta, 0.2)
+
+    def test_sample_balls_in_bins_llr_chunks_are_seed_reproducible(self) -> None:
+        coeffs = normalize_bnb_accountant_coeffs(coeffs=[1.0, 0.5])
+        llr_chunks_1 = sample_balls_in_bins_llr_chunks(
+            coeffs=coeffs,
+            cycle_length=3,
+            horizon=6,
+            sigma=1.2,
+            num_samples=128,
+            seed=2026,
+            chunk_size=32,
+            num_workers=0,
+            positive_sample=True,
+        )
+        llr_chunks_2 = sample_balls_in_bins_llr_chunks(
+            coeffs=coeffs,
+            cycle_length=3,
+            horizon=6,
+            sigma=1.2,
+            num_samples=128,
+            seed=2026,
+            chunk_size=32,
+            num_workers=0,
+            positive_sample=True,
+        )
+        self.assertEqual(len(llr_chunks_1), len(llr_chunks_2))
+        for chunk_1, chunk_2 in zip(llr_chunks_1, llr_chunks_2):
+            self.assertTrue(torch.allclose(torch.as_tensor(chunk_1), torch.as_tensor(chunk_2)))
+
+    def test_estimate_balls_in_bins_epsilon_chunked_matches_one_shot(self) -> None:
+        coeffs = normalize_bnb_accountant_coeffs(coeffs=[1.0, 0.5])
+        kwargs = dict(
+            coeffs=coeffs,
+            cycle_length=3,
+            horizon=6,
+            noise_multiplier=1.6,
+            target_delta=0.2,
+            num_samples=4_000,
+            seed=99,
+            tolerance=1e-4,
+            max_iterations=80,
+            num_workers=0,
+        )
+        eps_full = estimate_balls_in_bins_epsilon_monte_carlo(**kwargs)
+        eps_chunked = estimate_balls_in_bins_epsilon_monte_carlo(
+            **kwargs,
+            chunk_size=1_000,
+        )
+        self.assertLess(abs(float(eps_full) - float(eps_chunked)), 0.15)
 
     def test_make_bnb_calibration_report_schema(self) -> None:
         verification = DeltaVerificationResult(
