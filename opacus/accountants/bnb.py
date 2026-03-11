@@ -245,6 +245,8 @@ class BNBAccountant(IAccountant):
                 "bnb_reduce_dimensionality",
                 "bnb_tolerance",
                 "bnb_max_iterations",
+                "bnb_chunk_size",
+                "bnb_num_workers",
             ):
                 value = persisted_kwargs.get(key)
                 if value is not None:
@@ -256,6 +258,8 @@ class BNBAccountant(IAccountant):
             "bnb_reduce_dimensionality",
             "bnb_tolerance",
             "bnb_max_iterations",
+            "bnb_chunk_size",
+            "bnb_num_workers",
         ):
             value = kwargs.get(key)
             if value is not None:
@@ -270,6 +274,8 @@ class BNBAccountant(IAccountant):
         reduce_dimensionality = bool(calibration_cfg["bnb_reduce_dimensionality"])
         tolerance = float(calibration_cfg["bnb_tolerance"])
         max_iterations = int(calibration_cfg["bnb_max_iterations"])
+        chunk_size = calibration_cfg["bnb_chunk_size"]
+        num_workers = int(calibration_cfg["bnb_num_workers"])
         if (
             sampling_mode in ("b_min_sep", "balls_in_bins")
             and c_matrix is not None
@@ -298,6 +304,8 @@ class BNBAccountant(IAccountant):
                     reduce_dimensionality=reduce_dimensionality,
                     tolerance=float(tolerance),
                     max_iterations=max_iterations,
+                    chunk_size=chunk_size,
+                    num_workers=num_workers,
                 )
             )
 

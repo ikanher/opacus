@@ -25,10 +25,13 @@ from opacus.accountants.analysis.bnb import (
     build_b_min_sep_gaussian_mixture,
     build_lower_toeplitz_c_matrix_from_coeffs,
     calibrate_sigma_evr_binary_search,
+    compute_llr_sample_chunks,
     compute_llr_samples,
     describe_bnb_calibration_report,
     estimate_b_min_sep_epsilon_monte_carlo,
+    estimate_epsilon_from_llr_chunks,
     estimate_epsilon_from_llr_samples,
+    estimate_hockey_stick_delta_from_llr_chunks,
     estimate_hockey_stick_delta_from_llr_samples,
     find_sigma_binary_search,
     make_bnb_calibration_report,
@@ -239,6 +242,40 @@ class BNBAnalysisTest(unittest.TestCase):
         )
         self.assertTrue(torch.allclose(llr_1, llr_2))
 
+    def test_compute_llr_sample_chunks_are_seed_reproducible(self) -> None:
+        up = GaussianMixture(
+            modes=torch.tensor([[0.0, 0.0], [1.0, 0.0]]),
+            probs=torch.tensor([0.4, 0.6]),
+        )
+        lo = GaussianMixture(
+            modes=torch.tensor([[0.0, 0.0], [0.2, 0.0]]),
+            probs=torch.tensor([0.4, 0.6]),
+        )
+        llr_chunks_1 = compute_llr_sample_chunks(
+            up_gm=up,
+            lo_gm=lo,
+            sigma=0.8,
+            num_samples=128,
+            seed=2026,
+            chunk_size=32,
+            num_workers=0,
+        )
+        llr_chunks_2 = compute_llr_sample_chunks(
+            up_gm=up,
+            lo_gm=lo,
+            sigma=0.8,
+            num_samples=128,
+            seed=2026,
+            chunk_size=32,
+            num_workers=0,
+        )
+
+        self.assertEqual(sum(int(chunk.numel()) for chunk in llr_chunks_1), 128)
+        self.assertTrue(all(int(chunk.numel()) <= 32 for chunk in llr_chunks_1))
+        self.assertEqual(len(llr_chunks_1), len(llr_chunks_2))
+        for chunk_1, chunk_2 in zip(llr_chunks_1, llr_chunks_2):
+            self.assertTrue(torch.allclose(chunk_1, chunk_2))
+
     def test_compute_llr_samples_matches_reference_notebook_formula(self) -> None:
         # Parity against examples/monte_carlo_accountant.py formulas:
         #   component_llrs = (points @ modes.T - ||modes||^2 / 2) / sigma^2
@@ -337,6 +374,30 @@ class BNBAnalysisTest(unittest.TestCase):
         )
         self.assertEqual(estimated, 0.0)
 
+    def test_estimate_epsilon_from_llr_chunks_matches_sample_tensor_path(self) -> None:
+        llr = torch.tensor([-2.0, -0.5, 0.2, 1.0, 2.5, 3.0], dtype=torch.float64)
+        target_delta = estimate_hockey_stick_delta_from_llr_samples(
+            epsilon=0.7,
+            llr_samples=llr,
+        )
+        chunks = [llr[:2], llr[2:4], llr[4:]]
+        eps_chunks = estimate_epsilon_from_llr_chunks(
+            target_delta=target_delta,
+            llr_chunks=chunks,
+            tolerance=1e-8,
+        )
+        eps_full = estimate_epsilon_from_llr_samples(
+            target_delta=target_delta,
+            llr_samples=llr,
+            tolerance=1e-8,
+        )
+        self.assertAlmostEqual(eps_chunks, eps_full, places=10)
+        self.assertAlmostEqual(
+            estimate_hockey_stick_delta_from_llr_chunks(epsilon=eps_chunks, llr_chunks=chunks),
+            target_delta,
+            delta=1e-8,
+        )
+
     def test_estimate_b_min_sep_epsilon_is_seed_reproducible(self) -> None:
         c = torch.tensor(
             [
@@ -357,6 +418,32 @@ class BNBAnalysisTest(unittest.TestCase):
         eps_2 = estimate_b_min_sep_epsilon_monte_carlo(**kwargs)
         self.assertAlmostEqual(eps_1, eps_2, places=12)
         self.assertGreaterEqual(eps_1, 0.0)
+
+    def test_estimate_b_min_sep_epsilon_chunked_matches_one_shot(self) -> None:
+        c = torch.tensor(
+            [
+                [1.0, 0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0, 1.0],
+            ],
+            dtype=torch.float64,
+        )
+        kwargs = dict(
+            c_matrix=c,
+            bands=2,
+            noise_multiplier=1.2,
+            target_delta=0.2,
+            num_samples=10_000,
+            seed=7,
+            tolerance=1e-6,
+            max_iterations=200,
+        )
+        eps_full = estimate_b_min_sep_epsilon_monte_carlo(**kwargs)
+        eps_chunked = estimate_b_min_sep_epsilon_monte_carlo(
+            **kwargs,
+            chunk_size=2_000,
+            num_workers=0,
+        )
+        self.assertAlmostEqual(eps_full, eps_chunked, delta=0.02)
 
     def test_estimate_b_min_sep_epsilon_monotone_in_sigma_grid(self) -> None:
         c = torch.tensor(
@@ -529,6 +616,34 @@ class BNBAnalysisTest(unittest.TestCase):
             seed=42,
         )
         self.assertTrue(torch.allclose(llr_1, llr_2))
+
+    def test_sample_b_min_sep_llr_chunked_is_seed_reproducible(self) -> None:
+        c = torch.tensor(
+            [
+                [1.0, 0.0, 1.0, 0.0],
+                [0.0, 1.0, 0.0, 1.0],
+            ],
+            dtype=torch.float64,
+        )
+        llr_chunked_1 = sample_b_min_sep_llr(
+            c_matrix=c,
+            bands=2,
+            sigma=1.1,
+            num_samples=5000,
+            seed=42,
+            chunk_size=1024,
+            num_workers=0,
+        )
+        llr_chunked_2 = sample_b_min_sep_llr(
+            c_matrix=c,
+            bands=2,
+            sigma=1.1,
+            num_samples=5000,
+            seed=42,
+            chunk_size=1024,
+            num_workers=0,
+        )
+        self.assertTrue(torch.allclose(llr_chunked_1, llr_chunked_2))
 
     def test_make_bnb_calibration_report_schema(self) -> None:
         verification = DeltaVerificationResult(

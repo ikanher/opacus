@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 import math
 from typing import Any, Dict, Sequence
 
@@ -31,6 +32,8 @@ _BNB_CALIBRATION_DEFAULTS: Dict[str, Any] = {
     "bnb_require_evr_pass": False,
     "bnb_tolerance": 1e-7,
     "bnb_max_iterations": 1000,
+    "bnb_chunk_size": None,
+    "bnb_num_workers": 0,
 }
 
 
@@ -841,6 +844,44 @@ def generate_mixture_samples(
     return component_ids, means + sigma * noise
 
 
+def _validate_bnb_chunking(
+    *,
+    num_samples: int,
+    chunk_size: int | None,
+    num_workers: int,
+) -> None:
+    if num_samples <= 0:
+        raise ValueError("num_samples must be > 0")
+
+    if chunk_size is not None and chunk_size <= 0:
+        raise ValueError("chunk_size must be > 0 when provided")
+
+    if num_workers < 0:
+        raise ValueError("num_workers must be >= 0")
+
+
+def _derive_bnb_chunk_specs(
+    *,
+    num_samples: int,
+    seed: int,
+    chunk_size: int | None,
+) -> list[tuple[int, int]]:
+    if chunk_size is None or chunk_size >= num_samples:
+        return [(int(num_samples), int(seed))]
+
+    specs: list[tuple[int, int]] = []
+    remaining = int(num_samples)
+    chunk_index = 0
+
+    while remaining > 0:
+        current = min(int(chunk_size), remaining)
+        specs.append((current, int(seed + chunk_index)))
+        remaining -= current
+        chunk_index += 1
+
+    return specs
+
+
 def compute_llr_samples(
     *,
     up_gm: GaussianMixture,
@@ -862,6 +903,90 @@ def compute_llr_samples(
     return _mixture_logpdf(points, up_gm, sigma) - _mixture_logpdf(points, lo_gm, sigma)
 
 
+def _compute_llr_samples_chunk(
+    *,
+    up_gm: GaussianMixture,
+    lo_gm: GaussianMixture,
+    sigma: float,
+    num_samples: int,
+    seed: int,
+) -> torch.Tensor:
+    generator = torch.Generator(device=up_gm.modes.device).manual_seed(int(seed))
+    return compute_llr_samples(
+        up_gm=up_gm,
+        lo_gm=lo_gm,
+        sigma=sigma,
+        num_samples=num_samples,
+        generator=generator,
+    )
+
+
+def compute_llr_sample_chunks(
+    *,
+    up_gm: GaussianMixture,
+    lo_gm: GaussianMixture,
+    sigma: float,
+    num_samples: int,
+    seed: int = 0,
+    chunk_size: int | None = None,
+    num_workers: int = 0,
+) -> list[torch.Tensor]:
+    if up_gm.modes.shape[1] != lo_gm.modes.shape[1]:
+        raise ValueError("up_gm and lo_gm must have the same dimension")
+
+    _validate_bnb_chunking(
+        num_samples=int(num_samples),
+        chunk_size=chunk_size,
+        num_workers=int(num_workers),
+    )
+    specs = _derive_bnb_chunk_specs(
+        num_samples=int(num_samples),
+        seed=int(seed),
+        chunk_size=chunk_size,
+    )
+
+    if len(specs) == 1:
+        chunk_num_samples, chunk_seed = specs[0]
+        return [
+            _compute_llr_samples_chunk(
+                up_gm=up_gm,
+                lo_gm=lo_gm,
+                sigma=float(sigma),
+                num_samples=int(chunk_num_samples),
+                seed=int(chunk_seed),
+            )
+        ]
+
+    if num_workers <= 1:
+        generator = torch.Generator(device=up_gm.modes.device).manual_seed(int(seed))
+        return [
+            compute_llr_samples(
+                up_gm=up_gm,
+                lo_gm=lo_gm,
+                sigma=float(sigma),
+                num_samples=int(chunk_num_samples),
+                generator=generator,
+            )
+            for chunk_num_samples, _chunk_seed in specs
+        ]
+
+    max_workers = min(int(num_workers), len(specs))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                _compute_llr_samples_chunk,
+                up_gm=up_gm,
+                lo_gm=lo_gm,
+                sigma=float(sigma),
+                num_samples=int(chunk_num_samples),
+                seed=int(chunk_seed),
+            )
+            for chunk_num_samples, chunk_seed in specs
+        ]
+
+        return [future.result() for future in futures]
+
+
 def sample_b_min_sep_llr(
     *,
     c_matrix: torch.Tensor,
@@ -871,6 +996,8 @@ def sample_b_min_sep_llr(
     num_samples: int,
     seed: int = 0,
     reduce_dimensionality: bool = False,
+    chunk_size: int | None = None,
+    num_workers: int = 0,
 ) -> torch.Tensor:
     """
     Sample privacy-loss log-likelihood ratios for the BMinSep mechanism.
@@ -880,7 +1007,7 @@ def sample_b_min_sep_llr(
     ``lo`` is the zero-mean baseline mixture. These LLR samples are the direct
     input to Monte Carlo estimates of hockey-stick divergence.
 
-    Source: BMinSep (Dong and Ganesh, 2025 draft), Section 5, Equations (2)-(4), Theorem 5.1.
+    Source: BMinSep (Dong and Ganesh, 2025), Section 5, Equations (2)-(4), Theorem 5.1.
     """
     if num_samples <= 0:
         raise ValueError("num_samples must be > 0")
@@ -908,14 +1035,19 @@ def sample_b_min_sep_llr(
         probs=torch.ones(1, dtype=up_gm.modes.dtype, device=up_gm.modes.device),
     )
 
-    generator = torch.Generator(device=up_gm.modes.device).manual_seed(int(seed))
-    return compute_llr_samples(
+    chunks = compute_llr_sample_chunks(
         up_gm=up_gm,
         lo_gm=lo_gm,
         sigma=float(sigma),
         num_samples=int(num_samples),
-        generator=generator,
+        seed=int(seed),
+        chunk_size=chunk_size,
+        num_workers=int(num_workers),
     )
+    if len(chunks) == 1:
+        return chunks[0]
+
+    return torch.cat(chunks, dim=0)
 
 
 def estimate_hockey_stick_delta_from_llr_samples(
@@ -932,6 +1064,31 @@ def estimate_hockey_stick_delta_from_llr_samples(
     vals = torch.clamp(1.0 - torch.exp(epsilon - llr_samples), min=0.0)
 
     return float(torch.mean(vals))
+
+
+def estimate_hockey_stick_delta_from_llr_chunks(
+    *,
+    epsilon: float,
+    llr_chunks: Sequence[torch.Tensor],
+) -> float:
+    if len(llr_chunks) == 0:
+        raise ValueError("llr_chunks must be non-empty")
+
+    total = 0.0
+    count = 0
+    for chunk in llr_chunks:
+        if chunk.ndim != 1:
+            raise ValueError("each llr chunk must be a 1-D tensor")
+        if chunk.numel() == 0:
+            continue
+        vals = torch.clamp(1.0 - torch.exp(float(epsilon) - chunk), min=0.0)
+        total += float(torch.sum(vals))
+        count += int(chunk.numel())
+
+    if count <= 0:
+        raise ValueError("llr_chunks must contain at least one sample")
+
+    return total / float(count)
 
 
 def verify_hockey_stick_delta_hoeffding(
@@ -1073,6 +1230,74 @@ def _resolve_epsilon_upper_bound(
     raise ValueError("could not bracket epsilon; increase max_iterations")
 
 
+def estimate_epsilon_from_llr_chunks(
+    *,
+    target_delta: float,
+    llr_chunks: Sequence[torch.Tensor],
+    epsilon_low: float = 0.0,
+    epsilon_high: float | None = None,
+    tolerance: float = 1e-4,
+    max_iterations: int = 200,
+) -> float:
+    if target_delta < 0.0 or target_delta >= 1.0:
+        raise ValueError("target_delta must be in [0, 1)")
+
+    if epsilon_low < 0.0:
+        raise ValueError("epsilon_low must be >= 0")
+
+    if tolerance <= 0.0:
+        raise ValueError("tolerance must be > 0")
+
+    if max_iterations <= 0:
+        raise ValueError("max_iterations must be > 0")
+
+    delta_at_low = estimate_hockey_stick_delta_from_llr_chunks(
+        epsilon=epsilon_low,
+        llr_chunks=llr_chunks,
+    )
+    if target_delta >= delta_at_low:
+        return float(epsilon_low)
+
+    low = float(epsilon_low)
+    if epsilon_high is not None:
+        high = float(epsilon_high)
+        if high <= low:
+            raise ValueError("epsilon_high must be > epsilon_low")
+        d_high = estimate_hockey_stick_delta_from_llr_chunks(
+            epsilon=high,
+            llr_chunks=llr_chunks,
+        )
+        if d_high > target_delta:
+            raise ValueError("epsilon_high does not satisfy target_delta")
+    else:
+        high = max(1.0, low + 1.0)
+        for _ in range(max_iterations):
+            d_high = estimate_hockey_stick_delta_from_llr_chunks(
+                epsilon=high,
+                llr_chunks=llr_chunks,
+            )
+            if d_high <= target_delta:
+                break
+            high *= 2.0
+        else:
+            raise ValueError("could not bracket epsilon; increase max_iterations")
+
+    for _ in range(max_iterations):
+        mid = 0.5 * (low + high)
+        d_mid = estimate_hockey_stick_delta_from_llr_chunks(
+            epsilon=mid,
+            llr_chunks=llr_chunks,
+        )
+        if abs(d_mid - target_delta) <= tolerance:
+            return float(mid)
+        if d_mid > target_delta:
+            low = mid
+        else:
+            high = mid
+
+    return float(0.5 * (low + high))
+
+
 def estimate_b_min_sep_epsilon_monte_carlo(
     *,
     c_matrix: torch.Tensor,
@@ -1085,6 +1310,8 @@ def estimate_b_min_sep_epsilon_monte_carlo(
     reduce_dimensionality: bool = False,
     tolerance: float = 1e-4,
     max_iterations: int = 200,
+    chunk_size: int | None = None,
+    num_workers: int = 0,
 ) -> float:
     """
     Estimate epsilon for BMinSep accounting from Monte Carlo LLR samples.
@@ -1104,19 +1331,35 @@ def estimate_b_min_sep_epsilon_monte_carlo(
     if seed < 0:
         raise ValueError("seed must be >= 0")
 
-    llr_samples = sample_b_min_sep_llr(
+    up_gm = build_b_min_sep_gaussian_mixture(
         c_matrix=c_matrix,
         bands=bands,
         cycle_length=cycle_length,
+        reduce_dimensionality=reduce_dimensionality,
+    )
+    zero_mode = torch.zeros(
+        1,
+        up_gm.modes.shape[1],
+        dtype=up_gm.modes.dtype,
+        device=up_gm.modes.device,
+    )
+    lo_gm = GaussianMixture(
+        modes=zero_mode,
+        probs=torch.ones(1, dtype=up_gm.modes.dtype, device=up_gm.modes.device),
+    )
+    llr_chunks = compute_llr_sample_chunks(
+        up_gm=up_gm,
+        lo_gm=lo_gm,
         sigma=float(noise_multiplier),
         num_samples=int(num_samples),
         seed=int(seed),
-        reduce_dimensionality=reduce_dimensionality,
+        chunk_size=chunk_size,
+        num_workers=int(num_workers),
     )
 
-    return estimate_epsilon_from_llr_samples(
+    return estimate_epsilon_from_llr_chunks(
         target_delta=float(target_delta),
-        llr_samples=llr_samples,
+        llr_chunks=llr_chunks,
         tolerance=tolerance,
         max_iterations=max_iterations,
     )
@@ -1132,6 +1375,8 @@ def estimate_b_min_sep_delta_monte_carlo(
     num_samples: int,
     seed: int = 0,
     reduce_dimensionality: bool = False,
+    chunk_size: int | None = None,
+    num_workers: int = 0,
 ) -> float:
     """
     Estimate hockey-stick ``delta(epsilon)`` for BMinSep from Monte Carlo LLRs.
@@ -1154,19 +1399,34 @@ def estimate_b_min_sep_delta_monte_carlo(
     if seed < 0:
         raise ValueError("seed must be >= 0")
 
-    llr_samples = sample_b_min_sep_llr(
+    up_gm = build_b_min_sep_gaussian_mixture(
         c_matrix=c_matrix,
         bands=bands,
         cycle_length=cycle_length,
+        reduce_dimensionality=reduce_dimensionality,
+    )
+    zero_mode = torch.zeros(
+        1,
+        up_gm.modes.shape[1],
+        dtype=up_gm.modes.dtype,
+        device=up_gm.modes.device,
+    )
+    lo_gm = GaussianMixture(
+        modes=zero_mode,
+        probs=torch.ones(1, dtype=up_gm.modes.dtype, device=up_gm.modes.device),
+    )
+    llr_chunks = compute_llr_sample_chunks(
+        up_gm=up_gm,
+        lo_gm=lo_gm,
         sigma=float(noise_multiplier),
         num_samples=int(num_samples),
         seed=int(seed),
-        reduce_dimensionality=reduce_dimensionality,
+        chunk_size=chunk_size,
+        num_workers=int(num_workers),
     )
-    # `delta(epsilon)` is estimated from sampled privacy-loss random variables.
-    return estimate_hockey_stick_delta_from_llr_samples(
+    return estimate_hockey_stick_delta_from_llr_chunks(
         epsilon=float(epsilon),
-        llr_samples=llr_samples,
+        llr_chunks=llr_chunks,
     )
 
 
