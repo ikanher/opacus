@@ -1544,12 +1544,19 @@ class PrivacyEngine:
         *,
         mechanism: str,
         kwargs: Dict[str, Any],
+        distributed_dp_runtime: bool,
     ) -> Optional[Dict[str, Any]]:
         if mechanism not in ("bandmf", "bsr", "bisr", "bnb", "bandinvmf"):
             return None
 
         calibration_cfg = resolve_bnb_calibration_kwargs(
             overrides=kwargs,
+        )
+        explicit_distributed_mode = kwargs.get("bnb_distributed_mode")
+        resolved_distributed_mode = (
+            explicit_distributed_mode
+            if explicit_distributed_mode is not None
+            else ("chunk_shard" if distributed_dp_runtime else "none")
         )
         return {
             "bnb_num_samples": int(calibration_cfg["bnb_num_samples"]),
@@ -1559,6 +1566,12 @@ class PrivacyEngine:
             ),
             "bnb_tolerance": float(calibration_cfg["bnb_tolerance"]),
             "bnb_max_iterations": int(calibration_cfg["bnb_max_iterations"]),
+            "bnb_chunk_size": calibration_cfg["bnb_chunk_size"],
+            "bnb_num_workers": int(calibration_cfg["bnb_num_workers"]),
+            "bnb_backend": str(calibration_cfg["bnb_backend"]),
+            "bnb_device": calibration_cfg["bnb_device"],
+            "bnb_distributed_mode": str(resolved_distributed_mode),
+            "bnb_distributed_dp_runtime": bool(distributed_dp_runtime),
         }
 
     @staticmethod
@@ -2498,6 +2511,7 @@ class PrivacyEngine:
         bnb_accounting_kwargs = self._build_bnb_accounting_kwargs_for_state(
             mechanism=mechanism_config.mechanism,
             kwargs=kwargs,
+            distributed_dp_runtime=bool(distributed),
         )
 
         mechanism_config = self._apply_correlated_runtime_calibration(

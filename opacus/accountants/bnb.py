@@ -275,6 +275,10 @@ class BNBAccountant(IAccountant):
                 "bnb_max_iterations",
                 "bnb_chunk_size",
                 "bnb_num_workers",
+                "bnb_backend",
+                "bnb_device",
+                "bnb_distributed_mode",
+                "bnb_distributed_dp_runtime",
             ):
                 value = persisted_kwargs.get(key)
                 if value is not None:
@@ -288,6 +292,10 @@ class BNBAccountant(IAccountant):
             "bnb_max_iterations",
             "bnb_chunk_size",
             "bnb_num_workers",
+            "bnb_backend",
+            "bnb_device",
+            "bnb_distributed_mode",
+            "bnb_distributed_dp_runtime",
         ):
             value = kwargs.get(key)
             if value is not None:
@@ -304,6 +312,10 @@ class BNBAccountant(IAccountant):
         max_iterations = int(calibration_cfg["bnb_max_iterations"])
         chunk_size = calibration_cfg["bnb_chunk_size"]
         num_workers = int(calibration_cfg["bnb_num_workers"])
+        backend = str(calibration_cfg["bnb_backend"])
+        device = calibration_cfg["bnb_device"]
+        distributed_mode = calibration_cfg["bnb_distributed_mode"]
+        distributed_dp_runtime = bool(calibration_cfg["bnb_distributed_dp_runtime"])
         if sampling_mode == "b_min_sep" and c_matrix is not None and bands is not None and c_matrix_contract is not None:
             if cycle_length is None:
                 cycle_length = bands
@@ -367,6 +379,10 @@ class BNBAccountant(IAccountant):
                     max_iterations=max_iterations,
                     chunk_size=chunk_size,
                     num_workers=num_workers,
+                    backend=backend,
+                    device=device,
+                    distributed_mode=distributed_mode,
+                    distributed_dp_runtime=distributed_dp_runtime,
                 )
             )
 

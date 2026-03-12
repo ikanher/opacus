@@ -18,6 +18,8 @@ import unittest
 import torch
 
 from opacus.accountants.analysis.bnb import (
+    _assign_bnb_chunk_specs_to_shard,
+    _resolve_bnb_distributed_mode,
     BNBCalibrationReport,
     DeltaVerificationResult,
     GaussianMixture,
@@ -55,6 +57,29 @@ from opacus.accountants.analysis.bnb import (
 
 
 class BNBAnalysisTest(unittest.TestCase):
+    def test_resolve_bnb_distributed_mode_auto_selects_chunk_shard_for_dp_runtime(self) -> None:
+        mode, auto_selected = _resolve_bnb_distributed_mode(
+            distributed_mode=None,
+            distributed_dp_runtime=True,
+        )
+        self.assertEqual(mode, "chunk_shard")
+        self.assertTrue(auto_selected)
+
+    def test_assign_bnb_chunk_specs_to_shard_round_robins_chunks(self) -> None:
+        chunk_specs = [(0, 4), (4, 4), (8, 4), (12, 4), (16, 4)]
+        shard_0 = _assign_bnb_chunk_specs_to_shard(
+            specs=chunk_specs,
+            rank=0,
+            world_size=2,
+        )
+        shard_1 = _assign_bnb_chunk_specs_to_shard(
+            specs=chunk_specs,
+            rank=1,
+            world_size=2,
+        )
+        self.assertEqual(shard_0, [chunk_specs[0], chunk_specs[2], chunk_specs[4]])
+        self.assertEqual(shard_1, [chunk_specs[1], chunk_specs[3]])
+
     def test_build_lower_toeplitz_c_matrix_from_coeffs_expected_entries(self) -> None:
         c = build_lower_toeplitz_c_matrix_from_coeffs(
             coeffs=[1.0, 0.5, 0.25],
@@ -738,6 +763,42 @@ class BNBAnalysisTest(unittest.TestCase):
             chunk_size=1_000,
         )
         self.assertLess(abs(float(eps_full) - float(eps_chunked)), 0.15)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for BnB CUDA parity")
+    def test_sample_balls_in_bins_llr_chunks_cuda_matches_cpu_seeded(self) -> None:
+        coeffs = normalize_bnb_accountant_coeffs(coeffs=[1.0, 0.5])
+        cpu_chunks = sample_balls_in_bins_llr_chunks(
+            coeffs=coeffs,
+            cycle_length=3,
+            horizon=6,
+            sigma=1.2,
+            num_samples=128,
+            seed=2026,
+            chunk_size=32,
+            num_workers=0,
+            positive_sample=True,
+            backend="cpu",
+        )
+        cuda_chunks = sample_balls_in_bins_llr_chunks(
+            coeffs=coeffs,
+            cycle_length=3,
+            horizon=6,
+            sigma=1.2,
+            num_samples=128,
+            seed=2026,
+            chunk_size=32,
+            num_workers=0,
+            positive_sample=True,
+            backend="cuda",
+        )
+        self.assertEqual(len(cpu_chunks), len(cuda_chunks))
+        for cpu_chunk, cuda_chunk in zip(cpu_chunks, cuda_chunks):
+            self.assertTrue(
+                torch.allclose(
+                    torch.as_tensor(cpu_chunk, dtype=torch.float64),
+                    torch.as_tensor(cuda_chunk, dtype=torch.float64).cpu(),
+                )
+            )
 
     def test_make_bnb_calibration_report_schema(self) -> None:
         verification = DeltaVerificationResult(

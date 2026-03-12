@@ -54,6 +54,7 @@ from typing import Any, Dict, Sequence
 import numpy as np
 import scipy
 import torch
+import torch.distributed as dist
 from torch.distributions import Bernoulli, kl_divergence
 
 BNB_VERIFICATION_CONTRACT = "evr_union_bound_alpha_split_v1"
@@ -69,6 +70,10 @@ _BNB_CALIBRATION_DEFAULTS: Dict[str, Any] = {
     "bnb_max_iterations": 1000,
     "bnb_chunk_size": None,
     "bnb_num_workers": 0,
+    "bnb_backend": "auto",
+    "bnb_device": None,
+    "bnb_distributed_mode": "none",
+    "bnb_distributed_dp_runtime": False,
 }
 
 
@@ -923,6 +928,109 @@ def _validate_bnb_chunking(
         raise ValueError("num_workers must be >= 0")
 
 
+def _resolve_bnb_backend_and_device(
+    *,
+    backend: str,
+    device: str | torch.device | None,
+) -> tuple[str, torch.device]:
+    resolved_backend = str(backend).lower()
+    if resolved_backend not in ("auto", "cpu", "cuda"):
+        raise ValueError("bnb_backend must be one of {'auto', 'cpu', 'cuda'}")
+
+    resolved_device: torch.device | None = None
+    if device is not None:
+        resolved_device = torch.device(device)
+
+    if resolved_backend == "auto":
+        if resolved_device is not None:
+            if resolved_device.type == "cuda" and torch.cuda.is_available():
+                return "cuda", resolved_device
+
+            return "cpu", torch.device("cpu")
+
+        if torch.cuda.is_available():
+            return "cuda", torch.device("cuda")
+
+        return "cpu", torch.device("cpu")
+
+    if resolved_backend == "cuda":
+        if not torch.cuda.is_available():
+            raise ValueError("bnb_backend='cuda' requires CUDA to be available")
+        if resolved_device is None:
+            resolved_device = torch.device("cuda")
+        elif resolved_device.type != "cuda":
+            raise ValueError("bnb_device must be a CUDA device when bnb_backend='cuda'")
+
+        return "cuda", resolved_device
+
+    return "cpu", torch.device("cpu")
+
+
+def _resolve_bnb_distributed_mode(
+    *,
+    distributed_mode: str | None,
+    distributed_dp_runtime: bool,
+) -> tuple[str, bool]:
+    if distributed_mode is None:
+        requested_mode = "chunk_shard" if distributed_dp_runtime else "none"
+        auto_selected = bool(distributed_dp_runtime)
+    else:
+        requested_mode = str(distributed_mode)
+        auto_selected = False
+
+    if requested_mode not in ("none", "chunk_shard"):
+        raise ValueError("bnb_distributed_mode must be one of {'none', 'chunk_shard'}")
+
+    return requested_mode, auto_selected
+
+
+def _assign_bnb_chunk_specs_to_shard(
+    *,
+    specs: list[tuple[int, int]],
+    rank: int,
+    world_size: int,
+) -> list[tuple[int, int]]:
+    if rank < 0:
+        raise ValueError("rank must be >= 0")
+
+    if world_size <= 0:
+        raise ValueError("world_size must be > 0")
+
+    if rank >= world_size:
+        raise ValueError("rank must be < world_size")
+
+    return [spec for index, spec in enumerate(specs) if index % world_size == rank]
+
+
+def _reduce_bnb_llr_chunks_to_coordinator(
+    *,
+    local_chunks: list[torch.Tensor],
+    distributed_mode: str,
+) -> list[torch.Tensor]:
+    if distributed_mode != "chunk_shard":
+        return local_chunks
+
+    if not dist.is_available() or not dist.is_initialized():
+        raise ValueError(
+            "bnb_distributed_mode='chunk_shard' requires torch.distributed to be initialized"
+        )
+
+    world_size = dist.get_world_size()
+    gathered: list[list[torch.Tensor] | None] = [None for _ in range(world_size)]
+    payload = [chunk.detach().cpu() for chunk in local_chunks]
+    dist.all_gather_object(gathered, payload)
+    rank = dist.get_rank()
+    if rank != 0:
+        return []
+
+    reduced: list[torch.Tensor] = []
+    for shard_chunks in gathered:
+        if shard_chunks:
+            reduced.extend([chunk.to(dtype=torch.float64) for chunk in shard_chunks])
+
+    return reduced
+
+
 def _derive_bnb_chunk_specs(
     *,
     num_samples: int,
@@ -1037,10 +1145,13 @@ def _build_balls_in_bins_modes_matrix(
     coeffs: Sequence[float],
     cycle_length: int,
     horizon: int,
-) -> np.ndarray:
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
 
     def _convolve_full_1d(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
-        out = torch.zeros(lhs.numel() + rhs.numel() - 1, dtype=torch.float64)
+        out = torch.zeros(
+            lhs.numel() + rhs.numel() - 1, dtype=torch.float64, device=lhs.device
+        )
         for idx in range(lhs.numel()):
             out[idx : idx + rhs.numel()] += lhs[idx] * rhs
 
@@ -1049,18 +1160,18 @@ def _build_balls_in_bins_modes_matrix(
     def _toeplitz(c: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
         rows = int(c.numel())
         cols = int(r.numel())
-        out = torch.empty((rows, cols), dtype=torch.float64)
+        out = torch.empty((rows, cols), dtype=torch.float64, device=c.device)
         for i in range(rows):
             for j in range(cols):
                 out[i, j] = r[j - i] if j >= i else c[i - j]
 
         return out
 
-    coeff_array = np.asarray([float(c) for c in coeffs], dtype=np.float64)
-    if coeff_array.ndim != 1 or coeff_array.size == 0:
+    coeff_list = [float(c) for c in coeffs]
+    if len(coeff_list) == 0:
         raise ValueError("coeffs must be a non-empty 1-D sequence")
 
-    if np.any(coeff_array < 0.0):
+    if any(c < 0.0 for c in coeff_list):
         raise ValueError("coeffs must be nonnegative")
 
     if cycle_length <= 0:
@@ -1069,28 +1180,29 @@ def _build_balls_in_bins_modes_matrix(
     if horizon <= 0:
         raise ValueError("horizon must be positive")
 
-    if coeff_array.size > horizon:
-        coeff_array = coeff_array[:horizon]
+    if len(coeff_list) > horizon:
+        coeff_list = coeff_list[:horizon]
 
-    coeff_t = torch.tensor(coeff_array, dtype=torch.float64)
-    x_t = (torch.arange(horizon) % int(cycle_length) == 0).to(dtype=torch.float64)
+    resolved_device = torch.device(device) if device is not None else torch.device("cpu")
+    coeff_t = torch.tensor(coeff_list, dtype=torch.float64, device=resolved_device)
+    x_t = (torch.arange(horizon, device=resolved_device) % int(cycle_length) == 0).to(dtype=torch.float64)
     first_mode = _convolve_full_1d(
         coeff_t,
         x_t[: horizon - coeff_t.numel() + 1],
     )
 
-    if coeff_array.size > 1:
+    if len(coeff_list) > 1:
         bot_block = _toeplitz(
             coeff_t[:-1],
-            torch.zeros(coeff_t.numel() - 1, dtype=torch.float64),
+            torch.zeros(coeff_t.numel() - 1, dtype=torch.float64, device=resolved_device),
         )
         bot_prod = torch.mv(bot_block, x_t[-coeff_t.numel() + 1 :])
         first_mode[-coeff_t.numel() + 1 :] += bot_prod
 
-    elementary_vector = torch.zeros(int(cycle_length), dtype=torch.float64)
+    elementary_vector = torch.zeros(int(cycle_length), dtype=torch.float64, device=resolved_device)
     elementary_vector[0] = coeff_t[0]
 
-    return _toeplitz(elementary_vector, first_mode).cpu().numpy()
+    return _toeplitz(elementary_vector, first_mode)
 
 
 def _generate_balls_in_bins_samples_chunk(
@@ -1102,8 +1214,9 @@ def _generate_balls_in_bins_samples_chunk(
     num_samples: int,
     seed: int,
     positive_sample: bool,
-    modes_matrix: np.ndarray | None = None,
-) -> np.ndarray:
+    modes_matrix: torch.Tensor | None = None,
+    device: torch.device | str | None = None,
+) -> torch.Tensor:
     if sigma <= 0.0:
         raise ValueError("sigma must be > 0")
 
@@ -1115,41 +1228,63 @@ def _generate_balls_in_bins_samples_chunk(
             coeffs=coeffs,
             cycle_length=cycle_length,
             horizon=horizon,
+            device=device,
         )
 
-    rng = np.random.default_rng(int(seed))
+    resolved_device = (
+        torch.device(device)
+        if device is not None
+        else modes_matrix.device
+    )
+    generator = torch.Generator(device=resolved_device).manual_seed(int(seed))
     if positive_sample:
-        starting_indices = rng.integers(0, int(cycle_length), size=int(num_samples))
+        starting_indices = torch.randint(
+            low=0,
+            high=int(cycle_length),
+            size=(int(num_samples),),
+            generator=generator,
+            device=resolved_device,
+        )
         means = modes_matrix[starting_indices]
     else:
-        means = np.zeros((int(num_samples), int(horizon)), dtype=np.float64)
+        means = torch.zeros(
+            (int(num_samples), int(horizon)),
+            dtype=torch.float64,
+            device=resolved_device,
+        )
 
-    noise = rng.normal(loc=0.0, scale=float(sigma), size=(int(num_samples), int(horizon)))
+    noise = torch.randn(
+        int(num_samples),
+        int(horizon),
+        generator=generator,
+        device=resolved_device,
+        dtype=torch.float64,
+    ) * float(sigma)
 
     return means + noise
 
 
 def _compute_balls_in_bins_privacy_loss_chunk(
     *,
-    samples: np.ndarray,
+    samples: torch.Tensor,
     sigma: float,
-    modes_matrix: np.ndarray,
-) -> np.ndarray:
+    modes_matrix: torch.Tensor,
+) -> torch.Tensor:
     if sigma <= 0.0:
         raise ValueError("sigma must be > 0")
 
     if samples.ndim != 2:
         raise ValueError("samples must have shape [n, horizon]")
 
-    dot_products = np.matmul(samples, modes_matrix.T)
-    squared_mode_norms = np.sum(modes_matrix * modes_matrix, axis=1)
-    per_mode_privacy_loss = (2.0 * dot_products - squared_mode_norms[None, :]) / (2.0 * float(sigma) ** 2)
-    per_mode_privacy_loss_t = torch.from_numpy(per_mode_privacy_loss)
+    dot_products = torch.matmul(samples, modes_matrix.T)
+    squared_mode_norms = torch.sum(modes_matrix * modes_matrix, dim=1)
+    per_mode_privacy_loss = (2.0 * dot_products - squared_mode_norms.unsqueeze(0)) / (
+        2.0 * float(sigma) ** 2
+    )
 
-    return (
-        torch.logsumexp(per_mode_privacy_loss_t, dim=1)
-        - math.log(float(modes_matrix.shape[0]))
-    ).cpu().numpy()
+    return torch.logsumexp(per_mode_privacy_loss, dim=1) - math.log(
+        float(modes_matrix.shape[0])
+    )
 
 
 def sample_balls_in_bins_llr_chunks(
@@ -1163,24 +1298,47 @@ def sample_balls_in_bins_llr_chunks(
     chunk_size: int | None = None,
     num_workers: int = 0,
     positive_sample: bool = True,
-) -> list[np.ndarray]:
+    backend: str = "auto",
+    device: str | torch.device | None = None,
+    distributed_mode: str | None = "none",
+    distributed_dp_runtime: bool = False,
+) -> list[torch.Tensor]:
     _validate_bnb_chunking(
         num_samples=int(num_samples),
         chunk_size=chunk_size,
         num_workers=int(num_workers),
+    )
+    resolved_backend, resolved_device = _resolve_bnb_backend_and_device(
+        backend=backend,
+        device=device,
+    )
+    resolved_distributed_mode, _auto_selected = _resolve_bnb_distributed_mode(
+        distributed_mode=distributed_mode,
+        distributed_dp_runtime=distributed_dp_runtime,
     )
     specs = _derive_bnb_chunk_specs(
         num_samples=int(num_samples),
         seed=int(seed),
         chunk_size=chunk_size,
     )
+    if resolved_distributed_mode == "chunk_shard":
+        if not dist.is_available() or not dist.is_initialized():
+            raise ValueError(
+                "bnb_distributed_mode='chunk_shard' requires torch.distributed to be initialized"
+            )
+        specs = _assign_bnb_chunk_specs_to_shard(
+            specs=specs,
+            rank=dist.get_rank(),
+            world_size=dist.get_world_size(),
+        )
     modes_matrix = _build_balls_in_bins_modes_matrix(
         coeffs=coeffs,
         cycle_length=int(cycle_length),
         horizon=int(horizon),
+        device=resolved_device,
     )
 
-    def _one(chunk_num_samples: int, chunk_seed: int) -> np.ndarray:
+    def _one(chunk_num_samples: int, chunk_seed: int) -> torch.Tensor:
         samples = _generate_balls_in_bins_samples_chunk(
             coeffs=coeffs,
             cycle_length=int(cycle_length),
@@ -1190,6 +1348,7 @@ def sample_balls_in_bins_llr_chunks(
             seed=int(chunk_seed),
             positive_sample=bool(positive_sample),
             modes_matrix=modes_matrix,
+            device=resolved_device,
         )
         llr = _compute_balls_in_bins_privacy_loss_chunk(
             samples=samples,
@@ -1203,10 +1362,30 @@ def sample_balls_in_bins_llr_chunks(
 
     if len(specs) == 1:
         chunk_num_samples, chunk_seed = specs[0]
-        return [_one(int(chunk_num_samples), int(chunk_seed))]
+        return _reduce_bnb_llr_chunks_to_coordinator(
+            local_chunks=[_one(int(chunk_num_samples), int(chunk_seed))],
+            distributed_mode=resolved_distributed_mode,
+        )
 
     if num_workers <= 1:
-        return [_one(int(chunk_num_samples), int(chunk_seed)) for chunk_num_samples, chunk_seed in specs]
+        local_chunks = [
+            _one(int(chunk_num_samples), int(chunk_seed))
+            for chunk_num_samples, chunk_seed in specs
+        ]
+        return _reduce_bnb_llr_chunks_to_coordinator(
+            local_chunks=local_chunks,
+            distributed_mode=resolved_distributed_mode,
+        )
+
+    if resolved_backend == "cuda":
+        local_chunks = [
+            _one(int(chunk_num_samples), int(chunk_seed))
+            for chunk_num_samples, chunk_seed in specs
+        ]
+        return _reduce_bnb_llr_chunks_to_coordinator(
+            local_chunks=local_chunks,
+            distributed_mode=resolved_distributed_mode,
+        )
 
     max_workers = min(int(num_workers), len(specs))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -1214,7 +1393,11 @@ def sample_balls_in_bins_llr_chunks(
             executor.submit(_one, int(chunk_num_samples), int(chunk_seed))
             for chunk_num_samples, chunk_seed in specs
         ]
-        return [future.result() for future in futures]
+        local_chunks = [future.result() for future in futures]
+    return _reduce_bnb_llr_chunks_to_coordinator(
+        local_chunks=local_chunks,
+        distributed_mode=resolved_distributed_mode,
+    )
 
 
 def estimate_balls_in_bins_epsilon_monte_carlo(
@@ -1230,6 +1413,10 @@ def estimate_balls_in_bins_epsilon_monte_carlo(
     max_iterations: int = 200,
     chunk_size: int | None = None,
     num_workers: int = 0,
+    backend: str = "auto",
+    device: str | torch.device | None = None,
+    distributed_mode: str | None = "none",
+    distributed_dp_runtime: bool = False,
 ) -> float:
     if target_delta < 0.0 or target_delta >= 1.0:
         raise ValueError("target_delta must be in [0, 1)")
@@ -1244,6 +1431,10 @@ def estimate_balls_in_bins_epsilon_monte_carlo(
         chunk_size=chunk_size,
         num_workers=int(num_workers),
         positive_sample=True,
+        backend=backend,
+        device=device,
+        distributed_mode=distributed_mode,
+        distributed_dp_runtime=distributed_dp_runtime,
     )
     negative_chunks = sample_balls_in_bins_llr_chunks(
         coeffs=coeffs,
@@ -1255,7 +1446,15 @@ def estimate_balls_in_bins_epsilon_monte_carlo(
         chunk_size=chunk_size,
         num_workers=int(num_workers),
         positive_sample=False,
+        backend=backend,
+        device=device,
+        distributed_mode=distributed_mode,
+        distributed_dp_runtime=distributed_dp_runtime,
     )
+    if distributed_mode == "chunk_shard" and dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+        result = torch.tensor(float("nan"), dtype=torch.float64)
+        dist.broadcast(result, src=0)
+        return float(result.item())
     positive_epsilon = estimate_epsilon_from_llr_chunks(
         target_delta=float(base_delta),
         llr_chunks=[torch.as_tensor(chunk, dtype=torch.float64) for chunk in positive_chunks],
@@ -1268,8 +1467,13 @@ def estimate_balls_in_bins_epsilon_monte_carlo(
         tolerance=float(tolerance),
         max_iterations=int(max_iterations),
     )
+    epsilon = float(max(float(positive_epsilon), float(negative_epsilon)))
+    if distributed_mode == "chunk_shard" and dist.is_available() and dist.is_initialized():
+        result = torch.tensor(epsilon, dtype=torch.float64)
+        dist.broadcast(result, src=0)
+        return float(result.item())
 
-    return float(max(float(positive_epsilon), float(negative_epsilon)))
+    return epsilon
 
 
 def _compute_llr_samples_chunk(
