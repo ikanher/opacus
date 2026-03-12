@@ -13,6 +13,7 @@ from opacus import SamplingSemantics
 from opacus.accountants.analysis.bnb import (
     estimate_balls_in_bins_epsilon_monte_carlo,
     get_bnb_base_delta,
+    get_bnb_overall_delta,
 )
 from opacus.accountants.utils import get_noise_multiplier
 from opacus.accountants.analysis.bnb import (
@@ -47,6 +48,36 @@ _SPEC.loader.exec_module(_MODULE)
     "jax_privacy Monte Carlo reference is unavailable",
 )
 class BNBJaxBSRParityTest(unittest.TestCase):
+    def test_bnb_base_delta_matches_jax_oracle_on_feasible_pair(self) -> None:
+        num_samples = 10_000
+        target_delta = 0.1
+
+        opacus_base_delta = float(get_bnb_base_delta(num_samples=num_samples, target_delta=target_delta))
+        jax_base_delta = float(jax_delta_calculation.get_base_delta(num_samples, target_delta))
+
+        self.assertAlmostEqual(opacus_base_delta, jax_base_delta, places=8)
+
+    def test_bnb_overall_delta_matches_jax_oracle_on_feasible_pair(self) -> None:
+        num_samples = 10_000
+        target_delta = 0.1
+        opacus_base_delta = float(get_bnb_base_delta(num_samples=num_samples, target_delta=target_delta))
+
+        opacus_overall = float(get_bnb_overall_delta(num_samples=num_samples, base_delta=opacus_base_delta))
+        jax_overall = float(jax_delta_calculation.get_overall_delta(num_samples, opacus_base_delta))
+
+        self.assertAlmostEqual(opacus_overall, jax_overall, places=8)
+        self.assertLessEqual(opacus_overall, target_delta)
+        self.assertAlmostEqual(opacus_overall, target_delta, places=5)
+
+    def test_bnb_base_delta_shared_infeasibility_matches_jax_oracle(self) -> None:
+        target_delta = 0.1
+        infeasible_samples = 10
+
+        with self.assertRaises(ValueError):
+            get_bnb_base_delta(num_samples=infeasible_samples, target_delta=target_delta)
+        with self.assertRaises(ValueError):
+            jax_delta_calculation.get_base_delta(infeasible_samples, target_delta)
+
     def test_amplified_bsr_modes_match_jax_balls_in_bins_reference(self) -> None:
         raw_coeffs = [1.0, 0.5]
         accountant_coeffs = normalize_bnb_accountant_coeffs(coeffs=raw_coeffs)

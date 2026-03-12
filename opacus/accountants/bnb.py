@@ -14,6 +14,25 @@
 
 from __future__ import annotations
 
+"""
+Runtime/accountant adapter for balls-in-bins and BMinSep Monte Carlo accounting.
+
+This module owns the accountant-facing boundary for amplified correlated
+accounting. It resolves runtime matrix metadata, validates that metadata
+against the selected sampling semantics, and delegates the actual Monte Carlo
+estimation to `opacus.opacus.accountants.analysis.bnb`.
+
+Paper lineage:
+- Balls-and-Bins (Chua et al., 2024) for the original one-shot balls-in-bins
+  certification model;
+- EVR (Wang et al., 2023) for the EVR-style confidence-splitting
+  interpretation used by the current candidate-ladder calibration path.
+
+Implementation lineage:
+- the amplified parity and EVR-oriented helper structure is closely aligned
+  with `google-deepmind/jax_privacy`.
+"""
+
 from typing import Any, Dict, Tuple
 from opacus.accountants.analysis.bnb import (
     estimate_balls_in_bins_epsilon_monte_carlo,
@@ -132,7 +151,11 @@ class BNBAccountant(IAccountant):
     Confidence-control logic lives in ``analysis.bnb``; this class wires those
     primitives into the Opacus accountant interface.
 
-    Source: BMinSep (Dong and Ganesh, 2025 draft), Section 5, Equations (2)-(4), Theorem 5.1.
+    Source:
+    - Balls-and-Bins (Chua et al., 2024) for one-shot Monte Carlo
+      certification;
+    - EVR (Wang et al., 2023) for EVR-style candidate-ladder feasibility and
+      confidence composition.
     """
 
     def __init__(self):
@@ -200,7 +223,11 @@ class BNBAccountant(IAccountant):
         2. validates matrix/sampler consistency,
         3. delegates epsilon estimation to ``estimate_b_min_sep_epsilon_monte_carlo``.
 
-        Source: BMinSep (Dong and Ganesh, 2025 draft), Section 5, Equations (2)-(4), Theorem 5.1.
+        Source:
+        - Balls-and-Bins (Chua et al., 2024) for one-shot Monte Carlo
+          certification;
+        - EVR (Wang et al., 2023) for the EVR-style feasibility path used by
+          the current balls-in-bins calibration surface.
         """
         if not self.history:
             return 0.0

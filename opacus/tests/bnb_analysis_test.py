@@ -21,6 +21,7 @@ from opacus.accountants.analysis.bnb import (
     BNBCalibrationReport,
     DeltaVerificationResult,
     GaussianMixture,
+    SingleVerificationResult,
     build_bnb_toeplitz_c_matrix_and_contract,
     build_b_min_sep_gaussian_mixture,
     estimate_balls_in_bins_epsilon_monte_carlo,
@@ -30,6 +31,8 @@ from opacus.accountants.analysis.bnb import (
     compute_llr_samples,
     describe_bnb_calibration_report,
     estimate_b_min_sep_epsilon_monte_carlo,
+    estimate_delta_upper_bound_single_verify_from_llr_chunks,
+    estimate_delta_upper_bound_single_verify_from_llr_samples,
     estimate_epsilon_from_llr_chunks,
     estimate_epsilon_from_llr_samples,
     estimate_hockey_stick_delta_from_llr_chunks,
@@ -217,6 +220,40 @@ class BNBAnalysisTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "same dimension"):
             compute_llr_samples(up_gm=up, lo_gm=lo, sigma=1.0, num_samples=8)
+
+    def test_single_verify_upper_bound_dominates_empirical_delta(self) -> None:
+        llr = torch.tensor([2.5, 1.2, 0.4, -0.2, 3.0], dtype=torch.float64)
+        result = estimate_delta_upper_bound_single_verify_from_llr_samples(
+            epsilon=0.5,
+            llr_samples=llr,
+            error_probability=1e-4,
+        )
+        empirical = estimate_hockey_stick_delta_from_llr_samples(
+            epsilon=0.5,
+            llr_samples=llr,
+        )
+        self.assertIsInstance(result, SingleVerificationResult)
+        self.assertGreaterEqual(result.upper_confidence_bound, empirical)
+        self.assertGreaterEqual(result.upper_confidence_bound, result.delta_estimate)
+
+    def test_single_verify_chunk_path_matches_sample_path(self) -> None:
+        llr = torch.tensor([1.0, 0.7, -0.4, 2.1, 1.5, 0.1], dtype=torch.float64)
+        sample_result = estimate_delta_upper_bound_single_verify_from_llr_samples(
+            epsilon=0.3,
+            llr_samples=llr,
+            error_probability=1e-5,
+        )
+        chunk_result = estimate_delta_upper_bound_single_verify_from_llr_chunks(
+            epsilon=0.3,
+            llr_chunks=[llr[:2], llr[2:4], llr[4:]],
+            error_probability=1e-5,
+        )
+        self.assertAlmostEqual(sample_result.delta_estimate, chunk_result.delta_estimate, places=12)
+        self.assertAlmostEqual(
+            sample_result.upper_confidence_bound,
+            chunk_result.upper_confidence_bound,
+            places=12,
+        )
 
     def test_compute_llr_samples_is_seed_reproducible(self) -> None:
         up = GaussianMixture(

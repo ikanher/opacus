@@ -14,6 +14,38 @@
 
 from __future__ import annotations
 
+"""
+Balls-in-bins and BMinSep Monte Carlo accounting helpers.
+
+This module owns the analysis-side sampling and verification utilities used by
+the amplified correlated-accounting path. It separates two certification
+contracts:
+
+- the original one-shot balls-in-bins / BMinSep Monte Carlo contract from
+  Balls-and-Bins (Chua et al., 2024), where one fixed candidate mechanism is
+  certified at one fixed ``epsilon``; and
+- the EVR-style candidate-ladder contract from EVR (Wang et al., 2023), where
+  confidence is split across multiple checked candidates through a `base_delta ->
+  overall_delta` mapping.
+
+Paper lineage:
+- Balls-and-Bins (Chua et al., 2024) defines the privacy-loss sampling model
+  and the one-shot Monte Carlo upper-bound contract;
+- EVR (Wang et al., 2023) defines the EVR-style confidence-splitting and
+  feasibility logic.
+- BMinSep (Dong and Ganesh, 2025)
+
+Implementation lineage:
+- the balls-in-bins sample generation, privacy-loss chunking, and EVR-style
+  feasibility probing in this module are closely adapted from
+  `google-deepmind/jax_privacy`.
+- original implementation based on example code from Dong et al. of
+  BMinSep (Dong and Ganesh, 2025)
+
+This module is analysis-only. Accountant history and runtime/sampler
+orchestration live in `opacus.opacus.accountants.bnb`.
+"""
+
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
 import math
@@ -47,11 +79,14 @@ def normalize_bnb_accountant_coeffs(
     """
     Normalize a non-negative Toeplitz first column for amplified BNB accounting.
 
-    JAX's balls-in-bins Monte Carlo path consumes a non-negative accountant-side
-    ``c_col`` whose scale is separated from the total noise multiplier. This
-    helper mirrors that contract for amplified BSR parity by normalizing the
-    accountant-side coefficients to unit L2 norm while leaving runtime
-    mechanism coefficients unchanged.
+    The amplified accountant works with an accountant-side Toeplitz first
+    column whose norm is separated from the public noise multiplier. This
+    helper normalizes a non-negative Toeplitz column to unit L2 norm while
+    leaving runtime mechanism coefficients unchanged.
+
+    Implementation lineage:
+    - mirrors the normalized accountant-side `c_col` contract used by
+      `google-deepmind/jax_privacy` for amplified balls-in-bins parity.
     """
     coeff_list = [float(c) for c in coeffs]
     if len(coeff_list) == 0:
@@ -95,7 +130,9 @@ class GaussianMixture:
     mean shift, and all components share the same isotropic ``sigma``.
     The sampled privacy loss is then computed between two such mixtures.
 
-    Source: BMinSep (Dong and Ganesh, 2025 draft), Section 4, Equation (1), and Section 5, Equation (2).
+    Source:
+    - Balls-and-Bins (Chua et al., 2024), privacy-loss sampling under
+      participation pattern-induced Gaussian means.
     """
 
     modes: torch.Tensor  # [k, d]
@@ -134,13 +171,36 @@ class DeltaVerificationResult:
 
 
 @dataclass(frozen=True)
+class SingleVerificationResult:
+    """
+    One-shot balls-in-bins verification result for a fixed mechanism and epsilon.
+
+    This mirrors the original balls-in-bins Monte Carlo contract: estimate the
+    hockey-stick divergence for one fixed candidate mechanism, then upper-bound
+    the true ``delta(epsilon)`` with a Bernoulli-KL inversion on the empirical
+    mean. No EVR/base-delta split or candidate-ladder composition is involved.
+
+    Source:
+    - Balls-and-Bins (Chua et al., 2024), one-shot single-mechanism
+      verification.
+    """
+
+    delta_estimate: float
+    upper_confidence_bound: float
+    error_probability: float
+    accepted: bool
+
+
+@dataclass(frozen=True)
 class BNBCalibrationReport:
     """
     Stable, versioned calibration payload for BNB Monte Carlo runs.
 
     The goal is reproducible diagnostics: a reviewer should be able to
     reconstruct what was calibrated, with which confidence split, and why
-    acceptance passed/failed, without re-reading logs.
+    acceptance passed or failed, without re-reading logs.
+
+    This report is specific to the EVR-style candidate-ladder calibration path.
     """
 
     version: int
@@ -1398,6 +1458,120 @@ def estimate_hockey_stick_delta_from_llr_chunks(
         raise ValueError("llr_chunks must contain at least one sample")
 
     return total / float(count)
+
+
+def estimate_delta_upper_bound_single_verify_from_llr_samples(
+    *,
+    epsilon: float,
+    llr_samples: torch.Tensor,
+    error_probability: float = 1e-6,
+) -> SingleVerificationResult:
+    """
+    Upper-bound ``delta(epsilon)`` for one fixed mechanism via Bernoulli KL inversion.
+
+    Let ``q_hat`` be the empirical hockey-stick divergence estimate from sampled
+    privacy losses. This helper returns the smallest ``p >= q_hat`` such that
+    ``KL(Bernoulli(q_hat) || Bernoulli(p)) >= log(1 / beta) / n`` where
+    ``beta = error_probability`` and ``n`` is the number of samples.
+
+    This is the original single-verification Monte Carlo contract from the
+    balls-in-bins paper. It intentionally does not use EVR/base-delta terms.
+    """
+    if error_probability <= 0.0 or error_probability >= 1.0:
+        raise ValueError("error_probability must be in (0, 1)")
+
+    if llr_samples.ndim != 1 or llr_samples.numel() == 0:
+        raise ValueError("llr_samples must be a non-empty 1-D tensor")
+
+    samples = llr_samples.to(dtype=torch.float64)
+    q_hat = float(
+        estimate_hockey_stick_delta_from_llr_samples(
+            epsilon=float(epsilon),
+            llr_samples=samples,
+        )
+    )
+    n = int(samples.numel())
+    threshold = math.log(1.0 / float(error_probability)) / float(n)
+
+    if q_hat >= 1.0:
+        upper = 1.0
+    else:
+        q = torch.tensor(float(q_hat), dtype=torch.float64)
+
+        def _bernoulli_kl_to(candidate: float) -> float:
+            p = torch.tensor(float(candidate), dtype=torch.float64)
+            return float(kl_divergence(Bernoulli(probs=q), Bernoulli(probs=p)))
+
+        low = float(q_hat)
+        high = 1.0
+        if _bernoulli_kl_to(high) < threshold:
+            upper = 1.0
+        else:
+            for _ in range(80):
+                mid = 0.5 * (low + high)
+                if _bernoulli_kl_to(mid) >= threshold:
+                    high = mid
+                else:
+                    low = mid
+            upper = float(high)
+
+    return SingleVerificationResult(
+        delta_estimate=float(q_hat),
+        upper_confidence_bound=float(upper),
+        error_probability=float(error_probability),
+        accepted=False,
+    )
+
+
+def estimate_delta_upper_bound_single_verify_from_llr_chunks(
+    *,
+    epsilon: float,
+    llr_chunks: Sequence[torch.Tensor],
+    error_probability: float = 1e-6,
+) -> SingleVerificationResult:
+    if len(llr_chunks) == 0:
+        raise ValueError("llr_chunks must be non-empty")
+
+    total = sum(int(chunk.numel()) for chunk in llr_chunks if chunk.ndim == 1)
+    if total <= 0:
+        raise ValueError("llr_chunks must contain at least one sample")
+
+    q_hat = float(
+        estimate_hockey_stick_delta_from_llr_chunks(
+            epsilon=float(epsilon),
+            llr_chunks=llr_chunks,
+        )
+    )
+    threshold = math.log(1.0 / float(error_probability)) / float(total)
+
+    if q_hat >= 1.0:
+        upper = 1.0
+    else:
+        q = torch.tensor(float(q_hat), dtype=torch.float64)
+
+        def _bernoulli_kl_to(candidate: float) -> float:
+            p = torch.tensor(float(candidate), dtype=torch.float64)
+            return float(kl_divergence(Bernoulli(probs=q), Bernoulli(probs=p)))
+
+        low = float(q_hat)
+        high = 1.0
+        if _bernoulli_kl_to(high) < threshold:
+            upper = 1.0
+        else:
+            for _ in range(80):
+                mid = 0.5 * (low + high)
+                if _bernoulli_kl_to(mid) >= threshold:
+                    high = mid
+                else:
+                    low = mid
+            upper = float(high)
+
+    return SingleVerificationResult(
+        delta_estimate=float(q_hat),
+        upper_confidence_bound=float(upper),
+        error_probability=float(error_probability),
+        accepted=False,
+    )
 
 
 def verify_hockey_stick_delta_hoeffding(
