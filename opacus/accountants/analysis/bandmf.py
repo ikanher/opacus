@@ -3,15 +3,16 @@ from __future__ import annotations
 """
 BandMF analysis helpers.
 
-BandMF is the optimized forward banded Toeplitz method from
-"Scaling up the Banded Matrix Factorization Mechanism for Differentially
-Private ML" (McKenna, 2024).
+The production BandMF contract follows the paper/JAX fixed-batch object:
+- optimize Toeplitz-style coefficients for the prefix workload;
+- materialize the finite-horizon banded lower-triangular matrix;
+- normalize each nonzero column independently.
 
-The production BandMF contract is:
-- optimize a banded lower-triangular Toeplitz strategy for the prefix workload;
-- use the prefix-workload mean squared error objective from Proposition 3.1;
-- normalize the resulting Toeplitz coefficients to unit single-participation
-  sensitivity before using them in runtime/accounting.
+This matches `jax_privacy.matrix_factorization.banded.ColumnNormalizedBanded`
+and is the canonical fixed-batch BandMF sensitivity surface.
+
+NB: This factorization is called "dense" and apparently the standard one is
+    unnormalized. We might need to change to unnormalized.
 """
 
 import math
@@ -19,8 +20,6 @@ from typing import Iterable
 
 import numpy as np
 import torch
-
-from opacus.accountants.analysis.bsr import generate_bsr_coeffs_from_sgd_workload
 
 
 def _validate_bands(*, bands: int) -> None:
@@ -69,23 +68,138 @@ def normalize_bandmf_strategy_coeffs(
     return [float(x) for x in normalized]
 
 
-def generate_legacy_bandmf_placeholder_coeffs_from_sgd_workload(
+def materialize_bandmf_toeplitz_matrix(
     *,
-    bands: int,
-    momentum: float,
-    weight_decay: float,
-) -> list[float]:
+    coeffs: Iterable[float],
+    steps: int,
+) -> np.ndarray:
     """
-    Legacy migration oracle for the historical `BandMF == BSR coeffs` contract.
-
-    This is not the paper-faithful BandMF method. It exists only so tests can
-    prove the refactor materially changed the old placeholder behavior.
+    Materialize the globally normalized lower-triangular Toeplitz BandMF matrix.
     """
-    return generate_bsr_coeffs_from_sgd_workload(
-        bands=int(bands),
-        momentum=float(momentum),
-        weight_decay=float(weight_decay),
+    coeff_array = _as_float_array(coeffs, name="coeffs")
+    _validate_steps(steps=int(steps), bands=int(min(len(coeff_array), steps)))
+    normalized = np.asarray(
+        normalize_bandmf_strategy_coeffs(coeffs=coeff_array.tolist()), dtype=np.float64
     )
+
+    n = int(steps)
+    matrix = np.zeros((n, n), dtype=np.float64)
+    for j in range(n):
+        max_lag = min(normalized.size, n - j)
+        matrix[j : j + max_lag, j] = normalized[:max_lag]
+
+    return matrix
+
+
+def materialize_column_normalized_banded_bandmf_matrix(
+    *,
+    coeffs: Iterable[float],
+    steps: int,
+) -> np.ndarray:
+    """
+    Materialize the paper/JAX BandMF matrix for a finite horizon.
+
+    The input Toeplitz-style coefficients are first globally normalized, then
+    the lower-triangular banded matrix is materialized, and finally each
+    nonzero column is normalized independently.
+    """
+    matrix = materialize_bandmf_toeplitz_matrix(coeffs=coeffs, steps=steps)
+    column_norms = np.linalg.norm(matrix, axis=0)
+    normalized = matrix.copy()
+    nonzero = column_norms > 0.0
+    normalized[:, nonzero] /= column_norms[nonzero]
+
+    return normalized
+
+
+def compute_bandmf_max_column_norm_from_column_normalized_matrix(
+    *,
+    matrix: np.ndarray,
+) -> float:
+    """Return the maximum column norm of a materialized BandMF matrix."""
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError("matrix must be square")
+
+    return float(np.max(np.linalg.norm(matrix, axis=0)))
+
+
+def _max_participation_for_linear_fn(
+    values: np.ndarray,
+    *,
+    min_separation: int,
+    max_participations: int,
+) -> float:
+    """Dynamic program for max min-sep participation on a 1-D objective."""
+    n = int(values.size)
+    if n == 0:
+        return 0.0
+
+    dp = np.zeros((int(max_participations) + 1, n + int(min_separation) + 1), dtype=np.float64)
+    for k in range(1, int(max_participations) + 1):
+        for i in range(n - 1, -1, -1):
+            take = float(values[i]) + dp[k - 1, i + int(min_separation)]
+            skip = dp[k, i + 1]
+            dp[k, i] = max(take, skip)
+
+    return float(dp[int(max_participations), 0])
+
+
+def compute_bandmf_fixed_batch_sensitivity_from_column_normalized_matrix(
+    *,
+    matrix: np.ndarray,
+    max_participations: int,
+    min_separation: int,
+) -> float:
+    """
+    Compute a fixed-batch BandMF sensitivity bound on the column-normalized matrix.
+
+    When `min_separation >= bands`, column-normalized banded BandMF columns are
+    orthogonal under the participation contract, so sensitivity is exactly
+    `sqrt(k_eff)`. Otherwise compute the generic absolute-Gram upper bound on
+    the same column-normalized matrix.
+    """
+    if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+        raise ValueError("matrix must be square")
+
+    if max_participations < 1:
+        raise ValueError("max_participations must be >= 1")
+
+    if min_separation < 1:
+        raise ValueError("min_separation must be >= 1")
+
+    n = int(matrix.shape[0])
+    if n < 1:
+        raise ValueError("matrix must be non-empty")
+
+    support = np.abs(matrix) > 0.0
+    if not np.any(support):
+        raise ValueError("matrix must have at least one nonzero entry")
+
+    row_idx, col_idx = np.nonzero(support)
+    bands = int(np.max(row_idx - col_idx)) + 1
+    k_eff = min(int(max_participations), (n - 1) // int(min_separation) + 1)
+    if int(min_separation) >= bands:
+        return math.sqrt(float(k_eff))
+
+    gram_abs = np.abs(matrix.T @ matrix)
+    row_max = np.asarray(
+        [
+            _max_participation_for_linear_fn(
+                gram_abs[i],
+                min_separation=int(min_separation),
+                max_participations=int(max_participations),
+            )
+            for i in range(n)
+        ],
+        dtype=np.float64,
+    )
+    sens_sq = _max_participation_for_linear_fn(
+        row_max,
+        min_separation=int(min_separation),
+        max_participations=int(max_participations),
+    )
+
+    return math.sqrt(float(sens_sq))
 
 
 def generate_bandmf_initial_strategy_coeffs(
@@ -104,6 +218,7 @@ def generate_bandmf_initial_strategy_coeffs(
     coeffs = np.ones(int(bands), dtype=np.float64)
     for idx in range(1, int(bands)):
         coeffs[idx] = coeffs[idx - 1] * ((2.0 * idx - 1.0) / (2.0 * idx))
+
     return normalize_bandmf_strategy_coeffs(coeffs=coeffs.tolist())
 
 
@@ -280,7 +395,6 @@ def generate_bandmf_coeffs_from_sgd_workload(
         max_optimizer_steps=int(max_optimizer_steps),
     )
 
-
 def compute_bandmf_mf_sensitivity_from_coeffs(
     *,
     coeffs: Iterable[float],
@@ -289,68 +403,14 @@ def compute_bandmf_mf_sensitivity_from_coeffs(
     min_separation: int,
 ) -> float:
     """
-    Compute fixed-batch BandMF sensitivity from Toeplitz coefficients.
-
-    Paper-faithful BandMF uses a column-normalized lower-triangular banded
-    strategy. Under a `(k, b)` fixed-batch contract with `b >= bands`, the
-    worst-case participations are orthogonal, so the sensitivity squared is
-    just the number of actual participations.
-
-    The legacy Toeplitz recurrence path is retained only as a fallback for
-    non-paper configurations with `min_separation < bands`.
+    Compute fixed-batch BandMF sensitivity on the paper/JAX column-normalized object.
     """
-    coeff_list = [float(c) for c in coeffs]
-    if not coeff_list:
-        raise ValueError("coeffs must be non-empty")
-
-    if not all(math.isfinite(c) for c in coeff_list):
-        raise ValueError("coeffs must be finite")
-
-    if any(c < 0.0 for c in coeff_list):
-        raise ValueError("coeffs must be nonnegative")
-
-    if steps < 1:
-        raise ValueError("steps must be >= 1")
-
-    if max_participations < 1:
-        raise ValueError("max_participations must be >= 1")
-
-    if min_separation < 1:
-        raise ValueError("min_separation must be >= 1")
-
-    k_eff = min(int(max_participations), (int(steps) - 1) // int(min_separation) + 1)
-
-    coeff_norm = math.sqrt(sum(c * c for c in coeff_list))
-    if not math.isfinite(coeff_norm) or coeff_norm <= 0.0:
-        raise ValueError("coeffs must have positive L2 norm")
-
-    # Column-normalized banded strategies have unit single-participation
-    # sensitivity. When participations are separated by at least the band
-    # width, cross terms vanish and sensitivity^2 equals the number of
-    # participations.
-    if int(min_separation) >= len(coeff_list):
-        return math.sqrt(float(k_eff))
-
-    for prev, cur in zip(coeff_list, coeff_list[1:]):
-        if cur > prev + 1e-12:
-            raise ValueError("coeffs must be non-increasing")
-
-    padding = (int(min_separation) - int(steps)) % int(min_separation)
-    padded = coeff_list + [0.0] * max(0, int(steps) - len(coeff_list) + padding)
-
-    vector: list[float] = [0.0] * len(padded)
-    for block_start in range(0, len(padded), int(min_separation)):
-        running = 0.0
-        block_end = min(block_start + int(min_separation), len(padded))
-
-        for idx in range(block_start, block_end):
-            running += padded[idx]
-            vector[idx] = running
-
-    stride = int(min_separation) * int(k_eff)
-    for idx in range(stride, len(vector)):
-        vector[idx] -= vector[idx - stride]
-
-    total_sq = sum(v * v for v in vector[: int(steps)])
-
-    return math.sqrt(total_sq)
+    matrix = materialize_column_normalized_banded_bandmf_matrix(
+        coeffs=coeffs,
+        steps=steps,
+    )
+    return compute_bandmf_fixed_batch_sensitivity_from_column_normalized_matrix(
+        matrix=matrix,
+        max_participations=max_participations,
+        min_separation=min_separation,
+    )

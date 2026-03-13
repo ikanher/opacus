@@ -197,6 +197,34 @@ def compute_bisr_fixed_batch_sensitivity_from_inverse_coeffs(
     )
 
 
+def derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs(
+    *,
+    coeffs: Iterable[float],
+    steps: int,
+) -> list[float]:
+    """
+    Derive a non-negative accountant-side first column for amplified BISR.
+
+    Runtime BISR is defined by signed inverse-side coefficients of ``(C^p)^{-1}``.
+    The amplified balls-in-bins accountant and the JAX Monte Carlo oracle,
+    however, require a non-negative accountant-side ``c_col``. We therefore
+    derive the finite-horizon factor-side coefficients for ``C^p`` and return
+    the first column of ``|C^p|``.
+    """
+    factor_coeffs = derive_bisr_factor_coeffs_from_inverse_coeffs(
+        coeffs=coeffs,
+        steps=steps,
+    )
+    accountant_coeffs = [abs(float(c)) for c in factor_coeffs]
+    if not all(math.isfinite(c) for c in accountant_coeffs):
+        raise ValueError("derived amplified BISR accountant coefficients must be finite")
+
+    if accountant_coeffs[0] <= 0.0:
+        raise ValueError("derived amplified BISR accountant coefficients must be positive")
+
+    return accountant_coeffs
+
+
 def compute_bisr_kappa_from_coeffs(
     *,
     coeffs: Iterable[float],

@@ -22,9 +22,9 @@ def validate_bnb_runtime_consistency(
     if coeffs is None or not isinstance(coeffs, (list, tuple)) or len(coeffs) == 0:
         raise ValueError(f"{coeffs_error_prefix} requires non-empty `coeffs`")
 
-    if int(bands) != len(coeffs):
+    if len(coeffs) < int(bands):
         raise ValueError(
-            "bnb consistency check failed: `bands` must match len(coeffs); "
+            "bnb consistency check failed: len(coeffs) must be >= bands; "
             f"got bands={int(bands)} and len(coeffs)={len(coeffs)}"
         )
 

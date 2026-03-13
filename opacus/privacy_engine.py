@@ -51,6 +51,14 @@ from opacus.accountants.bandmf import (
 from opacus.accountants.utils import get_noise_multiplier
 from opacus.accountants.analysis.bsr import (
     calibrate_bsr_z_std,
+    generate_bsr_coeffs_from_sgd_workload,
+)
+from opacus.accountants.analysis.bandmf import (
+    generate_bandmf_coeffs_from_sgd_workload,
+)
+from opacus.accountants.analysis.bisr import (
+    derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs,
+    generate_bisr_coeffs_from_sgd_workload,
 )
 from opacus.accountants.analysis.bnb import (
     BNBCalibrationStatus,
@@ -228,13 +236,25 @@ class PrivacyEngine:
 
         accountant_coeffs = None
         if mechanism_config.mechanism == "bsr":
-            accountant_coeffs = normalize_bnb_accountant_coeffs(
-                coeffs=list(state["coeffs"])
+            accountant_coeffs = list(state["coeffs"])
+            state["bnb_accountant_coeffs"] = list(accountant_coeffs)
+            state["bnb_accountant_coeffs_source"] = "raw_c_col"
+        elif mechanism_config.mechanism == "bisr":
+            horizon = state.get(
+                "bnb_horizon",
+                kwargs.get("total_steps", kwargs.get("steps", bins)),
+            )
+            accountant_coeffs = (
+                derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs(
+                    coeffs=list(state["coeffs"]),
+                    steps=int(horizon),
+                )
             )
             state["bnb_accountant_coeffs"] = list(accountant_coeffs)
+            state["bnb_accountant_coeffs_source"] = "abs_factor_c_col"
 
         if (
-            mechanism_config.mechanism == "bsr"
+            mechanism_config.mechanism in ("bsr", "bisr")
             or (
                 state.get("bnb_c_matrix") is None
                 and isinstance(state.get("coeffs"), (list, tuple))

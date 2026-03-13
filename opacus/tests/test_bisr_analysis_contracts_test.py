@@ -9,6 +9,7 @@ import pytest
 
 from opacus.accountants.analysis.bisr import (
     bisr_cyclic_poisson_epsilon_upper_bound,
+    derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs,
     compute_bisr_fixed_batch_sensitivity_from_inverse_coeffs,
     compute_bisr_kappa_from_coeffs,
     derive_bisr_factor_coeffs_from_inverse_coeffs,
@@ -249,6 +250,25 @@ def test_contract_bisr_factor_coeffs_are_derived_from_inverse_toeplitz_object() 
         factor_coeffs[i] + 1e-10 >= factor_coeffs[i + 1]
         for i in range(len(factor_coeffs) - 1)
     )
+
+
+def test_contract_bisr_amplified_accountant_coeffs_are_abs_factor_side() -> None:
+    inverse_coeffs = generate_bisr_coeffs_from_sgd_workload(
+        bands=4,
+        momentum=0.9,
+        weight_decay=0.9999,
+    )
+    factor_coeffs = derive_bisr_factor_coeffs_from_inverse_coeffs(
+        coeffs=inverse_coeffs,
+        steps=16,
+    )
+    accountant_coeffs = derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs(
+        coeffs=inverse_coeffs,
+        steps=16,
+    )
+    assert accountant_coeffs == pytest.approx([abs(c) for c in factor_coeffs], rel=0.0, abs=1e-12)
+    assert all(c >= 0.0 for c in accountant_coeffs)
+    assert accountant_coeffs != pytest.approx([abs(c) for c in inverse_coeffs] + [0.0] * (16 - len(inverse_coeffs)), rel=1e-9, abs=1e-9)
 
 
 def test_contract_bisr_majorant_requires_nonnegative_decreasing_sequence() -> None:

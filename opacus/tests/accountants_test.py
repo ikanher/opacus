@@ -44,6 +44,10 @@ from opacus.accountants.analysis.bsr import (
 from opacus.accountants.analysis.bandmf import (
     compute_bandmf_mf_sensitivity_from_coeffs,
 )
+from opacus.accountants.analysis.bisr import (
+    derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs,
+    generate_bisr_coeffs_from_sgd_workload,
+)
 from opacus.accountants.analysis.bnb import (
     build_bnb_toeplitz_c_matrix_and_contract,
     normalize_bnb_accountant_coeffs,
@@ -1120,8 +1124,16 @@ class AccountingTest(unittest.TestCase):
         sample_rate = 0.25
         epsilon = 0.5
         epochs = 1
-        coeffs = [1.0, -0.5]
-        c_matrix = _lower_toeplitz_from_coeffs(coeffs, horizon=4)
+        coeffs = generate_bisr_coeffs_from_sgd_workload(
+            bands=2,
+            momentum=0.9,
+            weight_decay=0.9999,
+        )
+        accountant_coeffs = derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs(
+            coeffs=coeffs,
+            steps=4,
+        )
+        c_matrix = _lower_toeplitz_from_coeffs(accountant_coeffs, horizon=4)
 
         noise_multiplier = get_noise_multiplier(
             target_epsilon=epsilon,
@@ -1131,6 +1143,7 @@ class AccountingTest(unittest.TestCase):
             accountant="bnb",
             mechanism_state={
                 "coeffs": coeffs,
+                "bnb_accountant_coeffs": accountant_coeffs,
                 "bsr_bands": 2,
                 "bnb_c_matrix": c_matrix,
                 "bnb_c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
@@ -1231,6 +1244,115 @@ class AccountingTest(unittest.TestCase):
                 "bnb_c_matrix": c_matrix,
                 "bnb_c_matrix_contract": contract,
                 "_noise_mechanism": "bsr",
+            },
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 4, "bands": 2},
+            ),
+        )
+
+        self.assertGreater(noise_multiplier, 0.0)
+
+    def test_bsr_balls_in_bins_raw_accountant_c_col_requires_more_noise_than_normalized(self) -> None:
+        coeffs = [1.0, 0.8]
+        raw_c_matrix, raw_contract = build_bnb_toeplitz_c_matrix_and_contract(
+            coeffs=coeffs,
+            bands=2,
+            horizon=8,
+        )
+        normalized_coeffs = normalize_bnb_accountant_coeffs(coeffs=coeffs)
+        normalized_c_matrix, normalized_contract = build_bnb_toeplitz_c_matrix_and_contract(
+            coeffs=normalized_coeffs,
+            bands=2,
+            horizon=8,
+        )
+
+        raw_noise = get_noise_multiplier(
+            target_epsilon=0.5,
+            target_delta=0.2,
+            sample_rate=0.25,
+            epochs=1,
+            accountant="bnb",
+            epsilon_tolerance=0.2,
+            bnb_num_samples=200,
+            bnb_max_iterations=8,
+            mechanism_state={
+                "coeffs": coeffs,
+                "bnb_accountant_coeffs": coeffs,
+                "bsr_bands": 2,
+                "bnb_bands": 2,
+                "bnb_cycle_length": 4,
+                "bnb_c_matrix": raw_c_matrix,
+                "bnb_c_matrix_contract": raw_contract,
+                "_noise_mechanism": "bsr",
+            },
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 4, "bands": 2},
+            ),
+        )
+
+        normalized_noise = get_noise_multiplier(
+            target_epsilon=0.5,
+            target_delta=0.2,
+            sample_rate=0.25,
+            epochs=1,
+            accountant="bnb",
+            epsilon_tolerance=0.2,
+            bnb_num_samples=200,
+            bnb_max_iterations=8,
+            mechanism_state={
+                "coeffs": coeffs,
+                "bnb_accountant_coeffs": normalized_coeffs,
+                "bsr_bands": 2,
+                "bnb_bands": 2,
+                "bnb_cycle_length": 4,
+                "bnb_c_matrix": normalized_c_matrix,
+                "bnb_c_matrix_contract": normalized_contract,
+                "_noise_mechanism": "bsr",
+            },
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 4, "bands": 2},
+            ),
+        )
+
+        self.assertGreater(raw_noise, normalized_noise)
+
+    def test_bisr_balls_in_bins_can_use_abs_factor_side_accountant_coeffs(self) -> None:
+        inverse_coeffs = generate_bisr_coeffs_from_sgd_workload(
+            bands=2,
+            momentum=0.9,
+            weight_decay=0.9999,
+        )
+        accountant_coeffs = derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs(
+            coeffs=inverse_coeffs,
+            steps=8,
+        )
+        c_matrix, contract = build_bnb_toeplitz_c_matrix_and_contract(
+            coeffs=accountant_coeffs,
+            bands=2,
+            horizon=8,
+        )
+
+        noise_multiplier = get_noise_multiplier(
+            target_epsilon=0.5,
+            target_delta=0.2,
+            sample_rate=0.25,
+            epochs=1,
+            accountant="bnb",
+            epsilon_tolerance=0.2,
+            bnb_num_samples=200,
+            bnb_max_iterations=8,
+            mechanism_state={
+                "coeffs": inverse_coeffs,
+                "bnb_accountant_coeffs": accountant_coeffs,
+                "bsr_bands": 2,
+                "bnb_bands": 2,
+                "bnb_cycle_length": 4,
+                "bnb_c_matrix": c_matrix,
+                "bnb_c_matrix_contract": contract,
+                "_noise_mechanism": "bisr",
             },
             sampling_semantics=SamplingSemantics(
                 sampling_mode="balls_in_bins",
