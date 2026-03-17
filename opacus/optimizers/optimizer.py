@@ -216,8 +216,26 @@ class CorrelatedNoiseMechanism(NoiseMechanism):
     """
     Correlated-noise mechanism with lower-triangular Toeplitz solve.
 
-    Given Toeplitz coefficients ``coeffs`` and iid Gaussian ``z``, this mechanism
-    computes ``u`` from ``C u = z`` via forward substitution and injects ``u``.
+    This is the runtime realization of a matrix-mechanism style release. There
+    are two equivalent views:
+
+    1. Release-space view:
+       ``y = C x + z``, where ``x`` is the vector of clipped per-step
+       aggregates and ``z`` is iid Gaussian noise.
+    2. Gradient-space view used in runtime:
+       ``x + u``, where ``u`` is correlated Gaussian noise chosen so that
+       ``C u = z``.
+
+    Runtime uses the second form because training code already expects one
+    noised gradient-like update per step. We therefore:
+
+    - generate iid Gaussian ``z`` with public scale ``z_std``;
+    - solve the triangular system ``C u = z`` online via forward substitution;
+    - add ``u`` to the clipped aggregated gradients.
+
+    The matrix ``C`` is public mechanism metadata. It is not clipped and it is
+    not noised. Clipping still happens on per-sample gradients before they are
+    accumulated into ``p.summed_grad``.
     """
 
     def __init__(
@@ -313,6 +331,15 @@ class CorrelatedNoiseMechanism(NoiseMechanism):
         raise ValueError(self._describe_tensor(name=name, tensor=tensor, step=step))
 
     def _pre_scale_noise_std(self, optimizer: "DPOptimizer") -> float:
+        """
+        Convert accountant-scale ``z_std`` to the tensor scale used at runtime.
+
+        The correlated-noise mechanism stores its public Gaussian scale in the
+        same convention as the matrix-factorization accountants. For mean-loss
+        training, the optimizer expects summed gradients internally, so we scale
+        the iid ``z`` draws back up by the expected batch denominator before the
+        correlated solve.
+        """
         if optimizer.loss_reduction == "sum":
             return self.z_std
 
@@ -327,6 +354,14 @@ class CorrelatedNoiseMechanism(NoiseMechanism):
     def _flatten_generated_z(
         self, optimizer: "DPOptimizer", std: float
     ) -> tuple[List[tuple[torch.Tensor, torch.Size, int]], torch.Tensor]:
+        """
+        Draw iid Gaussian ``z`` for every parameter and flatten it once.
+
+        The solve is performed over one concatenated vector so that the same
+        Toeplitz recurrence is applied across the whole model update. The
+        returned ``specs`` carry the information needed to reshape the solved
+        correlated noise back onto individual parameter tensors.
+        """
         specs: List[tuple[torch.Tensor, torch.Size, int]] = []
         chunks: List[torch.Tensor] = []
 
@@ -351,6 +386,13 @@ class CorrelatedNoiseMechanism(NoiseMechanism):
     def _flatten_summed_grads(
         self, specs: List[tuple[torch.Tensor, torch.Size, int]]
     ) -> torch.Tensor:
+        """
+        Flatten the already-clipped aggregated gradients into one vector.
+
+        ``p.summed_grad`` is produced by the standard DPOptimizer clipping path.
+        This helper just packages that clipped signal into the same layout used
+        by the correlated-noise solve.
+        """
         chunks: List[torch.Tensor] = []
         for p, _, _ in specs:
             assert p.summed_grad is not None
@@ -362,6 +404,33 @@ class CorrelatedNoiseMechanism(NoiseMechanism):
         return torch.cat(chunks, dim=0)
 
     def _solve_correlated_noise(self, z_flat: torch.Tensor) -> torch.Tensor:
+        """
+        Solve ``C u = z`` online for the current step's correlated noise.
+
+        ``self.coeffs`` defines the first column of a lower-triangular Toeplitz
+        matrix ``C``. Because ``C`` is triangular, the new correlated-noise
+        vector ``u_t`` depends only on the current iid Gaussian draw ``z_t`` and
+        the previously solved vectors ``u_{t-1}, u_{t-2}, ...`` stored in
+        ``self._history``.
+
+        Here each ``u_t`` and ``z_t`` is the flattened model-sized vector for
+        one optimizer step. ``C`` acts on the time axis, not within model
+        coordinates. Every coordinate of the flattened update obeys the same
+        Toeplitz recurrence.
+
+        Concretely, for
+
+        ``c_0 u_t + c_1 u_{t-1} + ... + c_b u_{t-b} = z_t``,
+
+        we rearrange to
+
+        ``u_t = (z_t - c_1 u_{t-1} - ... - c_b u_{t-b}) / c_0``.
+
+        This is the core equivalence between the release-space formulation
+        ``y = C x + z`` and the runtime formulation ``x + u`` with correlated
+        Gaussian noise. It is a forward-substitution recurrence, not a generic
+        dense linear solve.
+        """
         self._assert_finite(
             name="z_flat",
             tensor=z_flat,
@@ -370,6 +439,7 @@ class CorrelatedNoiseMechanism(NoiseMechanism):
         rhs = z_flat
         max_lag = min(len(self._history), self.bandwidth - 1)
         for lag in range(1, max_lag + 1):
+            # Forward substitution for the newest row of the Toeplitz system.
             rhs = rhs - self.coeffs[lag] * self._history[lag - 1]
 
         u_flat = rhs / self.c0
@@ -390,6 +460,13 @@ class CorrelatedNoiseMechanism(NoiseMechanism):
         summed_flat: torch.Tensor,
         u_flat: torch.Tensor,
     ) -> None:
+        """
+        Reshape the solved correlated noise and add it to clipped gradients.
+
+        After this step, ``p.grad`` contains the optimizer-facing noised update
+        for the current iteration. No extra clipping is performed here; the data
+        were already clipped upstream into ``p.summed_grad``.
+        """
         offset = 0
 
         for p, shape, numel in specs:
@@ -403,6 +480,19 @@ class CorrelatedNoiseMechanism(NoiseMechanism):
             offset = next_offset
 
     def add_noise(self, optimizer: "DPOptimizer") -> None:
+        """
+        Add correlated Gaussian noise to the clipped aggregated gradients.
+
+        Pipeline:
+
+        1. start from ``p.summed_grad`` produced by per-sample clipping;
+        2. draw iid Gaussian ``z`` at public scale ``z_std``;
+        3. solve ``C u = z`` to obtain correlated noise ``u``;
+        4. write ``p.grad = p.summed_grad + u``.
+
+        This is the runtime form of the matrix-mechanism release
+        ``y = C x + z`` applied to the vector of clipped step aggregates.
+        """
         std = self._pre_scale_noise_std(optimizer)
         specs, z_flat = self._flatten_generated_z(optimizer, std=std)
 

@@ -29,9 +29,10 @@ import math
 from typing import Iterable
 
 import numpy as np
-from scipy import optimize
+import torch
 
 from opacus.accountants.analysis.bisr import (
+    derive_bisr_factor_coeffs_from_inverse_coeffs,
     generate_bisr_coeffs_from_sgd_workload,
 )
 from opacus.accountants.analysis.bsr import compute_bsr_mf_sensitivity_from_coeffs
@@ -126,6 +127,26 @@ def derive_bandinvmf_runtime_coeffs_from_inv_coeffs(
     return [float(x) for x in _toeplitz_inverse_coeffs(coeff_array)]
 
 
+def derive_bandinvmf_factor_coeffs_from_inv_coeffs(
+    *,
+    inv_coeffs: Iterable[float],
+    steps: int,
+) -> list[float]:
+    """
+    Derive finite-horizon factor-side Toeplitz coefficients from BandInvMF inverse coefficients.
+
+    BandInvMF exposes inverse-band coefficients of the paper-facing lower
+    triangular Toeplitz object ``C^{-1}``, while the fixed-batch paper
+    sensitivity is written in terms of the factor-side object ``C``. This
+    helper keeps the BandInvMF namespace explicit while reusing the same
+    finite-horizon inverse-to-factor derivation pattern as BISR.
+    """
+    return derive_bisr_factor_coeffs_from_inverse_coeffs(
+        coeffs=inv_coeffs,
+        steps=steps,
+    )
+
+
 def derive_bandinvmf_inv_coeffs_from_runtime_coeffs(
     *,
     coeffs: Iterable[float],
@@ -146,6 +167,64 @@ def derive_bandinvmf_inv_coeffs_from_runtime_coeffs(
         raise ValueError("coeffs[0] must be > 0")
 
     return [float(x) for x in _toeplitz_inverse_coeffs(coeff_array)]
+
+
+def compute_bandinvmf_fixed_batch_sensitivity_from_inv_coeffs(
+    *,
+    inv_coeffs: Iterable[float],
+    steps: int,
+    max_participations: int,
+    min_separation: int,
+) -> float:
+    """
+    Evaluate the fixed-batch BandInvMF paper sensitivity from inverse-band coefficients.
+
+    BandInvMF optimization and runtime state are expressed using inverse-band
+    coefficients, but the paper-facing non-amplified calibration uses
+    ``sens_{k,b}(C)`` on the implied factor-side object ``C``. This helper
+    derives the finite-horizon factor-side coefficients and evaluates the
+    fixed-batch separated-participation sensitivity on that factor-side view.
+    """
+    factor_coeffs = derive_bandinvmf_factor_coeffs_from_inv_coeffs(
+        inv_coeffs=inv_coeffs,
+        steps=steps,
+    )
+    return float(
+        compute_bsr_mf_sensitivity_from_coeffs(
+            coeffs=factor_coeffs,
+            steps=steps,
+            max_participations=max_participations,
+            min_separation=min_separation,
+        )
+    )
+
+
+def derive_bandinvmf_amplified_accountant_coeffs_from_inv_coeffs(
+    *,
+    inv_coeffs: Iterable[float],
+    steps: int,
+) -> list[float]:
+    """
+    Derive a non-negative accountant-side first column for amplified BandInvMF.
+
+    Runtime BandInvMF is parameterized by inverse-band coefficients and executed
+    via the finite Toeplitz noising operator, but the amplified balls-in-bins
+    accountant consumes a non-negative first column ``c_col`` over the full
+    finite horizon. We therefore derive the factor-side finite-horizon
+    coefficients for ``C`` and return the first column of ``|C|``.
+    """
+    factor_coeffs = derive_bandinvmf_factor_coeffs_from_inv_coeffs(
+        inv_coeffs=inv_coeffs,
+        steps=steps,
+    )
+    accountant_coeffs = [abs(float(c)) for c in factor_coeffs]
+    if not all(math.isfinite(c) for c in accountant_coeffs):
+        raise ValueError("derived amplified BandInvMF accountant coefficients must be finite")
+
+    if accountant_coeffs[0] <= 0.0:
+        raise ValueError("derived amplified BandInvMF accountant coefficients must be positive")
+
+    return accountant_coeffs
 
 
 def _toeplitz_per_query_error_from_noising_coeffs(
@@ -282,7 +361,7 @@ def optimize_bandinvmf_inv_coeffs_for_sgd_workload(
     - initialize from analytic BISR,
     - keep the main diagonal coefficient fixed to 1,
     - optimize the remaining inverse-band coefficients for at most
-      `optimizer_steps` Powell iterations.
+      `optimizer_steps` L-BFGS iterations.
     """
     alpha = 1.0 if float(weight_decay) == 0.0 else float(weight_decay)
     beta = float(momentum)
@@ -308,11 +387,96 @@ def optimize_bandinvmf_inv_coeffs_for_sgd_workload(
         return [1.0]
 
     x0 = init[1:].copy()
+    init_obj = compute_bandinvmf_objective_from_inv_coeffs(
+        inv_coeffs=init.tolist(),
+        steps=steps,
+        max_participations=max_participations,
+        min_separation=min_separation,
+        momentum=beta,
+        weight_decay=alpha,
+    )
 
-    def loss(x: np.ndarray) -> float:
-        inv = np.concatenate(([1.0], np.asarray(x, dtype=np.float64)))
-        return compute_bandinvmf_objective_from_inv_coeffs(
-            inv_coeffs=inv.tolist(),
+    dtype = torch.float64
+    params = torch.nn.Parameter(torch.tensor(x0, dtype=dtype))
+    optimizer = torch.optim.LBFGS(
+        [params],
+        max_iter=int(optimizer_steps),
+        line_search_fn="strong_wolfe",
+    )
+    workload = torch.tensor(
+        _workload_coeffs(steps=steps, momentum=beta, weight_decay=alpha),
+        dtype=dtype,
+    )
+    k_eff = min(max_participations, (steps - 1) // min_separation + 1)
+
+    def _loss(v: torch.Tensor) -> torch.Tensor:
+        inv = torch.cat(
+            (
+                torch.ones(1, dtype=v.dtype, device=v.device),
+                v,
+            )
+        )
+
+        b_vals: list[torch.Tensor] = []
+        for t in range(int(steps)):
+            acc = torch.zeros((), dtype=v.dtype, device=v.device)
+            max_lag = min(t, inv.numel() - 1)
+            for lag in range(max_lag + 1):
+                acc = acc + inv[lag] * workload[t - lag]
+            b_vals.append(acc)
+
+        b_vec = torch.stack(b_vals)
+        mean_error = torch.cumsum(b_vec * b_vec, dim=0).mean()
+
+        strategy_vals: list[torch.Tensor] = [
+            torch.ones((), dtype=v.dtype, device=v.device)
+        ]
+        for i in range(1, int(steps)):
+            acc = torch.zeros((), dtype=v.dtype, device=v.device)
+            max_lag = min(i, inv.numel() - 1)
+            for lag in range(1, max_lag + 1):
+                acc = acc + inv[lag] * strategy_vals[i - lag]
+            strategy_vals.append(-acc / inv[0])
+
+        strategy = torch.stack(strategy_vals)
+        strategy_nonnegative = torch.relu(strategy)
+        strategy_envelope = torch.flip(
+            torch.cummax(torch.flip(strategy_nonnegative, dims=[0]), dim=0).values,
+            dims=[0],
+        )
+
+        total_sq = torch.zeros((), dtype=v.dtype, device=v.device)
+        for i in range(int(steps)):
+            j_max = min(k_eff - 1, i // min_separation)
+            row_sum = torch.zeros((), dtype=v.dtype, device=v.device)
+            for j in range(j_max + 1):
+                row_sum = row_sum + strategy_envelope[i - j * min_separation]
+
+            total_sq = total_sq + row_sum * row_sum
+
+        loss = mean_error * total_sq
+        if not torch.isfinite(loss):
+            return torch.tensor(1e100, dtype=v.dtype, device=v.device) + (
+                torch.sum(v * v) * 0.0
+            )
+
+        return loss
+
+    def closure() -> torch.Tensor:
+        optimizer.zero_grad(set_to_none=True)
+        loss = _loss(params)
+        loss.backward()
+        return loss
+
+    optimizer.step(closure)
+
+    with torch.no_grad():
+        opt = np.concatenate(
+            ([1.0], np.asarray(params.detach().cpu().numpy(), dtype=np.float64))
+        )
+    try:
+        opt_obj = compute_bandinvmf_objective_from_inv_coeffs(
+            inv_coeffs=opt.tolist(),
             steps=steps,
             max_participations=max_participations,
             min_separation=min_separation,
@@ -320,12 +484,18 @@ def optimize_bandinvmf_inv_coeffs_for_sgd_workload(
             weight_decay=alpha,
         )
 
-    result = optimize.minimize(
-        loss,
-        x0=x0,
-        method="Powell",
-        options={"maxiter": int(optimizer_steps), "disp": False},
-    )
-    opt = np.concatenate(([1.0], np.asarray(result.x, dtype=np.float64)))
+    except (FloatingPointError, OverflowError, ValueError):
+        opt_obj = math.inf
+
+    if not np.all(np.isfinite(opt)) or not math.isfinite(opt_obj):
+        raise RuntimeError(
+            "BandInvMF optimization produced a non-finite final candidate; "
+            "refusing to silently fall back to initialization"
+        )
+    if opt_obj >= init_obj - 1e-12:
+        raise RuntimeError(
+            "BandInvMF optimization did not improve over initialization; "
+            "refusing to silently fall back to initialization"
+        )
 
     return [float(x) for x in opt]
