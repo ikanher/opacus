@@ -140,7 +140,7 @@ def test_checkpoint_load_preserves_bnb_report_and_sampling_metadata() -> None:
     checkpoint_dict: dict = {}
     with io.BytesIO() as bio:
         pe.noise_mechanism_config = NoiseMechanismConfig(
-            mechanism="bnb",
+            mechanism="gaussian",
             accounting_mode="bnb_accountant",
             mechanism_state={
                 "coeffs": [1.0],

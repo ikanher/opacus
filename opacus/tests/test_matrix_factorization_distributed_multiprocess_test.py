@@ -289,11 +289,9 @@ def _worker_resume_parity_bnb(
                 sampling_mode="b_min_sep",
                 privacy_metadata={"bands": 2},
             ),
-            
             noise_mechanism_config=NoiseMechanismConfig(
-                mechanism="bnb",
+                mechanism="gaussian",
                 accounting_mode="bnb_accountant",
-                mechanism_state={"coeffs": [1.1, 0.3, -0.2], "z_std": 0.03, "bands": 2},
             ),
         )
 
@@ -381,11 +379,9 @@ def _worker_one_step_bnb_smoke(
                 sampling_mode="b_min_sep",
                 privacy_metadata={"bands": 2},
             ),
-            
             noise_mechanism_config=NoiseMechanismConfig(
-                mechanism="bnb",
+                mechanism="gaussian",
                 accounting_mode="bnb_accountant",
-                mechanism_state={"coeffs": [1.0, 0.25], "z_std": 0.05, "bands": 2},
             ),
         )
 

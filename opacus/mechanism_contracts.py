@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Literal, Mapping, Protocol
 
 
-NoiseMechanismName = Literal["gaussian", "bandmf", "bsr", "bisr", "bnb", "bandinvmf"]
+NoiseMechanismName = Literal["gaussian", "bandmf", "bsr", "bisr", "bandinvmf"]
 AccountingModeName = Literal[
     "standard_step_accountant",
     "bandmf_accountant",
@@ -115,9 +115,9 @@ class NoiseMechanismConfig:
 
     def __post_init__(self) -> None:
         mechanism = self.mechanism
-        if mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bnb", "bandinvmf"):
+        if mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bandinvmf"):
             raise ValueError(
-                "mechanism must be one of {'gaussian', 'bandmf', 'bsr', 'bisr', 'bnb', 'bandinvmf'}"
+                "mechanism must be one of {'gaussian', 'bandmf', 'bsr', 'bisr', 'bandinvmf'}"
             )
 
         if self.accounting_mode not in (
@@ -164,14 +164,5 @@ class NoiseMechanismConfig:
         ):
             raise ValueError(
                 "bandinvmf mechanism requires bsr_accountant or bnb_accountant "
-                "for authoritative accounting"
-            )
-
-        if (
-            mechanism == "bnb"
-            and self.accounting_mode != "bnb_accountant"
-        ):
-            raise ValueError(
-                "bnb mechanism requires bnb_accountant "
                 "for authoritative accounting"
             )

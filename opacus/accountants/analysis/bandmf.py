@@ -112,6 +112,24 @@ def materialize_column_normalized_banded_bandmf_matrix(
     return normalized
 
 
+def derive_bandmf_amplified_accountant_coeffs_from_runtime_coeffs(
+    *,
+    coeffs: Iterable[float],
+) -> list[float]:
+    """
+    Derive the current amplified BandMF accountant-side first column.
+
+    The current Opacus balls-in-bins ownership model for BandMF uses the
+    runtime Toeplitz first column directly as the accountant-side `c_col`.
+    This is an ownership/provenance helper, not a paper-parity claim.
+    """
+    coeff_array = _as_float_array(coeffs, name="coeffs")
+    if float(coeff_array[0]) <= 0.0:
+        raise ValueError("coeffs[0] must be > 0")
+
+    return [float(x) for x in coeff_array]
+
+
 def compute_bandmf_max_column_norm_from_column_normalized_matrix(
     *,
     matrix: np.ndarray,

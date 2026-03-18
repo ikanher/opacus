@@ -107,7 +107,7 @@ def test_bsr_dp_training_smoke_loop() -> None:
     assert eps > 0.0
 
 
-def _run_bnb_training_smoke(*, sampling_semantics: SamplingSemantics) -> None:
+def _run_bnb_accountant_training_smoke(*, sampling_semantics: SamplingSemantics) -> None:
     model = nn.Sequential(
         nn.Linear(4, 16),
         nn.ReLU(),
@@ -131,12 +131,8 @@ def _run_bnb_training_smoke(*, sampling_semantics: SamplingSemantics) -> None:
         poisson_sampling=False,
         noise_generator=torch.Generator().manual_seed(17),
         noise_mechanism_config=NoiseMechanismConfig(
-            mechanism="bnb",
+            mechanism="gaussian",
             accounting_mode="bnb_accountant",
-            mechanism_state={
-                "coeffs": [1.0, 0.2],
-                "z_std": noise_multiplier * max_grad_norm / float(batch_size),
-            },
         ),
         sampling_semantics=sampling_semantics,
     )
@@ -313,9 +309,9 @@ def _run_balls_in_bins_mf_training_smoke_autocoeff(*, mechanism: str, bands: int
     assert eps > 0.0
 
 
-def test_bnb_b_min_sep_training_smoke_loop() -> None:
+def test_bnb_accountant_b_min_sep_training_smoke_loop() -> None:
     with pytest.raises(ValueError, match="b_min_sep sampling is temporarily disabled"):
-        _run_bnb_training_smoke(
+        _run_bnb_accountant_training_smoke(
             sampling_semantics=SamplingSemantics(
                 sampling_mode="b_min_sep",
                 privacy_metadata={"b": 2, "p": 0.2},
@@ -323,9 +319,9 @@ def test_bnb_b_min_sep_training_smoke_loop() -> None:
         )
 
 
-def test_bnb_b_min_sep_training_smoke_loop_alt() -> None:
+def test_bnb_accountant_b_min_sep_training_smoke_loop_alt() -> None:
     with pytest.raises(ValueError, match="b_min_sep sampling is temporarily disabled"):
-        _run_bnb_training_smoke(
+        _run_bnb_accountant_training_smoke(
             sampling_semantics=SamplingSemantics(
                 sampling_mode="b_min_sep",
                 privacy_metadata={"b": 3, "p": 0.25},
@@ -375,7 +371,7 @@ def test_bandmf_cyclic_poisson_training_smoke_loop() -> None:
 
 
 def test_bnb_balls_in_bins_training_smoke_loop() -> None:
-    _run_bnb_training_smoke(
+    _run_bnb_accountant_training_smoke(
         sampling_semantics=SamplingSemantics(
             sampling_mode="balls_in_bins",
             privacy_metadata={"bins": 4},
@@ -419,25 +415,12 @@ def test_target_epsilon_sampler_paths_smoke() -> None:
             {"coeffs": [1.0, 0.2]},
         ),
         (
-            "bnb",
+            "gaussian",
             SamplingSemantics(
                 sampling_mode="balls_in_bins",
-                privacy_metadata={"bins": 4, "bands": 2},
+                privacy_metadata={"bins": 4},
             ),
-            {
-                "coeffs": [1.0, 0.2],
-                "bands": 2,
-                "c_matrix": build_bnb_toeplitz_c_matrix_and_contract(
-                    coeffs=[1.0, 0.2],
-                    bands=2,
-                    horizon=8,
-                )[0],
-                "c_matrix_contract": build_bnb_toeplitz_c_matrix_and_contract(
-                    coeffs=[1.0, 0.2],
-                    bands=2,
-                    horizon=8,
-                )[1],
-            },
+            {},
         ),
     ]
 
@@ -456,12 +439,16 @@ def test_target_epsilon_sampler_paths_smoke() -> None:
             epochs=1,
             max_grad_norm=1.0,
             poisson_sampling=False,
-            noise_generator=torch.Generator().manual_seed(31),
-            noise_mechanism_config=NoiseMechanismConfig(
-                mechanism=mechanism,
-                accounting_mode=f"{mechanism}_accountant",
-                mechanism_state=state,
-            ),
+                noise_generator=torch.Generator().manual_seed(31),
+                noise_mechanism_config=NoiseMechanismConfig(
+                    mechanism=mechanism,
+                    accounting_mode=(
+                        "bnb_accountant"
+                        if mechanism == "gaussian"
+                        else f"{mechanism}_accountant"
+                    ),
+                    mechanism_state=state,
+                ),
             sampling_semantics=semantics,
             bnb_require_evr_pass=False,
         )

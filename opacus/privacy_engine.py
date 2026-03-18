@@ -54,11 +54,15 @@ from opacus.accountants.analysis.bsr import (
     generate_bsr_coeffs_from_sgd_workload,
 )
 from opacus.accountants.analysis.bandmf import (
+    derive_bandmf_amplified_accountant_coeffs_from_runtime_coeffs,
     generate_bandmf_coeffs_from_sgd_workload,
 )
 from opacus.accountants.analysis.bisr import (
     derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs,
     generate_bisr_coeffs_from_sgd_workload,
+)
+from opacus.accountants.analysis.bandinvmf import (
+    derive_bandinvmf_amplified_accountant_coeffs_from_inv_coeffs,
 )
 from opacus.accountants.analysis.bnb import (
     BNBCalibrationStatus,
@@ -148,12 +152,12 @@ class PrivacyEngine:
         Ensure balls-in-bins BNB MF runs have analytical coeffs and Toeplitz state.
 
         This fills the gap between fixed/cyclic MF auto-coeff generation and the
-        BNB accountant path: amplified `bsr`/`bisr` runs may provide only
+        BNB accountant path: amplified MF runs may provide only
         `bsr_bands`, in which case we derive coefficients from the optimizer
         workload metadata and materialize the BNB Toeplitz contract before the
         accountant validates runtime inputs.
         """
-        if mechanism_config.mechanism not in ("bsr", "bisr"):
+        if mechanism_config.mechanism not in ("bsr", "bisr", "bandmf", "bandinvmf"):
             return mechanism_config
         if mechanism_config.accounting_mode != "bnb_accountant":
             return mechanism_config
@@ -235,15 +239,12 @@ class PrivacyEngine:
         state["bnb_cycle_length"] = bins
 
         accountant_coeffs = None
+        horizon = state.get("bnb_horizon", kwargs.get("total_steps", kwargs.get("steps", bins)))
         if mechanism_config.mechanism == "bsr":
             accountant_coeffs = list(state["coeffs"])
             state["bnb_accountant_coeffs"] = list(accountant_coeffs)
             state["bnb_accountant_coeffs_source"] = "raw_c_col"
         elif mechanism_config.mechanism == "bisr":
-            horizon = state.get(
-                "bnb_horizon",
-                kwargs.get("total_steps", kwargs.get("steps", bins)),
-            )
             accountant_coeffs = (
                 derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs(
                     coeffs=list(state["coeffs"]),
@@ -252,16 +253,21 @@ class PrivacyEngine:
             )
             state["bnb_accountant_coeffs"] = list(accountant_coeffs)
             state["bnb_accountant_coeffs_source"] = "abs_factor_c_col"
-
-        if (
-            mechanism_config.mechanism in ("bsr", "bisr")
-            or (
-                state.get("bnb_c_matrix") is None
-                and isinstance(state.get("coeffs"), (list, tuple))
-                and len(state.get("coeffs")) > 0
+        elif mechanism_config.mechanism == "bandmf":
+            accountant_coeffs = derive_bandmf_amplified_accountant_coeffs_from_runtime_coeffs(
+                coeffs=list(state["coeffs"]),
             )
-        ):
-            horizon = state.get("bnb_horizon", kwargs.get("total_steps", kwargs.get("steps", bins)))
+            state["bnb_accountant_coeffs"] = list(accountant_coeffs)
+            state["bnb_accountant_coeffs_source"] = "runtime_c_col"
+        elif mechanism_config.mechanism == "bandinvmf":
+            accountant_coeffs = derive_bandinvmf_amplified_accountant_coeffs_from_inv_coeffs(
+                inv_coeffs=list(state["bandinvmf_inv_coeffs"]),
+                steps=int(horizon),
+            )
+            state["bnb_accountant_coeffs"] = list(accountant_coeffs)
+            state["bnb_accountant_coeffs_source"] = "abs_factor_c_col"
+
+        if mechanism_config.mechanism in ("bsr", "bisr", "bandmf", "bandinvmf"):
             c_matrix, c_matrix_contract = build_bnb_toeplitz_c_matrix_and_contract(
                 coeffs=list(accountant_coeffs if accountant_coeffs is not None else state["coeffs"]),
                 bands=int(bands),
@@ -439,7 +445,7 @@ class PrivacyEngine:
     def _accountant_for_mechanism(*, mechanism_config: NoiseMechanismConfig, default_accountant):
         if mechanism_config.accounting_mode == "bnb_accountant":
             return create_accountant(mechanism="bnb")
-        if mechanism_config.mechanism in ("bandmf", "bsr", "bnb"):
+        if mechanism_config.mechanism in ("bandmf", "bsr"):
             return create_accountant(mechanism=mechanism_config.mechanism)
         if mechanism_config.mechanism in ("bisr", "bandinvmf"):
             return create_accountant(mechanism="bsr")
@@ -906,18 +912,6 @@ class PrivacyEngine:
                         "{'torch_sampler', 'cyclic_poisson'} only"
                     )
 
-        if mechanism == "bnb" and poisson_sampling:
-            raise ValueError(
-                "bnb mechanism requires explicit non-Poisson sampling semantics; "
-                "set poisson_sampling=False and provide sampling_semantics"
-            )
-
-        if mechanism == "bnb" and sampling_semantics is None:
-            raise ValueError(
-                "bnb mechanism requires explicit sampling_semantics "
-                "in {'b_min_sep', 'balls_in_bins'}"
-            )
-
         self._validate_bnb_sampling_policy(
             sampling_semantics=sampling_semantics,
             mechanism=mechanism,
@@ -935,10 +929,10 @@ class PrivacyEngine:
         if (
             sampling_semantics is not None
             and sampling_semantics.sampling_mode == "balls_in_bins"
-            and mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bnb", "bandinvmf")
+            and mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bandinvmf")
         ):
             raise ValueError(
-                "balls_in_bins sampling is supported only for mechanism in {'gaussian', 'bandmf', 'bsr', 'bisr', 'bnb', 'bandinvmf'}"
+                "balls_in_bins sampling is supported only for mechanism in {'gaussian', 'bandmf', 'bsr', 'bisr', 'bandinvmf'}"
             )
 
         if (
@@ -1566,7 +1560,7 @@ class PrivacyEngine:
         kwargs: Dict[str, Any],
         distributed_dp_runtime: bool,
     ) -> Optional[Dict[str, Any]]:
-        if mechanism not in ("bandmf", "bsr", "bisr", "bnb", "bandinvmf"):
+        if mechanism not in ("bandmf", "bsr", "bisr", "bandinvmf"):
             return None
 
         calibration_cfg = resolve_bnb_calibration_kwargs(
@@ -1604,7 +1598,7 @@ class PrivacyEngine:
         bnb_calibration_report: Optional[Dict[str, Any]],
         bnb_accounting_kwargs: Optional[Dict[str, Any]] = None,
     ) -> NoiseMechanismConfig:
-        if mechanism_config.mechanism not in ("bandmf", "bsr", "bisr", "bnb", "bandinvmf"):
+        if mechanism_config.mechanism not in ("bandmf", "bsr", "bisr", "bandinvmf"):
             return mechanism_config
 
         if isinstance(max_grad_norm, list):
@@ -1973,7 +1967,7 @@ class PrivacyEngine:
 
         requested_noise_mechanism = kwargs.get("noise_mechanism")
         if distributed and (
-            mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bnb", "bandinvmf")
+            mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf")
             or isinstance(requested_noise_mechanism, CorrelatedNoiseMechanism)
         ):
             self._validate_distributed_correlated_support(
@@ -2036,18 +2030,18 @@ class PrivacyEngine:
             sampling_semantics=sampling_semantics,
             kwargs=coeff_resolution_kwargs,
         )
-        mechanism_config = self._ensure_bnb_balls_in_bins_mf_state(
-            mechanism_config=mechanism_config,
-            optimizer=optimizer,
-            sampling_semantics=sampling_semantics,
-            kwargs=coeff_resolution_kwargs,
-        )
         mechanism_config = ensure_bandinvmf_runtime_state_helper(
             mechanism_config=mechanism_config,
             optimizer=optimizer,
             sampling_semantics=sampling_semantics,
             steps_hint=int(total_steps) if total_steps is not None else int(len(data_loader)),
             sample_rate_hint=float(sample_rate),
+            kwargs=coeff_resolution_kwargs,
+        )
+        mechanism_config = self._ensure_bnb_balls_in_bins_mf_state(
+            mechanism_config=mechanism_config,
+            optimizer=optimizer,
+            sampling_semantics=sampling_semantics,
             kwargs=coeff_resolution_kwargs,
         )
         if (
@@ -2281,12 +2275,6 @@ class PrivacyEngine:
             sampling_semantics=local_sampling_semantics,
             kwargs=coeff_resolution_kwargs,
         )
-        mechanism_config = self._ensure_bnb_balls_in_bins_mf_state(
-            mechanism_config=mechanism_config,
-            optimizer=optimizer,
-            sampling_semantics=local_sampling_semantics,
-            kwargs=coeff_resolution_kwargs,
-        )
         sample_rate_hint = (
             self._resolve_total_steps_sample_rate(
                 poisson_sampling=poisson_sampling,
@@ -2310,6 +2298,12 @@ class PrivacyEngine:
             sample_rate_hint=float(sample_rate_hint),
             kwargs=coeff_resolution_kwargs,
         )
+        mechanism_config = self._ensure_bnb_balls_in_bins_mf_state(
+            mechanism_config=mechanism_config,
+            optimizer=optimizer,
+            sampling_semantics=local_sampling_semantics,
+            kwargs=coeff_resolution_kwargs,
+        )
 
         is_dpddp = isinstance(module, DPDDP)
         is_ddp = isinstance(module, DDP)
@@ -2317,7 +2311,7 @@ class PrivacyEngine:
         distributed = is_dpddp or is_ddp or is_fsdp
 
         correlated_denominator = None
-        if mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bnb", "bandinvmf"):
+        if mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf"):
             _, calibration_expected_batch_size = self._resolve_sample_rate_and_expected_batch_size(
                 poisson_sampling=poisson_sampling,
                 sampling_semantics=local_sampling_semantics,
@@ -2648,10 +2642,6 @@ class PrivacyEngine:
                 payload["mechanism_state_summary"] = self._summarize_bsr_state(
                     mechanism_state
                 )
-            elif mechanism_config.mechanism == "bnb":
-                payload["bnb_calibration_report"] = mechanism_state.get(
-                    "_bnb_calibration_report"
-                )
 
         if delta is not None and accountant is not None:
             payload["target_delta"] = float(delta)
@@ -2790,11 +2780,7 @@ class PrivacyEngine:
         if isinstance(mechanism_cfg_payload, dict):
             mechanism_state = copy.deepcopy(mechanism_cfg_payload.get("mechanism_state", {}))
 
-            if (
-                mechanism_cfg_payload.get("mechanism") == "bnb"
-                and isinstance(mechanism_state, dict)
-                and "_bnb_calibration_report" in mechanism_state
-            ):
+            if isinstance(mechanism_state, dict) and "_bnb_calibration_report" in mechanism_state:
                 parsed = parse_bnb_calibration_report(
                     mechanism_state["_bnb_calibration_report"]
                 )

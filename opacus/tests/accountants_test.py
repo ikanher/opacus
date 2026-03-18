@@ -22,7 +22,7 @@ from unittest.mock import patch
 import hypothesis.strategies as st
 import torch
 from hypothesis import given, settings
-from opacus import SamplingSemantics
+from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
 from opacus.accountants import (
     BandMFAccountant,
     BNBAccountant,
@@ -44,6 +44,9 @@ from opacus.accountants.analysis.bsr import (
 from opacus.accountants.analysis.bandmf import (
     compute_bandmf_mf_sensitivity_from_coeffs,
 )
+from opacus.accountants.analysis.bandinvmf import (
+    derive_bandinvmf_amplified_accountant_coeffs_from_inv_coeffs,
+)
 from opacus.accountants.analysis.bisr import (
     derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs,
     generate_bisr_coeffs_from_sgd_workload,
@@ -53,6 +56,8 @@ from opacus.accountants.analysis.bnb import (
     normalize_bnb_accountant_coeffs,
 )
 from opacus.accountants.utils import get_noise_multiplier
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
 
 
 def _materialize_lower_triangular_from_coeffs(coeffs: list[float], n: int) -> list[list[float]]:
@@ -111,6 +116,54 @@ def _lower_toeplitz_from_coeffs(coeffs: list[float], horizon: int) -> torch.Tens
         for lag in range(max_lag + 1):
             c[i, i - lag] = float(coeffs[lag])
     return c
+
+
+def _tiny_loader(
+    *, n_samples: int = 32, in_dim: int = 4, n_classes: int = 3, batch_size: int = 8
+) -> DataLoader:
+    gen = torch.Generator().manual_seed(20260318)
+    x = torch.randn(n_samples, in_dim, generator=gen)
+    y = torch.randint(0, n_classes, size=(n_samples,), generator=gen)
+    return DataLoader(
+        TensorDataset(x, y),
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=True,
+    )
+
+
+def _resolve_bnb_state_via_make_private(
+    *,
+    mechanism: str,
+    mechanism_state: dict,
+    total_steps: int = 16,
+) -> dict:
+    pe = PrivacyEngine()
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(
+        model.parameters(), lr=0.05, momentum=0.9, weight_decay=0.01
+    )
+    pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_tiny_loader(),
+        noise_multiplier=1.0,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping="flat",
+        grad_sample_mode="hooks",
+        total_steps=total_steps,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism=mechanism,
+            accounting_mode="bnb_accountant",
+            mechanism_state=mechanism_state,
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 4, "bands": 2},
+        ),
+    )
+    return pe.noise_mechanism_config.mechanism_state
 
 
 class AccountantRegistryTest(unittest.TestCase):
@@ -1185,6 +1238,63 @@ class AccountingTest(unittest.TestCase):
         )
 
         self.assertGreater(noise_multiplier, 0.0)
+
+    def test_bandmf_balls_in_bins_make_private_resolves_state_from_explicit_coeffs(self) -> None:
+        state = _resolve_bnb_state_via_make_private(
+            mechanism="bandmf",
+            mechanism_state={"coeffs": [1.0, 0.2], "bsr_bands": 2},
+        )
+
+        self.assertEqual(state["bnb_accountant_coeffs_source"], "runtime_c_col")
+        self.assertTrue(len(state["bnb_accountant_coeffs"]) > 0)
+        self.assertIn("bnb_c_matrix", state)
+        self.assertIn("bnb_c_matrix_contract", state)
+
+    def test_bandmf_balls_in_bins_make_private_resolves_state_from_auto_coeffs(self) -> None:
+        state = _resolve_bnb_state_via_make_private(
+            mechanism="bandmf",
+            mechanism_state={"bsr_bands": 2},
+        )
+
+        self.assertEqual(state["coeff_source"], "analytical_auto")
+        self.assertEqual(state["bnb_accountant_coeffs_source"], "runtime_c_col")
+        self.assertTrue(len(state["bnb_accountant_coeffs"]) > 0)
+        self.assertIn("bnb_c_matrix", state)
+        self.assertIn("bnb_c_matrix_contract", state)
+
+    def test_bandinvmf_balls_in_bins_make_private_resolves_state_from_explicit_inv_coeffs(self) -> None:
+        state = _resolve_bnb_state_via_make_private(
+            mechanism="bandinvmf",
+            mechanism_state={"bandinvmf_inv_coeffs": [1.0, -0.1], "bsr_bands": 2},
+        )
+
+        self.assertEqual(state["bnb_accountant_coeffs_source"], "abs_factor_c_col")
+        self.assertEqual(
+            state["bnb_accountant_coeffs"],
+            derive_bandinvmf_amplified_accountant_coeffs_from_inv_coeffs(
+                inv_coeffs=state["bandinvmf_inv_coeffs"],
+                steps=16,
+            ),
+        )
+        self.assertIn("bnb_c_matrix", state)
+        self.assertIn("bnb_c_matrix_contract", state)
+
+    def test_bandinvmf_balls_in_bins_make_private_resolves_state_from_auto_coeffs(self) -> None:
+        state = _resolve_bnb_state_via_make_private(
+            mechanism="bandinvmf",
+            mechanism_state={
+                "bsr_bands": 2,
+                "bsr_max_participations": 2,
+                "bsr_min_separation": 4,
+                "bsr_iterations_number": 2,
+            },
+        )
+
+        self.assertEqual(state["coeff_source"], "optimized_auto")
+        self.assertEqual(state["bnb_accountant_coeffs_source"], "abs_factor_c_col")
+        self.assertTrue(len(state["bnb_accountant_coeffs"]) > 0)
+        self.assertIn("bnb_c_matrix", state)
+        self.assertIn("bnb_c_matrix_contract", state)
 
     def test_get_noise_multiplier_bsr_balls_in_bins_separates_cycle_length_from_matrix_bandwidth(self) -> None:
         delta = 0.2

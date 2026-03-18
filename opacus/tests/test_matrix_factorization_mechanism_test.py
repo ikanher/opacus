@@ -432,9 +432,8 @@ def test_distributed_bnb_rejects_b_min_sep_sampling(monkeypatch) -> None:
                 privacy_metadata={"b": 2, "p": 0.25},
             ),
             noise_mechanism_config=NoiseMechanismConfig(
-                mechanism="bnb",
+                mechanism="gaussian",
                 accounting_mode="bnb_accountant",
-                mechanism_state={"coeffs": [1.0, 0.3], "z_std": 0.01, "bands": 2},
             ),
         )
 
@@ -462,9 +461,8 @@ def test_distributed_bnb_rejects_b_min_sep_sampling_alt(monkeypatch) -> None:
                 privacy_metadata={"b": 2, "p": 0.25},
             ),
             noise_mechanism_config=NoiseMechanismConfig(
-                mechanism="bnb",
+                mechanism="gaussian",
                 accounting_mode="bnb_accountant",
-                mechanism_state={"coeffs": [1.0, 0.3], "z_std": 0.01, "bands": 2},
             ),
         )
 
