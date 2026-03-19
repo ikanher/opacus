@@ -440,7 +440,7 @@ def test_make_private_bsr_infers_fixed_batch_contract_from_total_steps() -> None
 
     state = dp_optimizer.noise_mechanism_config.mechanism_state
     assert state["bsr_iterations_number"] == 16
-    assert state["bsr_min_separation"] == len(private_loader)
+    assert state["bsr_min_separation"] == math.ceil(len(private_loader.dataset) / 8)
     assert state["bsr_max_participations"] == 2
 
 
@@ -469,8 +469,64 @@ def test_make_private_with_epsilon_bsr_infers_fixed_batch_contract_from_total_st
 
     state = dp_optimizer.noise_mechanism_config.mechanism_state
     assert state["bsr_iterations_number"] == 16
-    assert state["bsr_min_separation"] == len(private_loader)
+    assert state["bsr_min_separation"] == math.ceil(len(private_loader.dataset) / 8)
     assert state["bsr_max_participations"] == 2
+
+
+@pytest.mark.parametrize("mechanism", ["bsr", "bisr", "bandmf", "bandinvmf"])
+def test_fixed_batch_contract_helper_uses_logical_global_schedule_under_ddp_like_loader(
+    mechanism: str,
+) -> None:
+    accounting_mode = "bandmf_accountant" if mechanism == "bandmf" else "bsr_accountant"
+    resolved = PrivacyEngine._apply_default_fixed_batch_contract_for_torch_sampler(
+        mechanism_config=NoiseMechanismConfig(
+            mechanism=mechanism,
+            accounting_mode=accounting_mode,
+            mechanism_state={"coeffs": [1.0], "bsr_bands": 1},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="torch_sampler",
+            privacy_metadata={},
+        ),
+        total_steps=16,
+        dataloader_len=2,
+        dataset_size=64,
+        logical_batch_size=8,
+        kwargs={},
+    )
+
+    state = resolved.mechanism_state
+    assert state["bsr_iterations_number"] == 16
+    assert state["bsr_min_separation"] == 8
+    assert state["bsr_max_participations"] == 2
+
+
+def test_fixed_batch_contract_helper_preserves_explicit_overrides() -> None:
+    resolved = PrivacyEngine._apply_default_fixed_batch_contract_for_torch_sampler(
+        mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={
+                "coeffs": [1.0],
+                "bsr_bands": 1,
+                "bsr_min_separation": 5,
+            },
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="torch_sampler",
+            privacy_metadata={"bsr_max_participations": 7},
+        ),
+        total_steps=16,
+        dataloader_len=2,
+        dataset_size=64,
+        logical_batch_size=8,
+        kwargs={"bsr_iterations_number": 11},
+    )
+
+    state = resolved.mechanism_state
+    assert state["bsr_iterations_number"] == 11
+    assert state["bsr_min_separation"] == 5
+    assert state["bsr_max_participations"] == 7
 
 
 def test_make_private_with_epsilon_bsr_calibrates_without_external_callback() -> None:

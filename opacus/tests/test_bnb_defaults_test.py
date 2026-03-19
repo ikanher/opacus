@@ -1,7 +1,11 @@
 import torch
 
-import opacus.accountants.analysis.bnb as bnb_mod
+import opacus.accountants.analysis.bnb as bnb_analysis_mod
+import opacus.accountants.bnb as bnb_accountant_mod
+from opacus import SamplingSemantics
+from opacus.accountants import BNBAccountant
 from opacus.accountants.analysis.bnb import (
+    build_bnb_toeplitz_c_matrix_and_contract,
     estimate_balls_in_bins_epsilon_monte_carlo_optimistic,
     resolve_bnb_calibration_kwargs,
 )
@@ -52,8 +56,8 @@ def test_optimistic_balls_in_bins_epsilon_does_not_use_base_delta(monkeypatch) -
         del kwargs
         return [torch.tensor([2.0, 2.0, 2.0], dtype=torch.float64)]
 
-    monkeypatch.setattr(bnb_mod, "get_bnb_base_delta", _fail_base_delta)
-    monkeypatch.setattr(bnb_mod, "sample_balls_in_bins_llr_chunks", _fake_chunks)
+    monkeypatch.setattr(bnb_analysis_mod, "get_bnb_base_delta", _fail_base_delta)
+    monkeypatch.setattr(bnb_analysis_mod, "sample_balls_in_bins_llr_chunks", _fake_chunks)
 
     epsilon = estimate_balls_in_bins_epsilon_monte_carlo_optimistic(
         coeffs=[1.0],
@@ -64,3 +68,113 @@ def test_optimistic_balls_in_bins_epsilon_does_not_use_base_delta(monkeypatch) -
         num_samples=10,
     )
     assert float(epsilon) >= 0.0
+
+
+def _bnb_balls_in_bins_state() -> tuple[dict, SamplingSemantics]:
+    c_matrix, contract = build_bnb_toeplitz_c_matrix_and_contract(
+        coeffs=[1.0],
+        bands=1,
+        horizon=4,
+    )
+    state = {
+        "bnb_c_matrix": c_matrix,
+        "bnb_c_matrix_contract": contract,
+        "bnb_accountant_coeffs": [1.0],
+        "bnb_bands": 1,
+        "bnb_cycle_length": 1,
+    }
+    semantics = SamplingSemantics(
+        sampling_mode="balls_in_bins",
+        privacy_metadata={"bands": 1, "bins": 1},
+    )
+    return state, semantics
+
+
+def test_bnb_accountant_get_epsilon_optimistic_uses_optimistic_estimator(monkeypatch) -> None:
+    state, semantics = _bnb_balls_in_bins_state()
+    state["_bnb_accounting_kwargs"] = {
+        "bnb_calibration_mode": "optimistic",
+        "bnb_num_samples": 123,
+        "bnb_seed": 7,
+        "bnb_chunk_size": None,
+        "bnb_num_workers": 0,
+        "bnb_backend": "auto",
+        "bnb_device": None,
+        "bnb_distributed_mode": "none",
+        "bnb_distributed_dp_runtime": False,
+    }
+
+    accountant = BNBAccountant()
+    accountant.step(noise_multiplier=1.0, sample_rate=1.0)
+
+    def _fail_evr(**kwargs):
+        del kwargs
+        raise AssertionError("optimistic get_epsilon should not use EVR estimator")
+
+    def _optimistic(**kwargs):
+        assert kwargs["num_samples"] == 123
+        assert kwargs["seed"] == 7
+        return 1.234
+
+    monkeypatch.setattr(
+        bnb_accountant_mod,
+        "estimate_balls_in_bins_epsilon_monte_carlo",
+        _fail_evr,
+    )
+    monkeypatch.setattr(
+        bnb_accountant_mod,
+        "estimate_balls_in_bins_epsilon_monte_carlo_optimistic",
+        _optimistic,
+    )
+
+    epsilon = accountant.get_epsilon(
+        1e-5,
+        mechanism_state=state,
+        sampling_semantics=semantics,
+    )
+    assert float(epsilon) == 1.234
+
+
+def test_bnb_accountant_get_epsilon_evr_uses_base_delta_estimator(monkeypatch) -> None:
+    state, semantics = _bnb_balls_in_bins_state()
+    state["_bnb_accounting_kwargs"] = {
+        "bnb_calibration_mode": "evr",
+        "bnb_num_samples": 321,
+        "bnb_seed": 17,
+        "bnb_chunk_size": None,
+        "bnb_num_workers": 0,
+        "bnb_backend": "auto",
+        "bnb_device": None,
+        "bnb_distributed_mode": "none",
+        "bnb_distributed_dp_runtime": False,
+    }
+
+    accountant = BNBAccountant()
+    accountant.step(noise_multiplier=1.0, sample_rate=1.0)
+
+    def _evr(**kwargs):
+        assert kwargs["num_samples"] == 321
+        assert kwargs["seed"] == 17
+        return 2.345
+
+    def _fail_optimistic(**kwargs):
+        del kwargs
+        raise AssertionError("EVR get_epsilon should not use optimistic estimator")
+
+    monkeypatch.setattr(
+        bnb_accountant_mod,
+        "estimate_balls_in_bins_epsilon_monte_carlo",
+        _evr,
+    )
+    monkeypatch.setattr(
+        bnb_accountant_mod,
+        "estimate_balls_in_bins_epsilon_monte_carlo_optimistic",
+        _fail_optimistic,
+    )
+
+    epsilon = accountant.get_epsilon(
+        1e-5,
+        mechanism_state=state,
+        sampling_semantics=semantics,
+    )
+    assert float(epsilon) == 2.345

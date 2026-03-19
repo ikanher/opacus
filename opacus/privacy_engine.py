@@ -359,6 +359,8 @@ class PrivacyEngine:
         sampling_semantics: Optional[SamplingSemantics],
         total_steps: int,
         dataloader_len: int,
+        dataset_size: int,
+        logical_batch_size: int,
         kwargs: Dict[str, Any],
     ) -> NoiseMechanismConfig:
         if mechanism_config.mechanism not in ("bandmf", "bsr", "bisr", "bandinvmf"):
@@ -367,7 +369,19 @@ class PrivacyEngine:
         if sampling_semantics is None or sampling_semantics.sampling_mode != "torch_sampler":
             return mechanism_config
 
-        if total_steps < 1 or dataloader_len < 1:
+        if total_steps < 1:
+            return mechanism_config
+
+        global_steps_per_epoch = 0
+        if dataset_size > 0 and logical_batch_size > 0:
+            global_steps_per_epoch = int(
+                math.ceil(float(dataset_size) / float(logical_batch_size))
+            )
+        elif dataloader_len > 0:
+            # Fallback for callers that do not preserve pre-DDP logical schedule inputs.
+            global_steps_per_epoch = int(dataloader_len)
+
+        if global_steps_per_epoch < 1:
             return mechanism_config
 
         metadata = (
@@ -378,29 +392,32 @@ class PrivacyEngine:
         state = copy.deepcopy(mechanism_config.mechanism_state)
         changed = False
 
-        if (
-            kwargs.get("bsr_iterations_number") is None
-            and metadata.get("bsr_iterations_number") is None
-            and state.get("bsr_iterations_number") is None
+        for field_name in (
+            "bsr_iterations_number",
+            "bsr_min_separation",
+            "bsr_max_participations",
         ):
+            if state.get(field_name) is not None:
+                continue
+            explicit_value = kwargs.get(field_name)
+            if explicit_value is None:
+                explicit_value = metadata.get(field_name)
+            if explicit_value is None:
+                continue
+            state[field_name] = int(explicit_value)
+            changed = True
+
+        if state.get("bsr_iterations_number") is None:
             state["bsr_iterations_number"] = int(total_steps)
             changed = True
 
-        if (
-            kwargs.get("bsr_min_separation") is None
-            and metadata.get("bsr_min_separation") is None
-            and state.get("bsr_min_separation") is None
-        ):
-            state["bsr_min_separation"] = int(dataloader_len)
+        if state.get("bsr_min_separation") is None:
+            state["bsr_min_separation"] = int(global_steps_per_epoch)
             changed = True
 
-        if (
-            kwargs.get("bsr_max_participations") is None
-            and metadata.get("bsr_max_participations") is None
-            and state.get("bsr_max_participations") is None
-        ):
+        if state.get("bsr_max_participations") is None:
             state["bsr_max_participations"] = int(
-                math.ceil(float(total_steps) / float(dataloader_len))
+                math.ceil(float(total_steps) / float(global_steps_per_epoch))
             )
             changed = True
 
@@ -2104,6 +2121,8 @@ class PrivacyEngine:
             sampling_semantics=semantics,
             total_steps=int(total_steps) if total_steps is not None else 0,
             dataloader_len=int(len(data_loader)),
+            dataset_size=int(len(data_loader.dataset)),
+            logical_batch_size=int(batch_size) if batch_size is not None else 0,
             kwargs=kwargs,
         )
         mechanism_config = ensure_bandinvmf_runtime_state_helper(
@@ -2358,6 +2377,7 @@ class PrivacyEngine:
             sampling_semantics=local_sampling_semantics,
             kwargs=coeff_resolution_kwargs,
         )
+        batch_size = data_loader.batch_size
         sample_rate_hint = (
             self._resolve_total_steps_sample_rate(
                 poisson_sampling=poisson_sampling,
@@ -2378,6 +2398,8 @@ class PrivacyEngine:
                 else int(float(epochs) * float(len(data_loader)))
             ),
             dataloader_len=int(len(data_loader)),
+            dataset_size=int(len(data_loader.dataset)),
+            logical_batch_size=int(batch_size) if batch_size is not None else 0,
             kwargs=kwargs,
         )
         mechanism_config = ensure_bandinvmf_runtime_state_helper(
