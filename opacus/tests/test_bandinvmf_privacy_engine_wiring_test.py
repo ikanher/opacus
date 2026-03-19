@@ -28,6 +28,10 @@ def _loader(
     )
 
 
+def _bandinvmf_supported_fixed_batch_loader() -> DataLoader:
+    return _loader(n_samples=160, batch_size=8)
+
+
 def test_bandinvmf_make_private_generates_deterministic_runtime_state() -> None:
     def _run_once() -> dict:
         pe = PrivacyEngine()
@@ -56,6 +60,8 @@ def test_bandinvmf_make_private_generates_deterministic_runtime_state() -> None:
 
     first = _run_once()
     second = _run_once()
+    assert first["bsr_min_separation"] == 4
+    assert first["bsr_max_participations"] == 4
     assert first["bandinvmf_inv_coeffs"] == pytest.approx(
         second["bandinvmf_inv_coeffs"], rel=0.0, abs=1e-12
     )
@@ -82,14 +88,14 @@ def test_bandinvmf_make_private_with_epsilon_fixed_batch_passes_resolved_mf_sens
     _private_model, dp_optimizer, _private_loader = pe.make_private_with_epsilon(
         module=model,
         optimizer=optimizer,
-        data_loader=_loader(batch_size=8, n_samples=32),
+        data_loader=_bandinvmf_supported_fixed_batch_loader(),
         target_epsilon=8.0,
         target_delta=1e-5,
         max_grad_norm=1.0,
         poisson_sampling=False,
         clipping="flat",
         grad_sample_mode="hooks",
-        total_steps=16,
+        total_steps=80,
         noise_mechanism_config=NoiseMechanismConfig(
             mechanism="bandinvmf",
             accounting_mode="bsr_accountant",
@@ -101,6 +107,8 @@ def test_bandinvmf_make_private_with_epsilon_fixed_batch_passes_resolved_mf_sens
     assert captured["accountant"] == "bsr"
     assert float(captured["bsr_mf_sensitivity"]) > 0.0
     state = pe.noise_mechanism_config.mechanism_state
+    assert state["bsr_min_separation"] == 20
+    assert state["bsr_max_participations"] == 4
     assert float(state["bsr_mf_sensitivity"]) > 0.0
     assert "bandinvmf_inv_coeffs" in state
 
@@ -159,13 +167,13 @@ def test_bandinvmf_fixed_batch_accountant_get_epsilon_uses_bandinvmf_resolver() 
     _private_model, _dp_optimizer, _private_loader = pe.make_private(
         module=model,
         optimizer=optimizer,
-        data_loader=_loader(batch_size=8, n_samples=32),
+        data_loader=_bandinvmf_supported_fixed_batch_loader(),
         noise_multiplier=1.0,
         max_grad_norm=1.0,
         poisson_sampling=False,
         clipping="flat",
         grad_sample_mode="hooks",
-        total_steps=16,
+        total_steps=80,
         noise_mechanism_config=NoiseMechanismConfig(
             mechanism="bandinvmf",
             accounting_mode="bsr_accountant",
@@ -173,7 +181,7 @@ def test_bandinvmf_fixed_batch_accountant_get_epsilon_uses_bandinvmf_resolver() 
         ),
     )
 
-    pe.accountant.step(noise_multiplier=1.0, sample_rate=8 / 32)
+    pe.accountant.step(noise_multiplier=1.0, sample_rate=8 / 160)
     epsilon = pe.get_epsilon(delta=1e-5)
     assert math.isfinite(float(epsilon))
     assert float(epsilon) > 0.0

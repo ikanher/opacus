@@ -2099,10 +2099,17 @@ class PrivacyEngine:
             sampling_semantics=sampling_semantics,
             kwargs=coeff_resolution_kwargs,
         )
+        mechanism_config = self._apply_default_fixed_batch_contract_for_torch_sampler(
+            mechanism_config=mechanism_config,
+            sampling_semantics=semantics,
+            total_steps=int(total_steps) if total_steps is not None else 0,
+            dataloader_len=int(len(data_loader)),
+            kwargs=kwargs,
+        )
         mechanism_config = ensure_bandinvmf_runtime_state_helper(
             mechanism_config=mechanism_config,
             optimizer=optimizer,
-            sampling_semantics=sampling_semantics,
+            sampling_semantics=semantics,
             steps_hint=int(total_steps) if total_steps is not None else int(len(data_loader)),
             sample_rate_hint=float(sample_rate),
             kwargs=coeff_resolution_kwargs,
@@ -2110,15 +2117,8 @@ class PrivacyEngine:
         mechanism_config = self._ensure_bnb_balls_in_bins_mf_state(
             mechanism_config=mechanism_config,
             optimizer=optimizer,
-            sampling_semantics=sampling_semantics,
-            kwargs=coeff_resolution_kwargs,
-        )
-        mechanism_config = self._apply_default_fixed_batch_contract_for_torch_sampler(
-            mechanism_config=mechanism_config,
             sampling_semantics=semantics,
-            total_steps=int(total_steps) if total_steps is not None else 0,
-            dataloader_len=int(len(data_loader)),
-            kwargs=kwargs,
+            kwargs=coeff_resolution_kwargs,
         )
         if (
             mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf")
@@ -2369,6 +2369,17 @@ class PrivacyEngine:
             if total_steps is not None
             else (1.0 / float(len(data_loader)))
         )
+        mechanism_config = self._apply_default_fixed_batch_contract_for_torch_sampler(
+            mechanism_config=mechanism_config,
+            sampling_semantics=local_sampling_semantics,
+            total_steps=(
+                int(total_steps)
+                if total_steps is not None
+                else int(float(epochs) * float(len(data_loader)))
+            ),
+            dataloader_len=int(len(data_loader)),
+            kwargs=kwargs,
+        )
         mechanism_config = ensure_bandinvmf_runtime_state_helper(
             mechanism_config=mechanism_config,
             optimizer=optimizer,
@@ -2386,17 +2397,6 @@ class PrivacyEngine:
             optimizer=optimizer,
             sampling_semantics=local_sampling_semantics,
             kwargs=coeff_resolution_kwargs,
-        )
-        mechanism_config = self._apply_default_fixed_batch_contract_for_torch_sampler(
-            mechanism_config=mechanism_config,
-            sampling_semantics=local_sampling_semantics,
-            total_steps=(
-                int(total_steps)
-                if total_steps is not None
-                else int(float(epochs) * float(len(data_loader)))
-            ),
-            dataloader_len=int(len(data_loader)),
-            kwargs=kwargs,
         )
 
         is_dpddp = isinstance(module, DPDDP)
