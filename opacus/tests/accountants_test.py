@@ -17,6 +17,7 @@ import unittest
 import math
 import itertools
 import warnings
+from typing import Optional
 from unittest.mock import patch
 
 import hypothesis.strategies as st
@@ -137,6 +138,7 @@ def _resolve_bnb_state_via_make_private(
     mechanism: str,
     mechanism_state: dict,
     total_steps: int = 16,
+    extra_kwargs: Optional[dict] = None,
 ) -> dict:
     pe = PrivacyEngine()
     model = nn.Linear(4, 3)
@@ -162,6 +164,7 @@ def _resolve_bnb_state_via_make_private(
             sampling_mode="balls_in_bins",
             privacy_metadata={"bins": 4, "bands": 2},
         ),
+        **(extra_kwargs or {}),
     )
     return pe.noise_mechanism_config.mechanism_state
 
@@ -1261,6 +1264,22 @@ class AccountingTest(unittest.TestCase):
         self.assertTrue(len(state["bnb_accountant_coeffs"]) > 0)
         self.assertIn("bnb_c_matrix", state)
         self.assertIn("bnb_c_matrix_contract", state)
+
+    def test_bsr_balls_in_bins_make_private_persists_bnb_accounting_kwargs(self) -> None:
+        state = _resolve_bnb_state_via_make_private(
+            mechanism="bsr",
+            mechanism_state={"bsr_bands": 2},
+            extra_kwargs={
+                "bnb_calibration_mode": "optimistic",
+                "bnb_num_samples": 12345,
+                "bnb_seed": 77,
+            },
+        )
+
+        persisted = state["_bnb_accounting_kwargs"]
+        self.assertEqual(persisted["bnb_calibration_mode"], "optimistic")
+        self.assertEqual(persisted["bnb_num_samples"], 12345)
+        self.assertEqual(persisted["bnb_seed"], 77)
 
     def test_bsr_balls_in_bins_make_private_treats_empty_coeff_list_as_missing(self) -> None:
         state = _resolve_bnb_state_via_make_private(

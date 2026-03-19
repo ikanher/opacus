@@ -2061,6 +2061,20 @@ class PrivacyEngine:
                 mechanism_state=state,
             )
 
+        bnb_accounting_kwargs = self._build_bnb_accounting_kwargs_for_state(
+            mechanism=mechanism_config.mechanism,
+            kwargs=kwargs,
+            distributed_dp_runtime=bool(distributed),
+        )
+        if bnb_accounting_kwargs is not None:
+            state = copy.deepcopy(mechanism_config.mechanism_state)
+            state["_bnb_accounting_kwargs"] = dict(bnb_accounting_kwargs)
+            mechanism_config = NoiseMechanismConfig(
+                mechanism=mechanism_config.mechanism,
+                accounting_mode=mechanism_config.accounting_mode,
+                mechanism_state=state,
+            )
+
         if (
             mechanism_config.mechanism in ("bandmf", "bisr")
             or (
