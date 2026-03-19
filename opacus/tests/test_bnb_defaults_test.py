@@ -3,6 +3,7 @@ from opacus.accountants.analysis.bnb import resolve_bnb_calibration_kwargs
 
 def test_bnb_calibration_defaults_match_monte_carlo_reference() -> None:
     cfg = resolve_bnb_calibration_kwargs()
+    assert cfg["bnb_calibration_mode"] == "evr"
     assert cfg["bnb_num_samples"] == 500_000
     assert cfg["bnb_seed"] == 154
     assert cfg["bnb_max_iterations"] == 1000
@@ -15,11 +16,22 @@ def test_bnb_calibration_defaults_match_monte_carlo_reference() -> None:
 def test_overrides_take_precedence() -> None:
     cfg = resolve_bnb_calibration_kwargs(
         overrides={
+            "bnb_calibration_mode": "optimistic",
             "bnb_num_samples": 1234,
             "bnb_require_evr_pass": False,
             "bnb_chunk_size": 100,
         },
     )
+    assert cfg["bnb_calibration_mode"] == "optimistic"
     assert cfg["bnb_num_samples"] == 1234
     assert cfg["bnb_require_evr_pass"] is False
     assert cfg["bnb_chunk_size"] == 100
+
+
+def test_evr_mode_enables_acceptance_guard_by_default() -> None:
+    cfg = resolve_bnb_calibration_kwargs(
+        overrides={
+            "bnb_calibration_mode": "evr",
+        },
+    )
+    assert cfg["bnb_require_evr_pass"] is True

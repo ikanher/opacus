@@ -60,6 +60,9 @@ from torch.distributions import Bernoulli, kl_divergence
 BNB_VERIFICATION_CONTRACT = "evr_union_bound_alpha_split_v1"
 
 _BNB_CALIBRATION_DEFAULTS: Dict[str, Any] = {
+    # `evr` keeps the existing guarded Monte Carlo surface; `optimistic`
+    # disables the EVR acceptance guard while keeping the same sampler.
+    "bnb_calibration_mode": "evr",
     # These are directly from the example script.
     "bnb_num_samples": 500_000,
     "bnb_seed": 154,
@@ -121,6 +124,16 @@ def resolve_bnb_calibration_kwargs(
         for key, value in overrides.items():
             if key in _BNB_CALIBRATION_DEFAULTS and value is not None:
                 resolved[key] = value
+
+    mode = str(resolved["bnb_calibration_mode"])
+    if mode not in {"evr", "optimistic"}:
+        raise ValueError("bnb_calibration_mode must be one of {'evr', 'optimistic'}")
+
+    # Current production semantics: `optimistic` skips the EVR acceptance guard.
+    if mode == "optimistic":
+        resolved["bnb_require_evr_pass"] = False
+    elif overrides is None or overrides.get("bnb_require_evr_pass") is None:
+        resolved["bnb_require_evr_pass"] = True
 
     return resolved
 

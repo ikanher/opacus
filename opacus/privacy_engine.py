@@ -1573,6 +1573,7 @@ class PrivacyEngine:
             else ("chunk_shard" if distributed_dp_runtime else "none")
         )
         return {
+            "bnb_calibration_mode": str(calibration_cfg["bnb_calibration_mode"]),
             "bnb_num_samples": int(calibration_cfg["bnb_num_samples"]),
             "bnb_seed": int(calibration_cfg["bnb_seed"]),
             "bnb_reduce_dimensionality": bool(

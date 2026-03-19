@@ -268,6 +268,7 @@ class BNBAccountant(IAccountant):
         resolved_overrides = {}
         if isinstance(persisted_kwargs, dict):
             for key in (
+                "bnb_calibration_mode",
                 "bnb_num_samples",
                 "bnb_seed",
                 "bnb_reduce_dimensionality",
@@ -285,6 +286,7 @@ class BNBAccountant(IAccountant):
                     resolved_overrides[key] = value
 
         for key in (
+            "bnb_calibration_mode",
             "bnb_num_samples",
             "bnb_seed",
             "bnb_reduce_dimensionality",
