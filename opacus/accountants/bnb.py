@@ -36,6 +36,7 @@ Implementation lineage:
 from typing import Any, Dict, Tuple
 from opacus.accountants.analysis.bnb import (
     estimate_balls_in_bins_epsilon_monte_carlo,
+    estimate_balls_in_bins_epsilon_monte_carlo_optimistic,
     estimate_b_min_sep_epsilon_monte_carlo,
     resolve_bnb_calibration_kwargs,
 )
@@ -318,6 +319,7 @@ class BNBAccountant(IAccountant):
         device = calibration_cfg["bnb_device"]
         distributed_mode = calibration_cfg["bnb_distributed_mode"]
         distributed_dp_runtime = bool(calibration_cfg["bnb_distributed_dp_runtime"])
+        calibration_mode = str(calibration_cfg["bnb_calibration_mode"])
         if sampling_mode == "b_min_sep" and c_matrix is not None and bands is not None and c_matrix_contract is not None:
             if cycle_length is None:
                 cycle_length = bands
@@ -368,8 +370,11 @@ class BNBAccountant(IAccountant):
                 )
 
             horizon = int(c_matrix.shape[1])
+            estimator = estimate_balls_in_bins_epsilon_monte_carlo
+            if calibration_mode == "optimistic":
+                estimator = estimate_balls_in_bins_epsilon_monte_carlo_optimistic
             return float(
-                estimate_balls_in_bins_epsilon_monte_carlo(
+                estimator(
                     coeffs=accountant_coeffs,
                     cycle_length=int(cycle_length),
                     horizon=horizon,

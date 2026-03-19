@@ -1489,6 +1489,94 @@ def estimate_balls_in_bins_epsilon_monte_carlo(
     return epsilon
 
 
+def estimate_balls_in_bins_epsilon_monte_carlo_optimistic(
+    *,
+    coeffs: Sequence[float],
+    cycle_length: int,
+    horizon: int,
+    noise_multiplier: float,
+    target_delta: float,
+    num_samples: int,
+    seed: int = 0,
+    tolerance: float = 1e-4,
+    max_iterations: int = 200,
+    chunk_size: int | None = None,
+    num_workers: int = 0,
+    backend: str = "auto",
+    device: str | torch.device | None = None,
+    distributed_mode: str | None = "none",
+    distributed_dp_runtime: bool = False,
+) -> float:
+    """
+    Estimate epsilon directly from balls-in-bins Monte Carlo LLR samples.
+
+    This is the optimistic point-estimate surface: it inverts `delta(epsilon)`
+    directly at the target `delta` without the EVR/base-delta feasibility split.
+    """
+    if target_delta < 0.0 or target_delta >= 1.0:
+        raise ValueError("target_delta must be in [0, 1)")
+
+    positive_chunks = sample_balls_in_bins_llr_chunks(
+        coeffs=coeffs,
+        cycle_length=int(cycle_length),
+        horizon=int(horizon),
+        sigma=float(noise_multiplier),
+        num_samples=int(num_samples),
+        seed=int(seed),
+        chunk_size=chunk_size,
+        num_workers=int(num_workers),
+        positive_sample=True,
+        backend=backend,
+        device=device,
+        distributed_mode=distributed_mode,
+        distributed_dp_runtime=distributed_dp_runtime,
+    )
+    negative_chunks = sample_balls_in_bins_llr_chunks(
+        coeffs=coeffs,
+        cycle_length=int(cycle_length),
+        horizon=int(horizon),
+        sigma=float(noise_multiplier),
+        num_samples=int(num_samples),
+        seed=int(seed) + 1,
+        chunk_size=chunk_size,
+        num_workers=int(num_workers),
+        positive_sample=False,
+        backend=backend,
+        device=device,
+        distributed_mode=distributed_mode,
+        distributed_dp_runtime=distributed_dp_runtime,
+    )
+    if (
+        distributed_mode == "chunk_shard"
+        and dist.is_available()
+        and dist.is_initialized()
+        and dist.get_rank() != 0
+    ):
+        result = torch.tensor(float("nan"), dtype=torch.float64)
+        dist.broadcast(result, src=0)
+        return float(result.item())
+
+    positive_epsilon = estimate_epsilon_from_llr_chunks(
+        target_delta=float(target_delta),
+        llr_chunks=[torch.as_tensor(chunk, dtype=torch.float64) for chunk in positive_chunks],
+        tolerance=float(tolerance),
+        max_iterations=int(max_iterations),
+    )
+    negative_epsilon = estimate_epsilon_from_llr_chunks(
+        target_delta=float(target_delta),
+        llr_chunks=[torch.as_tensor(chunk, dtype=torch.float64) for chunk in negative_chunks],
+        tolerance=float(tolerance),
+        max_iterations=int(max_iterations),
+    )
+    epsilon = float(max(float(positive_epsilon), float(negative_epsilon)))
+    if distributed_mode == "chunk_shard" and dist.is_available() and dist.is_initialized():
+        result = torch.tensor(epsilon, dtype=torch.float64)
+        dist.broadcast(result, src=0)
+        return float(result.item())
+
+    return epsilon
+
+
 def _compute_llr_samples_chunk(
     *,
     up_gm: GaussianMixture,
