@@ -27,6 +27,7 @@ from typing import Any, Dict, Optional
 from torch import optim
 
 from opacus.accountants.analysis.bandinvmf import (
+    compute_bandinvmf_fixed_batch_sensitivity_from_inv_coeffs,
     derive_bandinvmf_inv_coeffs_from_runtime_coeffs,
     derive_bandinvmf_runtime_coeffs_from_inv_coeffs,
     optimize_bandinvmf_inv_coeffs_for_sgd_workload,
@@ -82,13 +83,107 @@ def resolve_bandinvmf_mf_sensitivity_for_fixed_batch(
     its own accountant module even though the underlying accounting contract is
     reused.
     """
-    return resolve_bsr_mf_sensitivity_for_fixed_batch(
-        mechanism_state=mechanism_state,
-        sampling_semantics=sampling_semantics,
-        steps=steps,
-        sample_rate=sample_rate,
-        kwargs=kwargs,
+    metadata = (
+        sampling_semantics.privacy_metadata
+        if sampling_semantics is not None
+        else {}
     )
+
+    inv_coeffs = kwargs.get(
+        "bandinvmf_inv_coeffs",
+        mechanism_state.get("bandinvmf_inv_coeffs"),
+    )
+    if inv_coeffs is None:
+        runtime_coeffs = kwargs.get("coeffs", mechanism_state.get("coeffs"))
+        if runtime_coeffs is not None:
+            inv_coeffs = derive_bandinvmf_inv_coeffs_from_runtime_coeffs(
+                coeffs=runtime_coeffs
+            )
+
+    max_participations = kwargs.get(
+        "bsr_max_participations",
+        metadata.get(
+            "bsr_max_participations",
+            mechanism_state.get("bsr_max_participations"),
+        ),
+    )
+    min_separation = kwargs.get(
+        "bsr_min_separation",
+        metadata.get(
+            "bsr_min_separation",
+            mechanism_state.get("bsr_min_separation"),
+        ),
+    )
+    sensitivity_steps = kwargs.get(
+        "bsr_iterations_number",
+        metadata.get(
+            "bsr_iterations_number",
+            mechanism_state.get("bsr_iterations_number"),
+        ),
+    )
+    if sensitivity_steps is None:
+        sensitivity_steps = int(steps)
+
+    mf_sensitivity = kwargs.get(
+        "bsr_mf_sensitivity",
+        metadata.get("bsr_mf_sensitivity", mechanism_state.get("bsr_mf_sensitivity")),
+    )
+    explicit_mf_sensitivity_override = kwargs.get("bsr_mf_sensitivity", None) is not None
+
+    if max_participations is None:
+        if sample_rate is None:
+            max_participations = 1
+        else:
+            max_participations = max(1, int(math.ceil(float(sample_rate) * float(sensitivity_steps))))
+
+    if min_separation is None:
+        min_separation = 1
+
+    sensitivity_steps = int(sensitivity_steps)
+    max_participations = int(max_participations)
+    min_separation = int(min_separation)
+
+    if mf_sensitivity is None:
+        if inv_coeffs is None:
+            raise ValueError(
+                "fixed-batch bandinvmf accounting requires inverse coefficients or "
+                "enough data to derive MF sensitivity"
+            )
+        return float(
+            compute_bandinvmf_fixed_batch_sensitivity_from_inv_coeffs(
+                inv_coeffs=inv_coeffs,
+                steps=sensitivity_steps,
+                max_participations=max_participations,
+                min_separation=min_separation,
+            )
+        )
+
+    mf_sensitivity = float(mf_sensitivity)
+    if not math.isfinite(mf_sensitivity) or mf_sensitivity <= 0.0:
+        raise ValueError("bsr_mf_sensitivity must be finite and > 0")
+
+    if explicit_mf_sensitivity_override and inv_coeffs is not None:
+        derived = float(
+            compute_bandinvmf_fixed_batch_sensitivity_from_inv_coeffs(
+                inv_coeffs=inv_coeffs,
+                steps=sensitivity_steps,
+                max_participations=max_participations,
+                min_separation=min_separation,
+            )
+        )
+        if not math.isfinite(derived) or derived <= 0.0:
+            raise ValueError(
+                "derived bandinvmf bsr_mf_sensitivity must be finite and > 0 "
+                "when validating explicit bsr_mf_sensitivity"
+            )
+        if not math.isclose(mf_sensitivity, derived, rel_tol=1e-9, abs_tol=1e-12):
+            raise ValueError(
+                "provided bsr_mf_sensitivity is inconsistent with "
+                "bandinvmf inverse coefficients/max_participations/min_separation "
+                "for the resolved bsr_iterations_number"
+            )
+
+    return float(mf_sensitivity)
 
 
 def _resolve_bandinvmf_runtime_contract_inputs(

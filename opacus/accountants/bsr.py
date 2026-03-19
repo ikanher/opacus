@@ -932,15 +932,26 @@ class BSRAccountant(IAccountant):
             sample_rate=sample_rate,
         )
 
-        resolved_mf_sensitivity = BSRAccountant._resolve_fixed_batch_mf_sensitivity(
-            mechanism=mechanism,
-            coeffs=coeffs,
-            max_participations=max_participations,
-            min_separation=min_separation,
-            sensitivity_steps=sensitivity_steps,
-            mf_sensitivity=mf_sensitivity,
-            explicit_mf_sensitivity_override=explicit_mf_sensitivity_override,
-        )
+        if mechanism == "bandinvmf":
+            from .bandinvmf import resolve_bandinvmf_mf_sensitivity_for_fixed_batch
+
+            resolved_mf_sensitivity = resolve_bandinvmf_mf_sensitivity_for_fixed_batch(
+                mechanism_state=state,
+                sampling_semantics=None,
+                steps=total_steps,
+                sample_rate=sample_rate,
+                kwargs=kwargs,
+            )
+        else:
+            resolved_mf_sensitivity = BSRAccountant._resolve_fixed_batch_mf_sensitivity(
+                mechanism=mechanism,
+                coeffs=coeffs,
+                max_participations=max_participations,
+                min_separation=min_separation,
+                sensitivity_steps=sensitivity_steps,
+                mf_sensitivity=mf_sensitivity,
+                explicit_mf_sensitivity_override=explicit_mf_sensitivity_override,
+            )
         reduced_contract = resolve_bsr_fixed_batch_gaussian_contract(
             noise_multiplier=float(noise_multiplier),
             mf_sensitivity=float(resolved_mf_sensitivity),

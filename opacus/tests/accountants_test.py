@@ -141,7 +141,7 @@ def _resolve_bnb_state_via_make_private(
     pe = PrivacyEngine()
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(
-        model.parameters(), lr=0.05, momentum=0.9, weight_decay=0.01
+        model.parameters(), lr=0.05, momentum=0.9, weight_decay=0.9999
     )
     pe.make_private(
         module=model,
@@ -1259,6 +1259,18 @@ class AccountingTest(unittest.TestCase):
         self.assertEqual(state["coeff_source"], "analytical_auto")
         self.assertEqual(state["bnb_accountant_coeffs_source"], "runtime_c_col")
         self.assertTrue(len(state["bnb_accountant_coeffs"]) > 0)
+        self.assertIn("bnb_c_matrix", state)
+        self.assertIn("bnb_c_matrix_contract", state)
+
+    def test_bsr_balls_in_bins_make_private_treats_empty_coeff_list_as_missing(self) -> None:
+        state = _resolve_bnb_state_via_make_private(
+            mechanism="bsr",
+            mechanism_state={"coeffs": [], "bsr_bands": 2},
+        )
+
+        self.assertEqual(state["coeff_source"], "analytical_auto")
+        self.assertTrue(len(state["coeffs"]) > 0)
+        self.assertEqual(state["bnb_accountant_coeffs_source"], "raw_c_col")
         self.assertIn("bnb_c_matrix", state)
         self.assertIn("bnb_c_matrix_contract", state)
 

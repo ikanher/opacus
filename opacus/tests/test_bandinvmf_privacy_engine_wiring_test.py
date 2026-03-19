@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import io
+import math
 
 import pytest
 import torch
@@ -146,6 +147,36 @@ def test_bandinvmf_make_private_with_epsilon_cyclic_passes_resolved_scale(monkey
     assert float(captured["bsr_sensitivity_scale"]) > 0.0
     state = pe.noise_mechanism_config.mechanism_state
     assert float(state["bsr_sensitivity_scale"]) > 0.0
+
+
+def test_bandinvmf_fixed_batch_accountant_get_epsilon_uses_bandinvmf_resolver() -> None:
+    pe = PrivacyEngine(accountant="bsr")
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(
+        model.parameters(), lr=0.05, momentum=0.9, weight_decay=0.01
+    )
+
+    _private_model, _dp_optimizer, _private_loader = pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(batch_size=8, n_samples=32),
+        noise_multiplier=1.0,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping="flat",
+        grad_sample_mode="hooks",
+        total_steps=16,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bandinvmf",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"bsr_bands": 4},
+        ),
+    )
+
+    pe.accountant.step(noise_multiplier=1.0, sample_rate=8 / 32)
+    epsilon = pe.get_epsilon(delta=1e-5)
+    assert math.isfinite(float(epsilon))
+    assert float(epsilon) > 0.0
 
 
 def test_bandinvmf_checkpoint_resume_preserves_generated_runtime_state() -> None:
