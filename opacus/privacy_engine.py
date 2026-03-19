@@ -353,6 +353,67 @@ class PrivacyEngine:
         }
 
     @staticmethod
+    def _apply_default_fixed_batch_contract_for_torch_sampler(
+        *,
+        mechanism_config: NoiseMechanismConfig,
+        sampling_semantics: Optional[SamplingSemantics],
+        total_steps: int,
+        dataloader_len: int,
+        kwargs: Dict[str, Any],
+    ) -> NoiseMechanismConfig:
+        if mechanism_config.mechanism not in ("bandmf", "bsr", "bisr", "bandinvmf"):
+            return mechanism_config
+
+        if sampling_semantics is None or sampling_semantics.sampling_mode != "torch_sampler":
+            return mechanism_config
+
+        if total_steps < 1 or dataloader_len < 1:
+            return mechanism_config
+
+        metadata = (
+            sampling_semantics.privacy_metadata
+            if sampling_semantics is not None
+            else {}
+        )
+        state = copy.deepcopy(mechanism_config.mechanism_state)
+        changed = False
+
+        if (
+            kwargs.get("bsr_iterations_number") is None
+            and metadata.get("bsr_iterations_number") is None
+            and state.get("bsr_iterations_number") is None
+        ):
+            state["bsr_iterations_number"] = int(total_steps)
+            changed = True
+
+        if (
+            kwargs.get("bsr_min_separation") is None
+            and metadata.get("bsr_min_separation") is None
+            and state.get("bsr_min_separation") is None
+        ):
+            state["bsr_min_separation"] = int(dataloader_len)
+            changed = True
+
+        if (
+            kwargs.get("bsr_max_participations") is None
+            and metadata.get("bsr_max_participations") is None
+            and state.get("bsr_max_participations") is None
+        ):
+            state["bsr_max_participations"] = int(
+                math.ceil(float(total_steps) / float(dataloader_len))
+            )
+            changed = True
+
+        if not changed:
+            return mechanism_config
+
+        return NoiseMechanismConfig(
+            mechanism=mechanism_config.mechanism,
+            accounting_mode=mechanism_config.accounting_mode,
+            mechanism_state=state,
+        )
+
+    @staticmethod
     def _log_bsr_trace(
         *,
         stage: str,
@@ -1560,7 +1621,7 @@ class PrivacyEngine:
         kwargs: Dict[str, Any],
         distributed_dp_runtime: bool,
     ) -> Optional[Dict[str, Any]]:
-        if mechanism not in ("bandmf", "bsr", "bisr", "bandinvmf"):
+        if mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bandinvmf"):
             return None
 
         calibration_cfg = resolve_bnb_calibration_kwargs(
@@ -2010,6 +2071,13 @@ class PrivacyEngine:
             total_steps=total_steps,
             distributed=distributed,
         )
+        semantics = self._build_sampling_semantics(
+            poisson_sampling=poisson_sampling,
+            sample_rate=sample_rate,
+            expected_batch_size=expected_batch_size,
+            distributed=distributed,
+            explicit_sampling_semantics=sampling_semantics,
+        )
 
         coeff_resolution_kwargs = dict(kwargs)
         if total_steps is not None:
@@ -2044,6 +2112,13 @@ class PrivacyEngine:
             optimizer=optimizer,
             sampling_semantics=sampling_semantics,
             kwargs=coeff_resolution_kwargs,
+        )
+        mechanism_config = self._apply_default_fixed_batch_contract_for_torch_sampler(
+            mechanism_config=mechanism_config,
+            sampling_semantics=semantics,
+            total_steps=int(total_steps) if total_steps is not None else 0,
+            dataloader_len=int(len(data_loader)),
+            kwargs=kwargs,
         )
         if (
             mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf")
@@ -2114,13 +2189,6 @@ class PrivacyEngine:
             **optimizer_prepare_kwargs,
         )
 
-        semantics = self._build_sampling_semantics(
-            poisson_sampling=poisson_sampling,
-            sample_rate=sample_rate,
-            expected_batch_size=expected_batch_size,
-            distributed=distributed,
-            explicit_sampling_semantics=sampling_semantics,
-        )
         self._log_bsr_trace(
             stage="make_private",
             mechanism_config=mechanism_config,
@@ -2318,6 +2386,17 @@ class PrivacyEngine:
             optimizer=optimizer,
             sampling_semantics=local_sampling_semantics,
             kwargs=coeff_resolution_kwargs,
+        )
+        mechanism_config = self._apply_default_fixed_batch_contract_for_torch_sampler(
+            mechanism_config=mechanism_config,
+            sampling_semantics=local_sampling_semantics,
+            total_steps=(
+                int(total_steps)
+                if total_steps is not None
+                else int(float(epochs) * float(len(data_loader)))
+            ),
+            dataloader_len=int(len(data_loader)),
+            kwargs=kwargs,
         )
 
         is_dpddp = isinstance(module, DPDDP)

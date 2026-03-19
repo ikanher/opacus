@@ -421,6 +421,58 @@ def test_bsr_accountant_attaches_in_make_private() -> None:
     assert getattr(dp_optimizer, "accounting_mode") == "bsr_accountant"
 
 
+def test_make_private_bsr_infers_fixed_batch_contract_from_total_steps() -> None:
+    model = nn.Linear(4, 3)
+    _, dp_optimizer, private_loader = _make_private(
+        model,
+        poisson_sampling=False,
+        noise_seed=105,
+        total_steps=16,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={
+                "coeffs": [1.0],
+                "z_std": 0.01,
+            },
+        ),
+    )
+
+    state = dp_optimizer.noise_mechanism_config.mechanism_state
+    assert state["bsr_iterations_number"] == 16
+    assert state["bsr_min_separation"] == len(private_loader)
+    assert state["bsr_max_participations"] == 2
+
+
+def test_make_private_with_epsilon_bsr_infers_fixed_batch_contract_from_total_steps() -> None:
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    pe = PrivacyEngine()
+    _private_model, dp_optimizer, private_loader = pe.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        target_epsilon=3.0,
+        target_delta=1e-5,
+        total_steps=16,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={
+                "coeffs": [1.0],
+                "z_std": 0.01,
+            },
+        ),
+    )
+
+    state = dp_optimizer.noise_mechanism_config.mechanism_state
+    assert state["bsr_iterations_number"] == 16
+    assert state["bsr_min_separation"] == len(private_loader)
+    assert state["bsr_max_participations"] == 2
+
+
 def test_make_private_with_epsilon_bsr_calibrates_without_external_callback() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)

@@ -1281,6 +1281,22 @@ class AccountingTest(unittest.TestCase):
         self.assertEqual(persisted["bnb_num_samples"], 12345)
         self.assertEqual(persisted["bnb_seed"], 77)
 
+    def test_gaussian_balls_in_bins_make_private_persists_bnb_accounting_kwargs(self) -> None:
+        state = _resolve_bnb_state_via_make_private(
+            mechanism="gaussian",
+            mechanism_state={},
+            extra_kwargs={
+                "bnb_calibration_mode": "optimistic",
+                "bnb_num_samples": 12345,
+                "bnb_seed": 77,
+            },
+        )
+
+        persisted = state["_bnb_accounting_kwargs"]
+        self.assertEqual(persisted["bnb_calibration_mode"], "optimistic")
+        self.assertEqual(persisted["bnb_num_samples"], 12345)
+        self.assertEqual(persisted["bnb_seed"], 77)
+
     def test_bsr_balls_in_bins_make_private_treats_empty_coeff_list_as_missing(self) -> None:
         state = _resolve_bnb_state_via_make_private(
             mechanism="bsr",
