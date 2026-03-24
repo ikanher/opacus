@@ -241,6 +241,8 @@ def _resolve_bandinvmf_runtime_contract_inputs(
     if sample_rate_hint is not None:
         default_k = max(1, int(math.ceil(float(sample_rate_hint) * float(steps_hint))))
 
+    default_min_separation = metadata.get("bins", 1)
+
     max_participations = int(
         kwargs.get(
             "bsr_max_participations",
@@ -255,7 +257,7 @@ def _resolve_bandinvmf_runtime_contract_inputs(
             "bsr_min_separation",
             metadata.get(
                 "bsr_min_separation",
-                mechanism_state.get("bsr_min_separation", 1),
+                mechanism_state.get("bsr_min_separation", default_min_separation),
             ),
         )
     )

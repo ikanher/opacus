@@ -157,6 +157,42 @@ def test_bandinvmf_make_private_with_epsilon_cyclic_passes_resolved_scale(monkey
     assert float(state["bsr_sensitivity_scale"]) > 0.0
 
 
+def test_bandinvmf_balls_in_bins_auto_state_uses_bins_as_min_separation() -> None:
+    pe = PrivacyEngine()
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(
+        model.parameters(), lr=0.05, momentum=0.9, weight_decay=0.01
+    )
+
+    semantics = SamplingSemantics(
+        sampling_mode="balls_in_bins",
+        privacy_metadata={"bands": 4, "bins": 20},
+    )
+    _private_model, dp_optimizer, _private_loader = pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(n_samples=160, batch_size=8),
+        noise_multiplier=1.0,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping="flat",
+        grad_sample_mode="hooks",
+        total_steps=16,
+        sampling_semantics=semantics,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bandinvmf",
+            accounting_mode="bnb_accountant",
+            mechanism_state={"bsr_bands": 4},
+        ),
+    )
+
+    assert isinstance(dp_optimizer.noise_mechanism, InverseBandNoiseMechanism)
+    state = pe.noise_mechanism_config.mechanism_state
+    assert state["bsr_min_separation"] == 20
+    assert state["bsr_bands"] == 4
+    assert "bandinvmf_inv_coeffs" in state
+
+
 def test_bandinvmf_fixed_batch_accountant_get_epsilon_uses_bandinvmf_resolver() -> None:
     pe = PrivacyEngine(accountant="bsr")
     model = nn.Linear(4, 3)
