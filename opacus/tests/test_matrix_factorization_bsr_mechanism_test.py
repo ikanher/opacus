@@ -19,7 +19,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from opacus import PrivacyEngine
-from opacus.optimizers import CorrelatedNoiseMechanism
+from opacus.optimizers import CorrelatedNoiseMechanism, InverseBandNoiseMechanism
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -257,6 +257,53 @@ def test_streaming_state_roundtrip_replays_future_sequence() -> None:
     mech_b = CorrelatedNoiseMechanism(coeffs=coeffs, z_std=0.0)
 
     gen = torch.Generator().manual_seed(20260213)
+    z_seq = [torch.randn(6, generator=gen, dtype=torch.float64) for _ in range(9)]
+
+    for z in z_seq[:4]:
+        mech_a._solve_correlated_noise(z)
+
+    mech_b.load_state_dict(mech_a.state_dict())
+    assert mech_b.state_depth == mech_a.state_depth
+    assert mech_b.steps_with_noise == mech_a.steps_with_noise
+
+    for z in z_seq[4:]:
+        ua = mech_a._solve_correlated_noise(z)
+        ub = mech_b._solve_correlated_noise(z)
+        assert torch.allclose(ua, ub, atol=1e-12, rtol=1e-10)
+
+
+def test_inverse_band_streaming_matches_materialized_product() -> None:
+    inverse_coeffs = [1.0, -0.5, 0.125, -0.03125]
+    mechanism = InverseBandNoiseMechanism(inverse_coeffs=inverse_coeffs, z_std=0.0)
+    mechanism.reset_state()
+
+    steps = 7
+    dim = 5
+    gen = torch.Generator().manual_seed(20260324)
+
+    z_rows = []
+    u_rows = []
+    for _ in range(steps):
+        z = torch.randn(dim, generator=gen, dtype=torch.float64)
+        u = mechanism._solve_correlated_noise(z)
+        z_rows.append(z)
+        u_rows.append(u)
+
+    z_mat = torch.stack(z_rows, dim=0)
+    u_stream = torch.stack(u_rows, dim=0)
+
+    inv_mat = _materialize_lower_toeplitz(inverse_coeffs, n=steps)
+    u_dense = inv_mat @ z_mat
+
+    assert torch.allclose(u_stream, u_dense, atol=1e-10, rtol=1e-8)
+
+
+def test_inverse_band_state_roundtrip_replays_future_sequence() -> None:
+    inverse_coeffs = [1.0, -0.4, 0.09]
+    mech_a = InverseBandNoiseMechanism(inverse_coeffs=inverse_coeffs, z_std=0.0)
+    mech_b = InverseBandNoiseMechanism(inverse_coeffs=inverse_coeffs, z_std=0.0)
+
+    gen = torch.Generator().manual_seed(20260325)
     z_seq = [torch.randn(6, generator=gen, dtype=torch.float64) for _ in range(9)]
 
     for z in z_seq[:4]:

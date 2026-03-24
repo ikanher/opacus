@@ -85,7 +85,12 @@ from opacus.grad_sample import (
     get_gsm_class,
     wrap_model,
 )
-from opacus.optimizers import CorrelatedNoiseMechanism, DPOptimizer, get_optimizer_class
+from opacus.optimizers import (
+    CorrelatedNoiseMechanism,
+    DPOptimizer,
+    InverseBandNoiseMechanism,
+    get_optimizer_class,
+)
 from opacus.schedulers import _GradClipScheduler, _NoiseScheduler
 from opacus.utils.fast_gradient_clipping_utils import DPLossFastGradientClipping
 from opacus.validators.module_validator import ModuleValidator
@@ -708,6 +713,28 @@ class PrivacyEngine:
 
         state = config.mechanism_state
         mechanism_name = config.mechanism
+        z_std = state.get("z_std")
+        if z_std is None:
+            raise ValueError(
+                f"{mechanism_name} mechanism requires `mechanism_state['z_std']`"
+            )
+
+        if mechanism_name == "bisr":
+            inverse_coeffs = state.get("bisr_inv_coeffs")
+            if isinstance(inverse_coeffs, (list, tuple)) and len(inverse_coeffs) > 0:
+                return InverseBandNoiseMechanism(
+                    inverse_coeffs=inverse_coeffs,
+                    z_std=float(z_std),
+                )
+
+        if mechanism_name == "bandinvmf":
+            inverse_coeffs = state.get("bandinvmf_inv_coeffs")
+            if isinstance(inverse_coeffs, (list, tuple)) and len(inverse_coeffs) > 0:
+                return InverseBandNoiseMechanism(
+                    inverse_coeffs=inverse_coeffs,
+                    z_std=float(z_std),
+                )
+
         coeffs = state.get("coeffs")
         if coeffs is None:
             raise ValueError(
@@ -716,12 +743,6 @@ class PrivacyEngine:
 
         if not isinstance(coeffs, (list, tuple)):
             raise ValueError("`mechanism_state['coeffs']` must be a list or tuple")
-
-        z_std = state.get("z_std")
-        if z_std is None:
-            raise ValueError(
-                f"{mechanism_name} mechanism requires `mechanism_state['z_std']`"
-            )
 
         return CorrelatedNoiseMechanism(coeffs=coeffs, z_std=float(z_std))
 

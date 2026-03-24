@@ -10,7 +10,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
-from opacus.optimizers import CorrelatedNoiseMechanism
+from opacus.optimizers import CorrelatedNoiseMechanism, InverseBandNoiseMechanism
 
 import opacus.privacy_engine as pe_mod
 
@@ -112,7 +112,7 @@ def test_contract_bisr_fixed_runtime_calibration_tracks_extreme_noise_range(monk
                 mechanism_state={"bsr_bands": 8},
             ),
         )
-        assert isinstance(dp_optimizer.noise_mechanism, CorrelatedNoiseMechanism)
+        assert isinstance(dp_optimizer.noise_mechanism, InverseBandNoiseMechanism)
         z_stds.append(float(dp_optimizer.noise_mechanism.z_std))
 
     assert len(captured) == 5
@@ -221,7 +221,7 @@ def test_contract_bisr_make_private_with_epsilon_accepts_cyclic_poisson(monkeypa
         ),
     )
 
-    assert isinstance(dp_optimizer.noise_mechanism, CorrelatedNoiseMechanism)
+    assert isinstance(dp_optimizer.noise_mechanism, InverseBandNoiseMechanism)
     assert float(captured["bsr_sensitivity_scale"]) > 0.0
     assert captured.get("bsr_mf_sensitivity") is None
     assert float(pe.noise_mechanism_config.mechanism_state["bsr_sensitivity_scale"]) > 0.0

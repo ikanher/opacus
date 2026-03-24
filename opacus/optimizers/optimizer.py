@@ -542,6 +542,90 @@ class CorrelatedNoiseMechanism(NoiseMechanism):
         self.last_flat_u = None
 
 
+class InverseBandNoiseMechanism(CorrelatedNoiseMechanism):
+    """
+    Direct inverse-band runtime used by canonical BISR / BandInvMF paths.
+
+    This mechanism stores previous iid Gaussian draws ``z`` and applies the
+    paper recurrence directly:
+
+        u_t = c_0 z_t + c_1 z_{t-1} + ... + c_b z_{t-b}
+    """
+
+    def __init__(
+        self,
+        *,
+        inverse_coeffs: Sequence[float],
+        z_std: float,
+        debug_non_finite: bool = False,
+    ):
+        super().__init__(
+            coeffs=inverse_coeffs,
+            z_std=z_std,
+            debug_non_finite=debug_non_finite,
+        )
+
+    @property
+    def inverse_coeffs(self) -> tuple[float, ...]:
+        return self.coeffs
+
+    def _solve_correlated_noise(self, z_flat: torch.Tensor) -> torch.Tensor:
+        self._assert_finite(
+            name="z_flat",
+            tensor=z_flat,
+            step=self.steps_with_noise,
+        )
+        u_flat = self.inverse_coeffs[0] * z_flat
+        max_lag = min(len(self._history), self.bandwidth - 1)
+        for lag in range(1, max_lag + 1):
+            u_flat = u_flat + self.inverse_coeffs[lag] * self._history[lag - 1]
+
+        self._assert_finite(
+            name="u_flat",
+            tensor=u_flat,
+            step=self.steps_with_noise,
+        )
+        if self._history.maxlen:
+            self._history.appendleft(z_flat.detach().clone())
+
+        return u_flat
+
+    def state_dict(self) -> Mapping[str, Any]:
+        return {
+            "inverse_coeffs": self.inverse_coeffs,
+            "coeffs": self.inverse_coeffs,
+            "z_std": self.z_std,
+            "history": [h.detach().clone() for h in self._history],
+            "steps_with_noise": self.steps_with_noise,
+        }
+
+    def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        coeffs = tuple(
+            float(c)
+            for c in state_dict.get(
+                "inverse_coeffs",
+                state_dict.get("coeffs", self.inverse_coeffs),
+            )
+        )
+        z_std = float(state_dict.get("z_std", self.z_std))
+        history = state_dict.get("history", [])
+        steps_with_noise = int(state_dict.get("steps_with_noise", 0))
+
+        if coeffs != self.inverse_coeffs:
+            raise ValueError("cannot load state with mismatched inverse-band coefficients")
+
+        if z_std != self.z_std:
+            raise ValueError("cannot load state with mismatched z_std")
+
+        self._history = deque(maxlen=self.max_state_depth)
+        for h in history:
+            self._history.append(torch.as_tensor(h).detach().clone())
+
+        self.steps_with_noise = steps_with_noise
+        self.last_flat_z = None
+        self.last_flat_u = None
+
+
 class DPOptimizer(Optimizer):
     """
     ``torch.optim.Optimizer`` wrapper that adds additional functionality to clip per
@@ -965,9 +1049,17 @@ class DPOptimizer(Optimizer):
             and not k.startswith("_dp_distributed_")
         }
         self.original_optimizer.load_state_dict(optimizer_state)
-        if isinstance(self.noise_mechanism, CorrelatedNoiseMechanism) and mechanism_state is None:
+        if mechanism_state is None and type(self.noise_mechanism) in (
+            CorrelatedNoiseMechanism,
+            InverseBandNoiseMechanism,
+        ):
+            missing_kind = (
+                "inverse-band"
+                if isinstance(self.noise_mechanism, InverseBandNoiseMechanism)
+                else "correlated"
+            )
             raise ValueError(
-                "missing correlated noise mechanism state in optimizer checkpoint"
+                f"missing {missing_kind} noise mechanism state in optimizer checkpoint"
             )
         if mechanism_state is not None:
             self.noise_mechanism.load_state_dict(mechanism_state)

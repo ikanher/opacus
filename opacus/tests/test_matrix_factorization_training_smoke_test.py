@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
 from opacus.accountants.analysis.bnb import build_bnb_toeplitz_c_matrix_and_contract
-from opacus.optimizers import GaussianNoiseMechanism
+from opacus.optimizers import GaussianNoiseMechanism, InverseBandNoiseMechanism
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -304,6 +304,8 @@ def _run_balls_in_bins_mf_training_smoke_autocoeff(*, mechanism: str, bands: int
     loss.backward()
     dp_optimizer.step()
     assert torch.isfinite(loss)
+    if mechanism in ("bisr", "bandinvmf"):
+        assert isinstance(dp_optimizer.noise_mechanism, InverseBandNoiseMechanism)
 
     eps = pe.get_epsilon(delta=0.2)
     assert eps > 0.0
@@ -393,6 +395,10 @@ def test_bsr_balls_in_bins_training_smoke_loop_autocoeff() -> None:
 
 def test_bisr_balls_in_bins_training_smoke_loop_autocoeff() -> None:
     _run_balls_in_bins_mf_training_smoke_autocoeff(mechanism="bisr", bands=2)
+
+
+def test_bandinvmf_balls_in_bins_training_smoke_loop_autocoeff() -> None:
+    _run_balls_in_bins_mf_training_smoke_autocoeff(mechanism="bandinvmf", bands=2)
 
 
 def test_gaussian_balls_in_bins_training_smoke_loop() -> None:

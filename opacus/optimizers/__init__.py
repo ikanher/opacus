@@ -24,6 +24,7 @@ from .optimizer import (
     CorrelatedNoiseMechanism,
     DPOptimizer,
     GaussianNoiseMechanism,
+    InverseBandNoiseMechanism,
     NoiseMechanism,
 )
 from .optimizer_fast_gradient_clipping import DPOptimizerFastGradientClipping
@@ -43,6 +44,7 @@ __all__ = [
     "NoiseMechanism",
     "GaussianNoiseMechanism",
     "CorrelatedNoiseMechanism",
+    "InverseBandNoiseMechanism",
 ]
 
 

@@ -20,7 +20,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
-from opacus.optimizers import CorrelatedNoiseMechanism
+from opacus.optimizers import CorrelatedNoiseMechanism, InverseBandNoiseMechanism
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -125,6 +125,67 @@ def test_missing_correlated_mechanism_state_fails_loudly() -> None:
     _, opt2, _, _ = _make_private(model2, noise_seed=201, mechanism_state=mech_state)
     with pytest.raises(ValueError, match="missing correlated noise mechanism state"):
         opt2.load_state_dict(state)
+
+
+def test_bisr_inverse_band_resume_matches_uninterrupted_next_step() -> None:
+    base = nn.Linear(4, 3)
+    model1 = copy.deepcopy(base)
+    model2 = copy.deepcopy(base)
+
+    def _make_private_bisr(model: nn.Module, *, noise_seed: int):
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=0.05, momentum=0.9, weight_decay=0.9
+        )
+        pe = PrivacyEngine()
+        noise_gen = torch.Generator().manual_seed(noise_seed)
+        private_model, dp_optimizer, private_loader = pe.make_private(
+            module=model,
+            optimizer=optimizer,
+            data_loader=_loader(),
+            noise_multiplier=0.3,
+            max_grad_norm=1.0,
+            poisson_sampling=False,
+            noise_generator=noise_gen,
+            clipping="flat",
+            grad_sample_mode="hooks",
+            total_steps=16,
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bisr",
+                accounting_mode="bsr_accountant",
+                mechanism_state={"bsr_bands": 3},
+            ),
+        )
+        return private_model, dp_optimizer, private_loader, pe
+
+    pmodel1, opt1, loader1, pe1 = _make_private_bisr(model1, noise_seed=1234)
+    pmodel2, opt2, loader2, pe2 = _make_private_bisr(model2, noise_seed=5678)
+    batches1 = list(loader1)
+    batches2 = list(loader2)
+    assert len(batches1) >= 3
+    assert len(batches2) >= 3
+
+    _run_pre_step(pmodel1, opt1, batches1[0])
+    _run_pre_step(pmodel1, opt1, batches1[1])
+
+    with io.BytesIO() as bio:
+        pe1.save_checkpoint(path=bio, module=pmodel1, optimizer=opt1)
+        bio.seek(0)
+        pe2.load_checkpoint(path=bio, module=pmodel2, optimizer=opt2)
+
+    _run_pre_step(pmodel1, opt1, batches1[2])
+    _run_pre_step(pmodel2, opt2, batches2[2])
+
+    grad1 = torch.cat([p.grad.reshape(-1) for p in opt1.params])
+    grad2 = torch.cat([p.grad.reshape(-1) for p in opt2.params])
+    assert torch.allclose(grad1, grad2, atol=1e-7, rtol=1e-6)
+
+    mech1 = opt1.noise_mechanism
+    mech2 = opt2.noise_mechanism
+    assert isinstance(mech1, InverseBandNoiseMechanism)
+    assert isinstance(mech2, InverseBandNoiseMechanism)
+    assert mech1.last_flat_u is not None
+    assert mech2.last_flat_u is not None
+    assert torch.allclose(mech1.last_flat_u, mech2.last_flat_u, atol=1e-7, rtol=1e-6)
 
 
 def test_checkpoint_load_preserves_bnb_report_and_sampling_metadata() -> None:
