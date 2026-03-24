@@ -249,11 +249,14 @@ def test_distributed_torch_sampler_shards_batches_across_ranks(monkeypatch) -> N
         total_steps=8,
     )
 
+    assert loader0.batch_size == 4
+    assert loader1.batch_size == 4
+
     b0 = _take_first_index_batches(loader0, num_batches=3)
     b1 = _take_first_index_batches(loader1, num_batches=3)
     assert b0 != b1
     assert len(set(b0[0]).intersection(set(b1[0]))) == 0
-    assert len(set(b0[0]).union(set(b1[0]))) == 16
+    assert len(set(b0[0]).union(set(b1[0]))) == 8
 
 
 def test_distributed_cyclic_poisson_shards_batches_across_ranks(monkeypatch) -> None:

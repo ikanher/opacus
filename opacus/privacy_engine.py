@@ -194,7 +194,44 @@ class PrivacyEngine:
         if bands < 1:
             raise ValueError(f"{mechanism_config.mechanism} bands must be >= 1")
 
-        bins = kwargs.get("bnb_b", metadata.get("bins", state.get("bnb_cycle_length", state.get("bnb_bins"))))
+        metadata_bins = metadata.get("bins", metadata.get("b"))
+        explicit_cycle_length = kwargs.get("bnb_cycle_length", state.get("bnb_cycle_length"))
+        legacy_bins = state.get("bnb_bins")
+        explicit_bins = kwargs.get("bnb_b")
+
+        if explicit_cycle_length is not None:
+            explicit_cycle_length = int(explicit_cycle_length)
+            if explicit_cycle_length < 1:
+                raise ValueError("balls-in-bins cycle length must be >= 1")
+
+            if metadata_bins is not None and int(metadata_bins) != explicit_cycle_length:
+                raise ValueError(
+                    "conflicting canonical inputs: `bnb_cycle_length` must match "
+                    "sampling_semantics privacy_metadata['bins']"
+                )
+
+            if explicit_bins is not None and int(explicit_bins) != explicit_cycle_length:
+                raise ValueError(
+                    "conflicting canonical inputs: `bnb_cycle_length` must match "
+                    "`bnb_b`"
+                )
+
+            if legacy_bins is not None and int(legacy_bins) != explicit_cycle_length:
+                raise ValueError(
+                    "conflicting canonical inputs: `bnb_cycle_length` must match "
+                    "mechanism_state['bnb_bins']"
+                )
+
+        bins = kwargs.get(
+            "bnb_b",
+            metadata_bins
+            if metadata_bins is not None
+            else (
+                explicit_cycle_length
+                if explicit_cycle_length is not None
+                else state.get("bnb_cycle_length", state.get("bnb_bins"))
+            ),
+        )
         if bins is None:
             raise ValueError(
                 "balls-in-bins MF state generation requires `bnb_b` or "
@@ -300,7 +337,35 @@ class PrivacyEngine:
         state = copy.deepcopy(mechanism_config.mechanism_state)
         state["_noise_mechanism"] = "gaussian"
         metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
-        bins = metadata.get("bins", metadata.get("b", state.get("bnb_cycle_length", state.get("bnb_bins"))))
+        metadata_bins = metadata.get("bins", metadata.get("b"))
+        explicit_cycle_length = kwargs.get("bnb_cycle_length", state.get("bnb_cycle_length"))
+        legacy_bins = state.get("bnb_bins")
+        if explicit_cycle_length is not None:
+            explicit_cycle_length = int(explicit_cycle_length)
+            if explicit_cycle_length < 1:
+                raise ValueError("balls-in-bins cycle length must be >= 1")
+
+            if metadata_bins is not None and int(metadata_bins) != explicit_cycle_length:
+                raise ValueError(
+                    "conflicting canonical inputs: `bnb_cycle_length` must match "
+                    "sampling_semantics privacy_metadata['bins']"
+                )
+
+            if legacy_bins is not None and int(legacy_bins) != explicit_cycle_length:
+                raise ValueError(
+                    "conflicting canonical inputs: `bnb_cycle_length` must match "
+                    "mechanism_state['bnb_bins']"
+                )
+
+        bins = (
+            metadata_bins
+            if metadata_bins is not None
+            else (
+                explicit_cycle_length
+                if explicit_cycle_length is not None
+                else state.get("bnb_cycle_length", state.get("bnb_bins"))
+            )
+        )
         if bins is None:
             raise ValueError(
                 "gaussian balls_in_bins accounting requires privacy_metadata['bins']"
@@ -759,11 +824,15 @@ class PrivacyEngine:
         )
 
     def _rebuild_data_loader_with_sampler(
-        self, data_loader: DataLoader, sampler
+        self,
+        data_loader: DataLoader,
+        sampler,
+        *,
+        batch_size: Optional[int] = None,
     ) -> DataLoader:
         return DataLoader(
             dataset=data_loader.dataset,
-            batch_size=data_loader.batch_size,
+            batch_size=data_loader.batch_size if batch_size is None else int(batch_size),
             sampler=sampler,
             drop_last=data_loader.drop_last,
             num_workers=data_loader.num_workers,
@@ -1776,7 +1845,17 @@ class PrivacyEngine:
             )
         ):
             sampler = self._build_distributed_torch_sampler(data_loader=data_loader)
-            return self._rebuild_data_loader_with_sampler(data_loader, sampler)
+            world_size = torch.distributed.get_world_size()
+            local_batch_size = int(data_loader.batch_size / world_size)
+            if local_batch_size <= 0:
+                raise ValueError(
+                    "distributed torch_sampler requires batch_size >= world_size"
+                )
+            return self._rebuild_data_loader_with_sampler(
+                data_loader,
+                sampler,
+                batch_size=local_batch_size,
+            )
 
         if poisson_sampling:
             return DPDataLoader.from_data_loader(
@@ -2695,6 +2774,7 @@ class PrivacyEngine:
             total_steps=total_steps,
             noise_mechanism_config=mechanism_config,
             sampling_semantics=local_sampling_semantics,
+            **kwargs,
         )
 
     def get_epsilon(self, delta, **kwargs):
