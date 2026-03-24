@@ -8,6 +8,10 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from opacus import NoiseMechanismConfig, PrivacyEngine
+from opacus.accountants.analysis.bisr import (
+    derive_bisr_runtime_coeffs_from_inverse_coeffs,
+    generate_bisr_coeffs_from_sgd_workload,
+)
 from opacus.accountants.bsr import resolve_bisr_mf_sensitivity_for_fixed_batch
 from opacus.accountants.utils import get_noise_multiplier
 from opacus.optimizers import CorrelatedNoiseMechanism
@@ -97,6 +101,46 @@ def test_make_private_with_epsilon_bisr_fixed_batch_resolves_mf_sensitivity(monk
     assert float(captured["bsr_mf_sensitivity"]) > 0.0
     assert pe.noise_mechanism_config.mechanism_state["coeff_source"] == "analytical_auto"
     assert float(pe.noise_mechanism_config.mechanism_state["bsr_mf_sensitivity"]) > 0.0
+
+
+def test_make_private_with_epsilon_bisr_auto_state_derives_runtime_coeffs_from_inverse(monkeypatch) -> None:
+    monkeypatch.setattr(pe_mod, "get_noise_multiplier", lambda **kwargs: 1.0)
+
+    pe = PrivacyEngine()
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9, weight_decay=0.9999)
+
+    pe.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(batch_size=8),
+        target_epsilon=8.0,
+        target_delta=1e-5,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping="flat",
+        grad_sample_mode="hooks",
+        total_steps=10,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bisr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"bsr_bands": 4},
+        ),
+    )
+
+    state = pe.noise_mechanism_config.mechanism_state
+    expected_inv = generate_bisr_coeffs_from_sgd_workload(
+        bands=4,
+        momentum=0.9,
+        weight_decay=0.9999,
+    )
+    expected_runtime = derive_bisr_runtime_coeffs_from_inverse_coeffs(
+        coeffs=expected_inv,
+    )
+
+    assert state["bisr_inv_coeffs"] == pytest.approx(expected_inv, rel=0.0, abs=1e-12)
+    assert state["coeffs"] == pytest.approx(expected_runtime, rel=0.0, abs=1e-12)
+    assert state["coeffs"] != pytest.approx(state["bisr_inv_coeffs"], rel=0.0, abs=1e-12)
 
 
 def test_bisr_fixed_batch_noise_search_accepts_explicit_mf_sensitivity() -> None:

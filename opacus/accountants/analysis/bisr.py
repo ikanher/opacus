@@ -161,6 +161,45 @@ def derive_bisr_factor_coeffs_from_inverse_coeffs(
     return factor_coeffs
 
 
+def derive_bisr_runtime_coeffs_from_inverse_coeffs(
+    *,
+    coeffs: Iterable[float],
+) -> list[float]:
+    """
+    Recover runtime Toeplitz coefficients from BISR inverse-side coefficients.
+
+    ``CorrelatedNoiseMechanism`` consumes the lower-triangular Toeplitz
+    operator used in the online solve ``C u = z``. BISR analytics, however,
+    expose the inverse-side banded Toeplitz coefficients of ``C^{-1}``.
+    Since the inverse of a lower-triangular Toeplitz matrix is again
+    lower-triangular Toeplitz, we can recover the first runtime coefficients
+    via the standard triangular inverse recurrence.
+    """
+    coeff_list = [float(c) for c in coeffs]
+    if len(coeff_list) == 0:
+        raise ValueError("coeffs must be non-empty")
+
+    if not all(math.isfinite(c) for c in coeff_list):
+        raise ValueError("coeffs must be finite")
+
+    if coeff_list[0] <= 0.0:
+        raise ValueError("coeffs[0] must be > 0")
+
+    runtime_coeffs = [0.0] * len(coeff_list)
+    runtime_coeffs[0] = 1.0 / coeff_list[0]
+    for idx in range(1, len(coeff_list)):
+        acc = 0.0
+        for lag in range(1, idx + 1):
+            acc += runtime_coeffs[idx - lag] * coeff_list[lag]
+
+        runtime_coeffs[idx] = -acc / coeff_list[0]
+
+    if not all(math.isfinite(c) for c in runtime_coeffs):
+        raise ValueError("derived runtime coefficients must be finite")
+
+    return runtime_coeffs
+
+
 def compute_bisr_fixed_batch_sensitivity_from_inverse_coeffs(
     *,
     coeffs: Iterable[float],

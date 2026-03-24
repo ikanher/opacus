@@ -59,6 +59,7 @@ from opacus.accountants.analysis.bandmf import (
 )
 from opacus.accountants.analysis.bisr import (
     derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs,
+    derive_bisr_runtime_coeffs_from_inverse_coeffs,
     generate_bisr_coeffs_from_sgd_workload,
 )
 from opacus.accountants.analysis.bandinvmf import (
@@ -241,15 +242,30 @@ class PrivacyEngine:
         if bins < 1:
             raise ValueError("balls-in-bins bins must be >= 1")
 
-        if not (isinstance(coeffs, (list, tuple)) and len(coeffs) > 0):
+        bisr_inv_coeffs = state.get("bisr_inv_coeffs")
+        if (
+            mechanism_config.mechanism == "bisr"
+            and isinstance(bisr_inv_coeffs, (list, tuple))
+            and len(bisr_inv_coeffs) > 0
+            and not (isinstance(coeffs, (list, tuple)) and len(coeffs) > 0)
+        ):
+            state["bisr_inv_coeffs"] = [float(c) for c in bisr_inv_coeffs]
+            state["coeffs"] = derive_bisr_runtime_coeffs_from_inverse_coeffs(
+                coeffs=state["bisr_inv_coeffs"],
+            )
+            state.setdefault("coeff_source", "analytical_inv_explicit")
+        elif not (isinstance(coeffs, (list, tuple)) and len(coeffs) > 0):
             momentum, weight_decay = PrivacyEngine._resolve_uniform_sgd_workload_from_optimizer(
                 optimizer=optimizer
             )
             if mechanism_config.mechanism == "bisr":
-                state["coeffs"] = generate_bisr_coeffs_from_sgd_workload(
+                state["bisr_inv_coeffs"] = generate_bisr_coeffs_from_sgd_workload(
                     bands=bands,
                     momentum=momentum,
                     weight_decay=weight_decay,
+                )
+                state["coeffs"] = derive_bisr_runtime_coeffs_from_inverse_coeffs(
+                    coeffs=state["bisr_inv_coeffs"],
                 )
             elif mechanism_config.mechanism == "bandmf":
                 steps_hint = kwargs.get(
@@ -284,7 +300,7 @@ class PrivacyEngine:
         elif mechanism_config.mechanism == "bisr":
             accountant_coeffs = (
                 derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs(
-                    coeffs=list(state["coeffs"]),
+                    coeffs=list(state.get("bisr_inv_coeffs", state["coeffs"])),
                     steps=int(horizon),
                 )
             )

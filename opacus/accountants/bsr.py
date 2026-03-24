@@ -23,6 +23,7 @@ from torch import optim
 from opacus.accountants.analysis.bisr import (
     compute_bisr_fixed_batch_sensitivity_from_inverse_coeffs,
     compute_bisr_kappa_from_coeffs,
+    derive_bisr_runtime_coeffs_from_inverse_coeffs,
     generate_bisr_coeffs_from_sgd_workload,
 )
 from opacus.accountants.analysis.bsr import (
@@ -86,6 +87,22 @@ def ensure_bsr_family_cyclic_coeffs(
     state = copy.deepcopy(mechanism_config.mechanism_state)
     state["_noise_mechanism"] = mechanism_config.mechanism
     coeffs = state.get("coeffs")
+    inv_coeffs = state.get("bisr_inv_coeffs")
+
+    if mechanism_config.mechanism == "bisr":
+        if isinstance(inv_coeffs, (list, tuple)) and len(inv_coeffs) > 0:
+            state["bisr_inv_coeffs"] = [float(c) for c in inv_coeffs]
+            if not (isinstance(coeffs, (list, tuple)) and len(coeffs) > 0):
+                state["coeffs"] = derive_bisr_runtime_coeffs_from_inverse_coeffs(
+                    coeffs=state["bisr_inv_coeffs"],
+                )
+
+            return NoiseMechanismConfig(
+                mechanism=mechanism_config.mechanism,
+                accounting_mode=mechanism_config.accounting_mode,
+                mechanism_state=state,
+            )
+
     if isinstance(coeffs, (list, tuple)) and len(coeffs) > 0:
         return NoiseMechanismConfig(
             mechanism=mechanism_config.mechanism,
@@ -134,10 +151,13 @@ def ensure_bsr_family_cyclic_coeffs(
         optimizer=optimizer
     )
     if mechanism_config.mechanism == "bisr":
-        state["coeffs"] = generate_bisr_coeffs_from_sgd_workload(
+        state["bisr_inv_coeffs"] = generate_bisr_coeffs_from_sgd_workload(
             bands=bands,
             momentum=momentum,
             weight_decay=weight_decay,
+        )
+        state["coeffs"] = derive_bisr_runtime_coeffs_from_inverse_coeffs(
+            coeffs=state["bisr_inv_coeffs"],
         )
     else:
         state["coeffs"] = generate_bsr_coeffs_from_sgd_workload(
@@ -167,6 +187,19 @@ def ensure_bsr_family_fixed_analytical_coeffs(
 
     state = copy.deepcopy(mechanism_config.mechanism_state)
     coeffs = state.get("coeffs")
+    inv_coeffs = state.get("bisr_inv_coeffs")
+    if mechanism_config.mechanism == "bisr":
+        if isinstance(inv_coeffs, (list, tuple)) and len(inv_coeffs) > 0:
+            state["bisr_inv_coeffs"] = [float(c) for c in inv_coeffs]
+            if not (isinstance(coeffs, (list, tuple)) and len(coeffs) > 0):
+                state["coeffs"] = derive_bisr_runtime_coeffs_from_inverse_coeffs(
+                    coeffs=state["bisr_inv_coeffs"],
+                )
+            return NoiseMechanismConfig(
+                mechanism=mechanism_config.mechanism,
+                accounting_mode=mechanism_config.accounting_mode,
+                mechanism_state=state,
+            )
     if isinstance(coeffs, (list, tuple)) and len(coeffs) > 0:
         return mechanism_config
 
@@ -204,10 +237,13 @@ def ensure_bsr_family_fixed_analytical_coeffs(
         optimizer=optimizer
     )
     if mechanism_config.mechanism == "bisr":
-        state["coeffs"] = generate_bisr_coeffs_from_sgd_workload(
+        state["bisr_inv_coeffs"] = generate_bisr_coeffs_from_sgd_workload(
             bands=bands,
             momentum=momentum,
             weight_decay=weight_decay,
+        )
+        state["coeffs"] = derive_bisr_runtime_coeffs_from_inverse_coeffs(
+            coeffs=state["bisr_inv_coeffs"],
         )
     else:
         state["coeffs"] = generate_bsr_coeffs_from_sgd_workload(
@@ -245,12 +281,9 @@ def resolve_bisr_sensitivity_scale_for_cyclic(
             raise ValueError("bsr_sensitivity_scale must be finite and > 0")
         return float(sensitivity_scale)
 
-    bands = kwargs.get(
-        "bsr_bands",
-        metadata.get("bands", mechanism_state.get("bsr_bands")),
-    )
+    bands = kwargs.get("bsr_bands", metadata.get("bands", mechanism_state.get("bsr_bands")))
     if bands is None:
-        coeffs = mechanism_state.get("coeffs")
+        coeffs = mechanism_state.get("bisr_inv_coeffs", mechanism_state.get("coeffs"))
         bands = len(coeffs) if coeffs is not None else None
 
     if bands is None:
@@ -263,11 +296,11 @@ def resolve_bisr_sensitivity_scale_for_cyclic(
     if bands <= 0:
         raise ValueError("bands must be > 0")
 
-    coeffs = mechanism_state.get("coeffs")
+    coeffs = mechanism_state.get("bisr_inv_coeffs", mechanism_state.get("coeffs"))
     if coeffs is None:
         raise ValueError(
-            "cyclic-poisson bisr accounting requires either `bsr_sensitivity_scale` "
-            "or `mechanism_state['coeffs']`"
+            "cyclic-poisson bisr accounting requires either `bsr_sensitivity_scale`, "
+            "`mechanism_state['bisr_inv_coeffs']`, or legacy `mechanism_state['coeffs']`"
         )
 
     scale_steps = int(
@@ -324,11 +357,11 @@ def resolve_bisr_mf_sensitivity_for_fixed_batch(
             raise ValueError("bsr_mf_sensitivity must be finite and > 0")
         return value
 
-    coeffs = mechanism_state.get("coeffs")
+    coeffs = mechanism_state.get("bisr_inv_coeffs", mechanism_state.get("coeffs"))
     if coeffs is None:
         raise ValueError(
-            "bisr fixed-batch accounting requires either `bsr_mf_sensitivity` "
-            "or `mechanism_state['coeffs']`"
+            "bisr fixed-batch accounting requires either `bsr_mf_sensitivity`, "
+            "`mechanism_state['bisr_inv_coeffs']`, or legacy `mechanism_state['coeffs']`"
         )
 
     sensitivity_steps = int(

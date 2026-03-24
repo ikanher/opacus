@@ -50,6 +50,7 @@ from opacus.accountants.analysis.bandinvmf import (
 )
 from opacus.accountants.analysis.bisr import (
     derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs,
+    derive_bisr_runtime_coeffs_from_inverse_coeffs,
     generate_bisr_coeffs_from_sgd_workload,
 )
 from opacus.accountants.analysis.bnb import (
@@ -1261,6 +1262,25 @@ class AccountingTest(unittest.TestCase):
 
         self.assertEqual(state["coeff_source"], "analytical_auto")
         self.assertEqual(state["bnb_accountant_coeffs_source"], "runtime_c_col")
+        self.assertTrue(len(state["bnb_accountant_coeffs"]) > 0)
+        self.assertIn("bnb_c_matrix", state)
+        self.assertIn("bnb_c_matrix_contract", state)
+
+    def test_bisr_balls_in_bins_make_private_resolves_runtime_and_inverse_state_from_auto_coeffs(self) -> None:
+        state = _resolve_bnb_state_via_make_private(
+            mechanism="bisr",
+            mechanism_state={"bsr_bands": 2},
+        )
+
+        self.assertEqual(state["coeff_source"], "analytical_auto")
+        self.assertIn("bisr_inv_coeffs", state)
+        self.assertEqual(
+            state["coeffs"],
+            derive_bisr_runtime_coeffs_from_inverse_coeffs(
+                coeffs=state["bisr_inv_coeffs"],
+            ),
+        )
+        self.assertEqual(state["bnb_accountant_coeffs_source"], "abs_factor_c_col")
         self.assertTrue(len(state["bnb_accountant_coeffs"]) > 0)
         self.assertIn("bnb_c_matrix", state)
         self.assertIn("bnb_c_matrix_contract", state)
