@@ -26,6 +26,7 @@ Experiment-surface note:
 """
 
 import math
+import warnings
 from typing import Iterable
 
 import numpy as np
@@ -408,6 +409,8 @@ def optimize_bandinvmf_inv_coeffs_for_sgd_workload(
         dtype=dtype,
     )
     k_eff = min(max_participations, (steps - 1) // min_separation + 1)
+    best_opt = init.copy()
+    best_obj = init_obj
 
     def _loss(v: torch.Tensor) -> torch.Tensor:
         inv = torch.cat(
@@ -463,8 +466,28 @@ def optimize_bandinvmf_inv_coeffs_for_sgd_workload(
         return loss
 
     def closure() -> torch.Tensor:
+        nonlocal best_obj, best_opt
         optimizer.zero_grad(set_to_none=True)
         loss = _loss(params)
+        with torch.no_grad():
+            candidate = np.concatenate(
+                ([1.0], np.asarray(params.detach().cpu().numpy(), dtype=np.float64))
+            )
+        if np.all(np.isfinite(candidate)):
+            try:
+                candidate_obj = compute_bandinvmf_objective_from_inv_coeffs(
+                    inv_coeffs=candidate.tolist(),
+                    steps=steps,
+                    max_participations=max_participations,
+                    min_separation=min_separation,
+                    momentum=beta,
+                    weight_decay=alpha,
+                )
+            except (FloatingPointError, OverflowError, ValueError):
+                candidate_obj = math.inf
+            if math.isfinite(candidate_obj) and candidate_obj < best_obj - 1e-12:
+                best_obj = candidate_obj
+                best_opt = candidate
         loss.backward()
         return loss
 
@@ -488,14 +511,42 @@ def optimize_bandinvmf_inv_coeffs_for_sgd_workload(
         opt_obj = math.inf
 
     if not np.all(np.isfinite(opt)) or not math.isfinite(opt_obj):
+        if np.all(np.isfinite(best_opt)) and math.isfinite(best_obj):
+            if best_obj < init_obj - 1e-12:
+                warnings.warn(
+                    "BandInvMF optimization produced a non-finite final candidate; "
+                    "returning the best earlier finite improving candidate",
+                    UserWarning,
+                )
+            else:
+                warnings.warn(
+                    "BandInvMF optimization produced a non-finite final candidate; "
+                    "returning the finite initialization because no improving finite candidate was found",
+                    UserWarning,
+                )
+            return [float(x) for x in best_opt]
         raise RuntimeError(
             "BandInvMF optimization produced a non-finite final candidate; "
-            "refusing to silently fall back to initialization"
+            "and no finite candidate was found"
         )
     if opt_obj >= init_obj - 1e-12:
+        if np.all(np.isfinite(best_opt)) and math.isfinite(best_obj):
+            if best_obj < init_obj - 1e-12:
+                warnings.warn(
+                    "BandInvMF optimization did not finish with an improved final candidate; "
+                    "returning the best earlier finite improving candidate",
+                    UserWarning,
+                )
+            else:
+                warnings.warn(
+                    "BandInvMF optimization did not improve over initialization; "
+                    "returning the finite initialization",
+                    UserWarning,
+                )
+            return [float(x) for x in best_opt]
         raise RuntimeError(
             "BandInvMF optimization did not improve over initialization; "
-            "refusing to silently fall back to initialization"
+            "and no finite candidate was found"
         )
 
     return [float(x) for x in opt]

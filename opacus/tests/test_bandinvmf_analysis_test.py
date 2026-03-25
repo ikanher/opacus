@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 
 import pytest
+import torch
 
 from opacus.accountants.analysis.bandinvmf import (
     derive_bandinvmf_amplified_accountant_coeffs_from_inv_coeffs,
@@ -119,6 +120,43 @@ def test_bandinvmf_optimization_handles_cifar_like_search_instability() -> None:
     assert math.isfinite(obj)
 
 
+def test_bandinvmf_optimization_handles_pretrained_cifar100_amplified_row() -> None:
+    init = generate_bandinvmf_init_inv_coeffs_from_sgd_workload(
+        bands=5,
+        momentum=0.9,
+        weight_decay=0.9999,
+    )
+    init_obj = compute_bandinvmf_objective_from_inv_coeffs(
+        inv_coeffs=init,
+        steps=784,
+        max_participations=8,
+        min_separation=98,
+        momentum=0.9,
+        weight_decay=0.9999,
+    )
+    kwargs = {
+        "bands": 5,
+        "steps": 784,
+        "max_participations": 8,
+        "min_separation": 98,
+        "momentum": 0.9,
+        "weight_decay": 0.9999,
+        "optimizer_steps": 20,
+    }
+    coeffs = optimize_bandinvmf_inv_coeffs_for_sgd_workload(**kwargs)
+    obj = compute_bandinvmf_objective_from_inv_coeffs(
+        inv_coeffs=coeffs,
+        steps=kwargs["steps"],
+        max_participations=kwargs["max_participations"],
+        min_separation=kwargs["min_separation"],
+        momentum=kwargs["momentum"],
+        weight_decay=kwargs["weight_decay"],
+    )
+    assert all(math.isfinite(c) for c in coeffs)
+    assert math.isfinite(obj)
+    assert obj <= init_obj + 1e-10
+
+
 def test_bandinvmf_fixed_batch_paper_sensitivity_matches_bisr_for_init() -> None:
     coeffs = generate_bandinvmf_init_inv_coeffs_from_sgd_workload(
         bands=4,
@@ -182,16 +220,96 @@ def test_bandinvmf_optimization_raises_when_final_candidate_does_not_improve(mon
         _flat_objective,
     )
 
-    with pytest.raises(RuntimeError, match="did not improve over initialization"):
-        optimize_bandinvmf_inv_coeffs_for_sgd_workload(
+    coeffs = optimize_bandinvmf_inv_coeffs_for_sgd_workload(
+        bands=4,
+        steps=12,
+        max_participations=3,
+        min_separation=2,
+        momentum=0.3,
+        weight_decay=0.9,
+        optimizer_steps=1,
+    )
+    assert coeffs == pytest.approx(
+        generate_bandinvmf_init_inv_coeffs_from_sgd_workload(
             bands=4,
+            momentum=0.3,
+            weight_decay=0.9,
+        ),
+        rel=0.0,
+        abs=1e-12,
+    )
+
+
+def test_bandinvmf_optimization_recovers_best_finite_candidate_when_final_candidate_is_nonfinite(
+    monkeypatch,
+) -> None:
+    original_compute = compute_bandinvmf_objective_from_inv_coeffs
+    state = {"calls": 0}
+
+    def _scripted_objective(*, inv_coeffs, steps, max_participations, min_separation, momentum, weight_decay):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            return 10.0
+        if state["calls"] == 2:
+            return 5.0
+        raise ValueError("synthetic non-finite final candidate")
+
+    class _DummyLBFGS:
+        def __init__(self, params, max_iter, line_search_fn):
+            del max_iter, line_search_fn
+            self._params = params
+
+        def zero_grad(self, set_to_none=True):
+            del set_to_none
+            for param in self._params:
+                param.grad = None
+
+        def step(self, closure):
+            closure()
+            with torch.no_grad():
+                self._params[0].copy_(torch.tensor([-0.5, 0.0, 0.0], dtype=self._params[0].dtype))
+            closure()
+            with torch.no_grad():
+                self._params[0].fill_(float("nan"))
+
+    monkeypatch.setattr(
+        "opacus.accountants.analysis.bandinvmf.compute_bandinvmf_objective_from_inv_coeffs",
+        _scripted_objective,
+    )
+    monkeypatch.setattr(
+        "opacus.accountants.analysis.bandinvmf.torch.optim.LBFGS",
+        _DummyLBFGS,
+    )
+
+    coeffs = optimize_bandinvmf_inv_coeffs_for_sgd_workload(
+        bands=4,
+        steps=12,
+        max_participations=3,
+        min_separation=2,
+        momentum=0.3,
+        weight_decay=0.9,
+        optimizer_steps=2,
+    )
+
+    assert coeffs == pytest.approx(
+        generate_bandinvmf_init_inv_coeffs_from_sgd_workload(
+            bands=4,
+            momentum=0.3,
+            weight_decay=0.9,
+        ),
+        rel=0.0,
+        abs=1e-12,
+    )
+    assert math.isfinite(
+        original_compute(
+            inv_coeffs=coeffs,
             steps=12,
             max_participations=3,
             min_separation=2,
             momentum=0.3,
             weight_decay=0.9,
-            optimizer_steps=1,
         )
+    )
 
 
 @pytest.mark.parametrize(
