@@ -210,6 +210,26 @@ def test_bandinvmf_factor_side_fixed_batch_sensitivity_is_distinct_from_runtime_
     assert factor_side_sensitivity > runtime_sensitivity
 
 
+def test_bandinvmf_fixed_batch_sensitivity_handles_pretrained_sun397_nonamplified_row() -> None:
+    inv_coeffs = optimize_bandinvmf_inv_coeffs_for_sgd_workload(
+        bands=5,
+        steps=1192,
+        max_participations=8,
+        min_separation=149,
+        momentum=0.9,
+        weight_decay=0.9999,
+        optimizer_steps=20,
+    )
+    sensitivity = compute_bandinvmf_fixed_batch_sensitivity_from_inv_coeffs(
+        inv_coeffs=inv_coeffs,
+        steps=1192,
+        max_participations=8,
+        min_separation=149,
+    )
+    assert math.isfinite(sensitivity)
+    assert sensitivity > 0.0
+
+
 def test_bandinvmf_optimization_raises_when_final_candidate_does_not_improve(monkeypatch) -> None:
     def _flat_objective(*, inv_coeffs, steps, max_participations, min_separation, momentum, weight_decay):
         del inv_coeffs, steps, max_participations, min_separation, momentum, weight_decay

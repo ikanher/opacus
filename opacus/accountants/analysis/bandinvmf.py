@@ -190,9 +190,10 @@ def compute_bandinvmf_fixed_batch_sensitivity_from_inv_coeffs(
         inv_coeffs=inv_coeffs,
         steps=steps,
     )
+    factor_envelope = _decreasing_envelope(np.maximum(np.asarray(factor_coeffs, dtype=np.float64), 0.0))
     return float(
         compute_bsr_mf_sensitivity_from_coeffs(
-            coeffs=factor_coeffs,
+            coeffs=factor_envelope.tolist(),
             steps=steps,
             max_participations=max_participations,
             min_separation=min_separation,
