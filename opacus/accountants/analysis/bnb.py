@@ -979,6 +979,21 @@ def _resolve_bnb_backend_and_device(
     return "cpu", torch.device("cpu")
 
 
+def _make_bnb_broadcast_result_tensor(
+    value: float,
+    *,
+    backend: str,
+    device: str | torch.device | None,
+) -> torch.Tensor:
+    resolved_backend, resolved_device = _resolve_bnb_backend_and_device(
+        backend=backend,
+        device=device,
+    )
+    tensor_device = resolved_device if resolved_backend == "cuda" else torch.device("cpu")
+
+    return torch.tensor(float(value), dtype=torch.float64, device=tensor_device)
+
+
 def _resolve_bnb_distributed_mode(
     *,
     distributed_mode: str | None,
@@ -1465,7 +1480,11 @@ def estimate_balls_in_bins_epsilon_monte_carlo(
         distributed_dp_runtime=distributed_dp_runtime,
     )
     if distributed_mode == "chunk_shard" and dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
-        result = torch.tensor(float("nan"), dtype=torch.float64)
+        result = _make_bnb_broadcast_result_tensor(
+            float("nan"),
+            backend=backend,
+            device=device,
+        )
         dist.broadcast(result, src=0)
         return float(result.item())
     positive_epsilon = estimate_epsilon_from_llr_chunks(
@@ -1482,7 +1501,11 @@ def estimate_balls_in_bins_epsilon_monte_carlo(
     )
     epsilon = float(max(float(positive_epsilon), float(negative_epsilon)))
     if distributed_mode == "chunk_shard" and dist.is_available() and dist.is_initialized():
-        result = torch.tensor(epsilon, dtype=torch.float64)
+        result = _make_bnb_broadcast_result_tensor(
+            epsilon,
+            backend=backend,
+            device=device,
+        )
         dist.broadcast(result, src=0)
         return float(result.item())
 
@@ -1552,7 +1575,11 @@ def estimate_balls_in_bins_epsilon_monte_carlo_optimistic(
         and dist.is_initialized()
         and dist.get_rank() != 0
     ):
-        result = torch.tensor(float("nan"), dtype=torch.float64)
+        result = _make_bnb_broadcast_result_tensor(
+            float("nan"),
+            backend=backend,
+            device=device,
+        )
         dist.broadcast(result, src=0)
         return float(result.item())
 
@@ -1570,7 +1597,11 @@ def estimate_balls_in_bins_epsilon_monte_carlo_optimistic(
     )
     epsilon = float(max(float(positive_epsilon), float(negative_epsilon)))
     if distributed_mode == "chunk_shard" and dist.is_available() and dist.is_initialized():
-        result = torch.tensor(epsilon, dtype=torch.float64)
+        result = _make_bnb_broadcast_result_tensor(
+            epsilon,
+            backend=backend,
+            device=device,
+        )
         dist.broadcast(result, src=0)
         return float(result.item())
 

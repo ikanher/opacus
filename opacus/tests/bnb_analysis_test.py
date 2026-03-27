@@ -14,11 +14,13 @@
 # limitations under the License.
 
 import unittest
+from unittest import mock
 
 import torch
 
 from opacus.accountants.analysis.bnb import (
     _assign_bnb_chunk_specs_to_shard,
+    _make_bnb_broadcast_result_tensor,
     _resolve_bnb_distributed_mode,
     BNBCalibrationReport,
     DeltaVerificationResult,
@@ -27,6 +29,7 @@ from opacus.accountants.analysis.bnb import (
     build_bnb_toeplitz_c_matrix_and_contract,
     build_b_min_sep_gaussian_mixture,
     estimate_balls_in_bins_epsilon_monte_carlo,
+    estimate_balls_in_bins_epsilon_monte_carlo_optimistic,
     build_lower_toeplitz_c_matrix_from_coeffs,
     calibrate_sigma_evr_binary_search,
     compute_llr_sample_chunks,
@@ -79,6 +82,40 @@ class BNBAnalysisTest(unittest.TestCase):
         )
         self.assertEqual(shard_0, [chunk_specs[0], chunk_specs[2], chunk_specs[4]])
         self.assertEqual(shard_1, [chunk_specs[1], chunk_specs[3]])
+
+    def test_make_bnb_broadcast_result_tensor_uses_cpu_for_cpu_backend(self) -> None:
+        tensor = _make_bnb_broadcast_result_tensor(
+            1.25,
+            backend="cpu",
+            device="cpu",
+        )
+        self.assertEqual(tensor.device.type, "cpu")
+        self.assertAlmostEqual(float(tensor.item()), 1.25, places=12)
+
+    def test_make_bnb_broadcast_result_tensor_requests_resolved_cuda_device(self) -> None:
+        seen: dict[str, object] = {}
+        orig_tensor = torch.tensor
+
+        def _fake_tensor(*args, **kwargs):
+            seen["device"] = kwargs.get("device")
+            safe_kwargs = dict(kwargs)
+            safe_kwargs.pop("device", None)
+            return orig_tensor(*args, **safe_kwargs)
+
+        with mock.patch(
+            "opacus.accountants.analysis.bnb._resolve_bnb_backend_and_device",
+            return_value=("cuda", torch.device("cuda:7")),
+        ):
+            with mock.patch("opacus.accountants.analysis.bnb.torch.tensor", side_effect=_fake_tensor):
+                tensor = _make_bnb_broadcast_result_tensor(
+                    2.5,
+                    backend="auto",
+                    device=None,
+                )
+
+        self.assertEqual(seen["device"], torch.device("cuda:7"))
+        self.assertEqual(tensor.device.type, "cpu")
+        self.assertAlmostEqual(float(tensor.item()), 2.5, places=12)
 
     def test_build_lower_toeplitz_c_matrix_from_coeffs_expected_entries(self) -> None:
         c = build_lower_toeplitz_c_matrix_from_coeffs(
@@ -799,6 +836,32 @@ class BNBAnalysisTest(unittest.TestCase):
                     torch.as_tensor(cuda_chunk, dtype=torch.float64).cpu(),
                 )
             )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for BnB CUDA parity")
+    def test_estimate_balls_in_bins_epsilon_optimistic_cuda_matches_cpu_tolerant(self) -> None:
+        coeffs = normalize_bnb_accountant_coeffs(coeffs=[1.0, 0.5])
+        kwargs = dict(
+            coeffs=coeffs,
+            cycle_length=3,
+            horizon=6,
+            noise_multiplier=1.6,
+            target_delta=0.2,
+            num_samples=4_000,
+            seed=99,
+            tolerance=1e-4,
+            max_iterations=80,
+            chunk_size=1_000,
+            num_workers=0,
+        )
+        eps_cpu = estimate_balls_in_bins_epsilon_monte_carlo_optimistic(
+            **kwargs,
+            backend="cpu",
+        )
+        eps_cuda = estimate_balls_in_bins_epsilon_monte_carlo_optimistic(
+            **kwargs,
+            backend="cuda",
+        )
+        self.assertLess(abs(float(eps_cpu) - float(eps_cuda)), 0.15)
 
     def test_make_bnb_calibration_report_schema(self) -> None:
         verification = DeltaVerificationResult(
