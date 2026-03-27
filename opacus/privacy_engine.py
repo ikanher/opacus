@@ -2870,6 +2870,13 @@ class PrivacyEngine:
             "ts_unix": round(time.time(), 6),
         }
 
+        bnb_accounting_kwargs = mechanism_state.get("_bnb_accounting_kwargs")
+        if isinstance(bnb_accounting_kwargs, dict):
+            payload["bnb_accounting_kwargs"] = dict(bnb_accounting_kwargs)
+            payload["bnb_calibration_mode"] = bnb_accounting_kwargs.get(
+                "bnb_calibration_mode"
+            )
+
         if mechanism_config is not None:
             if mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf"):
                 payload["mechanism_state_summary"] = self._summarize_bsr_state(
