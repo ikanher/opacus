@@ -69,7 +69,6 @@ from opacus.accountants.analysis.bnb import (
     BNBCalibrationStatus,
     build_bnb_toeplitz_c_matrix_and_contract,
     normalize_bnb_accountant_coeffs,
-    calibrate_b_min_sep_noise_multiplier_monte_carlo,
     describe_bnb_calibration_report,
     make_bnb_calibration_report,
     parse_bnb_calibration_report,
@@ -1581,21 +1580,47 @@ class PrivacyEngine:
             overrides=kwargs,
         )
         t0 = time.perf_counter()
-        noise_multiplier = calibrate_b_min_sep_noise_multiplier_monte_carlo(
-            c_matrix=bnb_c_matrix,
-            bands=int(bnb_bands),
-            cycle_length=int(bnb_cycle_length),
-            target_epsilon=float(target_epsilon),
-            target_delta=float(target_delta),
-            num_samples=int(calibration_cfg["bnb_num_samples"]),
-            seed=int(calibration_cfg["bnb_seed"]),
-            reduce_dimensionality=bool(calibration_cfg["bnb_reduce_dimensionality"]),
-            sigma_low=float(kwargs.get("bnb_sigma_low", 1e-7)),
-            sigma_high=float(kwargs.get("bnb_sigma_high", 100.0)),
-            tolerance=float(calibration_cfg["bnb_tolerance"]),
-            max_iterations=int(calibration_cfg["bnb_max_iterations"]),
-            max_sigma=float(kwargs.get("bnb_max_sigma", 1e6)),
-        )
+        estimator_kwargs = {
+            "mechanism_state": self._annotate_mechanism_state(
+                mechanism=mechanism_config.mechanism,
+                mechanism_state=mechanism_config.mechanism_state,
+            ),
+            "sampling_semantics": sampling_semantics,
+            "bnb_calibration_mode": str(calibration_cfg["bnb_calibration_mode"]),
+            "bnb_num_samples": int(calibration_cfg["bnb_num_samples"]),
+            "bnb_seed": int(calibration_cfg["bnb_seed"]),
+            "bnb_reduce_dimensionality": bool(
+                calibration_cfg["bnb_reduce_dimensionality"]
+            ),
+            "bnb_tolerance": float(calibration_cfg["bnb_tolerance"]),
+            "bnb_max_iterations": int(calibration_cfg["bnb_max_iterations"]),
+            "bnb_chunk_size": calibration_cfg["bnb_chunk_size"],
+            "bnb_num_workers": int(calibration_cfg["bnb_num_workers"]),
+            "bnb_backend": str(calibration_cfg["bnb_backend"]),
+            "bnb_device": calibration_cfg["bnb_device"],
+            "bnb_distributed_mode": str(calibration_cfg["bnb_distributed_mode"]),
+            "bnb_distributed_dp_runtime": bool(
+                calibration_cfg["bnb_distributed_dp_runtime"]
+            ),
+        }
+        if total_steps:
+            noise_multiplier = get_noise_multiplier(
+                target_epsilon=float(target_epsilon),
+                target_delta=float(target_delta),
+                sample_rate=float(sample_rate),
+                steps=int(total_steps),
+                accountant="bnb",
+                **estimator_kwargs,
+            )
+        else:
+            noise_multiplier = get_noise_multiplier(
+                target_epsilon=float(target_epsilon),
+                target_delta=float(target_delta),
+                sample_rate=float(sample_rate),
+                epochs=int(epochs),
+                accountant="bnb",
+                **estimator_kwargs,
+            )
         logger.info(
             "OPACUS_DP_TIMING %s",
             json.dumps(
@@ -1614,6 +1639,13 @@ class PrivacyEngine:
                     "target_epsilon": float(target_epsilon),
                     "target_delta": float(target_delta),
                     "num_samples": int(calibration_cfg["bnb_num_samples"]),
+                    "bnb_backend": str(calibration_cfg["bnb_backend"]),
+                    "bnb_distributed_mode": str(
+                        calibration_cfg["bnb_distributed_mode"]
+                    ),
+                    "bnb_distributed_dp_runtime": bool(
+                        calibration_cfg["bnb_distributed_dp_runtime"]
+                    ),
                 },
                 sort_keys=True,
             ),

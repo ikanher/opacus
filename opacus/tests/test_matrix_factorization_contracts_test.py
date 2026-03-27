@@ -23,6 +23,7 @@ import math
 import pytest
 import torch
 import torch.nn.functional as F
+import opacus.privacy_engine as privacy_engine_mod
 from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
 from opacus.accountants.analysis.bandmf import generate_bandmf_coeffs_from_sgd_workload
 from opacus.accountants.analysis.bsr import generate_bsr_coeffs_from_sgd_workload
@@ -1715,6 +1716,62 @@ def test_make_private_with_epsilon_logs_sample_rate_resolution_context_total_ste
 
     messages = [r.getMessage() for r in caplog.records]
     assert any("bnb init: starting get_noise_multiplier (steps=" in m for m in messages)
+
+
+def test_make_private_with_epsilon_bnb_uses_accountant_get_noise_multiplier_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    pe = PrivacyEngine()
+    captured: dict[str, object] = {}
+
+    def wrapped_get_noise_multiplier(**kwargs):
+        captured.update(copy.deepcopy(kwargs))
+        return 1.23
+
+    monkeypatch.setattr(privacy_engine_mod, "get_noise_multiplier", wrapped_get_noise_multiplier)
+
+    _, dp_optimizer, _ = pe.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        target_epsilon=0.5,
+        target_delta=0.2,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        total_steps=9,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="gaussian",
+            accounting_mode="bnb_accountant",
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 5},
+        ),
+        bnb_calibration_mode="optimistic",
+        bnb_num_samples=12345,
+        bnb_chunk_size=111,
+        bnb_num_workers=7,
+        bnb_backend="cuda",
+        bnb_device="cuda",
+        bnb_distributed_mode="chunk_shard",
+        bnb_distributed_dp_runtime=True,
+    )
+
+    assert float(dp_optimizer.noise_multiplier) == pytest.approx(1.23)
+    assert captured["accountant"] == "bnb"
+    assert captured["steps"] == 9
+    assert captured["bnb_calibration_mode"] == "optimistic"
+    assert captured["bnb_num_samples"] == 12345
+    assert captured["bnb_chunk_size"] == 111
+    assert captured["bnb_num_workers"] == 7
+    assert captured["bnb_backend"] == "cuda"
+    assert captured["bnb_device"] == "cuda"
+    assert captured["bnb_distributed_mode"] == "chunk_shard"
+    assert captured["bnb_distributed_dp_runtime"] is True
+    assert captured["sampling_semantics"].sampling_mode == "balls_in_bins"
+    assert captured["mechanism_state"]["bnb_c_matrix_contract"]["sampling_mode"] == "b_min_sep"
 
 
 def test_make_private_with_epsilon_epochs_uses_balls_in_bins_rate() -> None:
