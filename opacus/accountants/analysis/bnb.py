@@ -48,7 +48,10 @@ orchestration live in `opacus.opacus.accountants.bnb`.
 
 from dataclasses import dataclass
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import math
+import os
+import time
 from typing import Any, Dict, Sequence
 
 import numpy as np
@@ -78,6 +81,28 @@ _BNB_CALIBRATION_DEFAULTS: Dict[str, Any] = {
     "bnb_distributed_mode": "none",
     "bnb_distributed_dp_runtime": False,
 }
+
+
+def _timing_enabled() -> bool:
+    return os.getenv("DEBUG_TIMING", "").strip().lower() not in ("", "0", "false", "no")
+
+
+def _debug_timing(message: str) -> None:
+    if _timing_enabled():
+        print(f"[opacus.bnb_analysis] [timing] {message}", flush=True)
+
+
+@contextmanager
+def _timed(label: str):
+    if not _timing_enabled():
+        yield
+        return
+    start = time.perf_counter()
+    _debug_timing(f"start {label}")
+    try:
+        yield
+    finally:
+        _debug_timing(f"done {label} elapsed={time.perf_counter() - start:.3f}s")
 
 
 def normalize_bnb_accountant_coeffs(
@@ -1331,24 +1356,35 @@ def sample_balls_in_bins_llr_chunks(
     distributed_mode: str | None = "none",
     distributed_dp_runtime: bool = False,
 ) -> list[torch.Tensor]:
-    _validate_bnb_chunking(
-        num_samples=int(num_samples),
-        chunk_size=chunk_size,
-        num_workers=int(num_workers),
+    label = (
+        "sample_balls_in_bins_llr_chunks "
+        f"positive={positive_sample} sigma={float(sigma):.6g} "
+        f"num_samples={int(num_samples)} chunk_size={chunk_size} num_workers={int(num_workers)}"
     )
-    resolved_backend, resolved_device = _resolve_bnb_backend_and_device(
-        backend=backend,
-        device=device,
-    )
-    resolved_distributed_mode, _auto_selected = _resolve_bnb_distributed_mode(
-        distributed_mode=distributed_mode,
-        distributed_dp_runtime=distributed_dp_runtime,
-    )
-    specs = _derive_bnb_chunk_specs(
-        num_samples=int(num_samples),
-        seed=int(seed),
-        chunk_size=chunk_size,
-    )
+    with _timed(label):
+        _validate_bnb_chunking(
+            num_samples=int(num_samples),
+            chunk_size=chunk_size,
+            num_workers=int(num_workers),
+        )
+        resolved_backend, resolved_device = _resolve_bnb_backend_and_device(
+            backend=backend,
+            device=device,
+        )
+        resolved_distributed_mode, _auto_selected = _resolve_bnb_distributed_mode(
+            distributed_mode=distributed_mode,
+            distributed_dp_runtime=distributed_dp_runtime,
+        )
+        specs = _derive_bnb_chunk_specs(
+            num_samples=int(num_samples),
+            seed=int(seed),
+            chunk_size=chunk_size,
+        )
+        _debug_timing(
+            "sample_balls_in_bins_llr_chunks config "
+            f"backend={resolved_backend} device={resolved_device} "
+            f"distributed_mode={resolved_distributed_mode} chunks={len(specs)}"
+        )
     if resolved_distributed_mode == "chunk_shard":
         if not dist.is_available() or not dist.is_initialized():
             raise ValueError(
@@ -1359,73 +1395,90 @@ def sample_balls_in_bins_llr_chunks(
             rank=dist.get_rank(),
             world_size=dist.get_world_size(),
         )
-    modes_matrix = _build_balls_in_bins_modes_matrix(
-        coeffs=coeffs,
-        cycle_length=int(cycle_length),
-        horizon=int(horizon),
-        device=resolved_device,
-    )
-
-    def _one(chunk_num_samples: int, chunk_seed: int) -> torch.Tensor:
-        samples = _generate_balls_in_bins_samples_chunk(
+    with _timed("build_balls_in_bins_modes_matrix"):
+        modes_matrix = _build_balls_in_bins_modes_matrix(
             coeffs=coeffs,
             cycle_length=int(cycle_length),
             horizon=int(horizon),
-            sigma=float(sigma),
-            num_samples=int(chunk_num_samples),
-            seed=int(chunk_seed),
-            positive_sample=bool(positive_sample),
-            modes_matrix=modes_matrix,
             device=resolved_device,
         )
-        llr = _compute_balls_in_bins_privacy_loss_chunk(
-            samples=samples,
-            sigma=float(sigma),
-            modes_matrix=modes_matrix,
-        )
-        if not positive_sample:
-            llr = -llr
+    _debug_timing(
+        "modes_matrix "
+        f"shape={tuple(modes_matrix.shape)} device={modes_matrix.device}"
+    )
 
-        return llr
+    def _one(chunk_num_samples: int, chunk_seed: int) -> torch.Tensor:
+        with _timed(f"chunk seed={int(chunk_seed)} n={int(chunk_num_samples)}"):
+            with _timed("generate_samples"):
+                samples = _generate_balls_in_bins_samples_chunk(
+                    coeffs=coeffs,
+                    cycle_length=int(cycle_length),
+                    horizon=int(horizon),
+                    sigma=float(sigma),
+                    num_samples=int(chunk_num_samples),
+                    seed=int(chunk_seed),
+                    positive_sample=bool(positive_sample),
+                    modes_matrix=modes_matrix,
+                    device=resolved_device,
+                )
+            with _timed("compute_privacy_loss"):
+                llr = _compute_balls_in_bins_privacy_loss_chunk(
+                    samples=samples,
+                    sigma=float(sigma),
+                    modes_matrix=modes_matrix,
+                )
+            if not positive_sample:
+                llr = -llr
+
+            return llr
 
     if len(specs) == 1:
         chunk_num_samples, chunk_seed = specs[0]
-        return _reduce_bnb_llr_chunks_to_coordinator(
-            local_chunks=[_one(int(chunk_num_samples), int(chunk_seed))],
-            distributed_mode=resolved_distributed_mode,
-        )
+        with _timed(f"compute_single_chunk n={int(chunk_num_samples)}"):
+            local_chunks = [_one(int(chunk_num_samples), int(chunk_seed))]
+        with _timed("reduce_chunks_to_coordinator"):
+            return _reduce_bnb_llr_chunks_to_coordinator(
+                local_chunks=local_chunks,
+                distributed_mode=resolved_distributed_mode,
+            )
 
     if num_workers <= 1:
-        local_chunks = [
-            _one(int(chunk_num_samples), int(chunk_seed))
-            for chunk_num_samples, chunk_seed in specs
-        ]
-        return _reduce_bnb_llr_chunks_to_coordinator(
-            local_chunks=local_chunks,
-            distributed_mode=resolved_distributed_mode,
-        )
+        with _timed(f"compute_chunks_serial count={len(specs)}"):
+            local_chunks = [
+                _one(int(chunk_num_samples), int(chunk_seed))
+                for chunk_num_samples, chunk_seed in specs
+            ]
+        with _timed("reduce_chunks_to_coordinator"):
+            return _reduce_bnb_llr_chunks_to_coordinator(
+                local_chunks=local_chunks,
+                distributed_mode=resolved_distributed_mode,
+            )
 
     if resolved_backend == "cuda":
-        local_chunks = [
-            _one(int(chunk_num_samples), int(chunk_seed))
-            for chunk_num_samples, chunk_seed in specs
-        ]
+        with _timed(f"compute_chunks_cuda_serial count={len(specs)}"):
+            local_chunks = [
+                _one(int(chunk_num_samples), int(chunk_seed))
+                for chunk_num_samples, chunk_seed in specs
+            ]
+        with _timed("reduce_chunks_to_coordinator"):
+            return _reduce_bnb_llr_chunks_to_coordinator(
+                local_chunks=local_chunks,
+                distributed_mode=resolved_distributed_mode,
+            )
+
+    max_workers = min(int(num_workers), len(specs))
+    with _timed(f"compute_chunks_threadpool count={len(specs)} workers={max_workers}"):
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(_one, int(chunk_num_samples), int(chunk_seed))
+                for chunk_num_samples, chunk_seed in specs
+            ]
+            local_chunks = [future.result() for future in futures]
+    with _timed("reduce_chunks_to_coordinator"):
         return _reduce_bnb_llr_chunks_to_coordinator(
             local_chunks=local_chunks,
             distributed_mode=resolved_distributed_mode,
         )
-
-    max_workers = min(int(num_workers), len(specs))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(_one, int(chunk_num_samples), int(chunk_seed))
-            for chunk_num_samples, chunk_seed in specs
-        ]
-        local_chunks = [future.result() for future in futures]
-    return _reduce_bnb_llr_chunks_to_coordinator(
-        local_chunks=local_chunks,
-        distributed_mode=resolved_distributed_mode,
-    )
 
 
 def estimate_balls_in_bins_epsilon_monte_carlo(
@@ -1446,39 +1499,50 @@ def estimate_balls_in_bins_epsilon_monte_carlo(
     distributed_mode: str | None = "none",
     distributed_dp_runtime: bool = False,
 ) -> float:
-    if target_delta < 0.0 or target_delta >= 1.0:
-        raise ValueError("target_delta must be in [0, 1)")
-    base_delta = get_bnb_base_delta(num_samples=int(num_samples), target_delta=float(target_delta))
-    positive_chunks = sample_balls_in_bins_llr_chunks(
-        coeffs=coeffs,
-        cycle_length=int(cycle_length),
-        horizon=int(horizon),
-        sigma=float(noise_multiplier),
-        num_samples=int(num_samples),
-        seed=int(seed),
-        chunk_size=chunk_size,
-        num_workers=int(num_workers),
-        positive_sample=True,
-        backend=backend,
-        device=device,
-        distributed_mode=distributed_mode,
-        distributed_dp_runtime=distributed_dp_runtime,
-    )
-    negative_chunks = sample_balls_in_bins_llr_chunks(
-        coeffs=coeffs,
-        cycle_length=int(cycle_length),
-        horizon=int(horizon),
-        sigma=float(noise_multiplier),
-        num_samples=int(num_samples),
-        seed=int(seed) + 1,
-        chunk_size=chunk_size,
-        num_workers=int(num_workers),
-        positive_sample=False,
-        backend=backend,
-        device=device,
-        distributed_mode=distributed_mode,
-        distributed_dp_runtime=distributed_dp_runtime,
-    )
+    with _timed(
+        "estimate_balls_in_bins_epsilon_monte_carlo "
+        f"sigma={float(noise_multiplier):.6g} delta={float(target_delta):.6g} "
+        f"num_samples={int(num_samples)}"
+    ):
+        if target_delta < 0.0 or target_delta >= 1.0:
+            raise ValueError("target_delta must be in [0, 1)")
+        with _timed("get_bnb_base_delta"):
+            base_delta = get_bnb_base_delta(
+                num_samples=int(num_samples), target_delta=float(target_delta)
+            )
+        _debug_timing(f"base_delta={float(base_delta):.6g}")
+        with _timed("sample_positive_llr_chunks"):
+            positive_chunks = sample_balls_in_bins_llr_chunks(
+                coeffs=coeffs,
+                cycle_length=int(cycle_length),
+                horizon=int(horizon),
+                sigma=float(noise_multiplier),
+                num_samples=int(num_samples),
+                seed=int(seed),
+                chunk_size=chunk_size,
+                num_workers=int(num_workers),
+                positive_sample=True,
+                backend=backend,
+                device=device,
+                distributed_mode=distributed_mode,
+                distributed_dp_runtime=distributed_dp_runtime,
+            )
+        with _timed("sample_negative_llr_chunks"):
+            negative_chunks = sample_balls_in_bins_llr_chunks(
+                coeffs=coeffs,
+                cycle_length=int(cycle_length),
+                horizon=int(horizon),
+                sigma=float(noise_multiplier),
+                num_samples=int(num_samples),
+                seed=int(seed) + 1,
+                chunk_size=chunk_size,
+                num_workers=int(num_workers),
+                positive_sample=False,
+                backend=backend,
+                device=device,
+                distributed_mode=distributed_mode,
+                distributed_dp_runtime=distributed_dp_runtime,
+            )
     if distributed_mode == "chunk_shard" and dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
         result = _make_bnb_broadcast_result_tensor(
             float("nan"),
@@ -1487,19 +1551,26 @@ def estimate_balls_in_bins_epsilon_monte_carlo(
         )
         dist.broadcast(result, src=0)
         return float(result.item())
-    positive_epsilon = estimate_epsilon_from_llr_chunks(
-        target_delta=float(base_delta),
-        llr_chunks=[torch.as_tensor(chunk, dtype=torch.float64) for chunk in positive_chunks],
-        tolerance=float(tolerance),
-        max_iterations=int(max_iterations),
-    )
-    negative_epsilon = estimate_epsilon_from_llr_chunks(
-        target_delta=float(base_delta),
-        llr_chunks=[torch.as_tensor(chunk, dtype=torch.float64) for chunk in negative_chunks],
-        tolerance=float(tolerance),
-        max_iterations=int(max_iterations),
-    )
+    with _timed("invert_positive_epsilon"):
+        positive_epsilon = estimate_epsilon_from_llr_chunks(
+            target_delta=float(base_delta),
+            llr_chunks=[torch.as_tensor(chunk, dtype=torch.float64) for chunk in positive_chunks],
+            tolerance=float(tolerance),
+            max_iterations=int(max_iterations),
+        )
+    with _timed("invert_negative_epsilon"):
+        negative_epsilon = estimate_epsilon_from_llr_chunks(
+            target_delta=float(base_delta),
+            llr_chunks=[torch.as_tensor(chunk, dtype=torch.float64) for chunk in negative_chunks],
+            tolerance=float(tolerance),
+            max_iterations=int(max_iterations),
+        )
     epsilon = float(max(float(positive_epsilon), float(negative_epsilon)))
+    _debug_timing(
+        f"epsilon_forward={float(positive_epsilon):.6g} "
+        f"epsilon_reverse={float(negative_epsilon):.6g} "
+        f"epsilon={epsilon:.6g}"
+    )
     if distributed_mode == "chunk_shard" and dist.is_available() and dist.is_initialized():
         result = _make_bnb_broadcast_result_tensor(
             epsilon,
@@ -1536,39 +1607,46 @@ def estimate_balls_in_bins_epsilon_monte_carlo_optimistic(
     This is the optimistic point-estimate surface: it inverts `delta(epsilon)`
     directly at the target `delta` without the EVR/base-delta feasibility split.
     """
-    if target_delta < 0.0 or target_delta >= 1.0:
-        raise ValueError("target_delta must be in [0, 1)")
+    with _timed(
+        "estimate_balls_in_bins_epsilon_monte_carlo_optimistic "
+        f"sigma={float(noise_multiplier):.6g} delta={float(target_delta):.6g} "
+        f"num_samples={int(num_samples)}"
+    ):
+        if target_delta < 0.0 or target_delta >= 1.0:
+            raise ValueError("target_delta must be in [0, 1)")
 
-    positive_chunks = sample_balls_in_bins_llr_chunks(
-        coeffs=coeffs,
-        cycle_length=int(cycle_length),
-        horizon=int(horizon),
-        sigma=float(noise_multiplier),
-        num_samples=int(num_samples),
-        seed=int(seed),
-        chunk_size=chunk_size,
-        num_workers=int(num_workers),
-        positive_sample=True,
-        backend=backend,
-        device=device,
-        distributed_mode=distributed_mode,
-        distributed_dp_runtime=distributed_dp_runtime,
-    )
-    negative_chunks = sample_balls_in_bins_llr_chunks(
-        coeffs=coeffs,
-        cycle_length=int(cycle_length),
-        horizon=int(horizon),
-        sigma=float(noise_multiplier),
-        num_samples=int(num_samples),
-        seed=int(seed) + 1,
-        chunk_size=chunk_size,
-        num_workers=int(num_workers),
-        positive_sample=False,
-        backend=backend,
-        device=device,
-        distributed_mode=distributed_mode,
-        distributed_dp_runtime=distributed_dp_runtime,
-    )
+        with _timed("sample_positive_llr_chunks"):
+            positive_chunks = sample_balls_in_bins_llr_chunks(
+                coeffs=coeffs,
+                cycle_length=int(cycle_length),
+                horizon=int(horizon),
+                sigma=float(noise_multiplier),
+                num_samples=int(num_samples),
+                seed=int(seed),
+                chunk_size=chunk_size,
+                num_workers=int(num_workers),
+                positive_sample=True,
+                backend=backend,
+                device=device,
+                distributed_mode=distributed_mode,
+                distributed_dp_runtime=distributed_dp_runtime,
+            )
+        with _timed("sample_negative_llr_chunks"):
+            negative_chunks = sample_balls_in_bins_llr_chunks(
+                coeffs=coeffs,
+                cycle_length=int(cycle_length),
+                horizon=int(horizon),
+                sigma=float(noise_multiplier),
+                num_samples=int(num_samples),
+                seed=int(seed) + 1,
+                chunk_size=chunk_size,
+                num_workers=int(num_workers),
+                positive_sample=False,
+                backend=backend,
+                device=device,
+                distributed_mode=distributed_mode,
+                distributed_dp_runtime=distributed_dp_runtime,
+            )
     if (
         distributed_mode == "chunk_shard"
         and dist.is_available()
@@ -1583,19 +1661,26 @@ def estimate_balls_in_bins_epsilon_monte_carlo_optimistic(
         dist.broadcast(result, src=0)
         return float(result.item())
 
-    positive_epsilon = estimate_epsilon_from_llr_chunks(
-        target_delta=float(target_delta),
-        llr_chunks=[torch.as_tensor(chunk, dtype=torch.float64) for chunk in positive_chunks],
-        tolerance=float(tolerance),
-        max_iterations=int(max_iterations),
-    )
-    negative_epsilon = estimate_epsilon_from_llr_chunks(
-        target_delta=float(target_delta),
-        llr_chunks=[torch.as_tensor(chunk, dtype=torch.float64) for chunk in negative_chunks],
-        tolerance=float(tolerance),
-        max_iterations=int(max_iterations),
-    )
+    with _timed("invert_positive_epsilon"):
+        positive_epsilon = estimate_epsilon_from_llr_chunks(
+            target_delta=float(target_delta),
+            llr_chunks=[torch.as_tensor(chunk, dtype=torch.float64) for chunk in positive_chunks],
+            tolerance=float(tolerance),
+            max_iterations=int(max_iterations),
+        )
+    with _timed("invert_negative_epsilon"):
+        negative_epsilon = estimate_epsilon_from_llr_chunks(
+            target_delta=float(target_delta),
+            llr_chunks=[torch.as_tensor(chunk, dtype=torch.float64) for chunk in negative_chunks],
+            tolerance=float(tolerance),
+            max_iterations=int(max_iterations),
+        )
     epsilon = float(max(float(positive_epsilon), float(negative_epsilon)))
+    _debug_timing(
+        f"epsilon_forward={float(positive_epsilon):.6g} "
+        f"epsilon_reverse={float(negative_epsilon):.6g} "
+        f"epsilon={epsilon:.6g}"
+    )
     if distributed_mode == "chunk_shard" and dist.is_available() and dist.is_initialized():
         result = _make_bnb_broadcast_result_tensor(
             epsilon,
@@ -2058,63 +2143,82 @@ def estimate_epsilon_from_llr_chunks(
     tolerance: float = 1e-4,
     max_iterations: int = 200,
 ) -> float:
-    if target_delta < 0.0 or target_delta >= 1.0:
-        raise ValueError("target_delta must be in [0, 1)")
+    with _timed(
+        "estimate_epsilon_from_llr_chunks "
+        f"target_delta={float(target_delta):.6g} chunks={len(llr_chunks)}"
+    ):
+        if target_delta < 0.0 or target_delta >= 1.0:
+            raise ValueError("target_delta must be in [0, 1)")
 
-    if epsilon_low < 0.0:
-        raise ValueError("epsilon_low must be >= 0")
+        if epsilon_low < 0.0:
+            raise ValueError("epsilon_low must be >= 0")
 
-    if tolerance <= 0.0:
-        raise ValueError("tolerance must be > 0")
+        if tolerance <= 0.0:
+            raise ValueError("tolerance must be > 0")
 
-    if max_iterations <= 0:
-        raise ValueError("max_iterations must be > 0")
+        if max_iterations <= 0:
+            raise ValueError("max_iterations must be > 0")
 
-    delta_at_low = estimate_hockey_stick_delta_from_llr_chunks(
-        epsilon=epsilon_low,
-        llr_chunks=llr_chunks,
-    )
-    if target_delta >= delta_at_low:
-        return float(epsilon_low)
-
-    low = float(epsilon_low)
-    if epsilon_high is not None:
-        high = float(epsilon_high)
-        if high <= low:
-            raise ValueError("epsilon_high must be > epsilon_low")
-        d_high = estimate_hockey_stick_delta_from_llr_chunks(
-            epsilon=high,
-            llr_chunks=llr_chunks,
-        )
-        if d_high > target_delta:
-            raise ValueError("epsilon_high does not satisfy target_delta")
-    else:
-        high = max(1.0, low + 1.0)
-        for _ in range(max_iterations):
-            d_high = estimate_hockey_stick_delta_from_llr_chunks(
-                epsilon=high,
+        with _timed("delta_at_epsilon_low"):
+            delta_at_low = estimate_hockey_stick_delta_from_llr_chunks(
+                epsilon=epsilon_low,
                 llr_chunks=llr_chunks,
             )
-            if d_high <= target_delta:
-                break
-            high *= 2.0
-        else:
-            raise ValueError("could not bracket epsilon; increase max_iterations")
-
-    for _ in range(max_iterations):
-        mid = 0.5 * (low + high)
-        d_mid = estimate_hockey_stick_delta_from_llr_chunks(
-            epsilon=mid,
-            llr_chunks=llr_chunks,
+        _debug_timing(
+            f"epsilon_search low={float(epsilon_low):.6g} delta_at_low={float(delta_at_low):.6g}"
         )
-        if abs(d_mid - target_delta) <= tolerance:
-            return float(mid)
-        if d_mid > target_delta:
-            low = mid
-        else:
-            high = mid
+        if target_delta >= delta_at_low:
+            return float(epsilon_low)
 
-    return float(0.5 * (low + high))
+        low = float(epsilon_low)
+        if epsilon_high is not None:
+            high = float(epsilon_high)
+            if high <= low:
+                raise ValueError("epsilon_high must be > epsilon_low")
+            with _timed("delta_at_provided_epsilon_high"):
+                d_high = estimate_hockey_stick_delta_from_llr_chunks(
+                    epsilon=high,
+                    llr_chunks=llr_chunks,
+                )
+            if d_high > target_delta:
+                raise ValueError("epsilon_high does not satisfy target_delta")
+        else:
+            high = max(1.0, low + 1.0)
+            with _timed("epsilon_bracketing"):
+                for i in range(max_iterations):
+                    d_high = estimate_hockey_stick_delta_from_llr_chunks(
+                        epsilon=high,
+                        llr_chunks=llr_chunks,
+                    )
+                    _debug_timing(
+                        f"epsilon_bracketing iter={i} high={float(high):.6g} delta={float(d_high):.6g}"
+                    )
+                    if d_high <= target_delta:
+                        break
+                    high *= 2.0
+                else:
+                    raise ValueError("could not bracket epsilon; increase max_iterations")
+
+        with _timed("epsilon_binary_search"):
+            for i in range(max_iterations):
+                mid = 0.5 * (low + high)
+                d_mid = estimate_hockey_stick_delta_from_llr_chunks(
+                    epsilon=mid,
+                    llr_chunks=llr_chunks,
+                )
+                if i < 5 or i + 1 == max_iterations or _timing_enabled():
+                    _debug_timing(
+                        f"epsilon_binary iter={i} low={float(low):.6g} mid={float(mid):.6g} "
+                        f"high={float(high):.6g} delta_mid={float(d_mid):.6g}"
+                    )
+                if abs(d_mid - target_delta) <= tolerance:
+                    return float(mid)
+                if d_mid > target_delta:
+                    low = mid
+                else:
+                    high = mid
+
+        return float(0.5 * (low + high))
 
 
 def estimate_b_min_sep_epsilon_monte_carlo(

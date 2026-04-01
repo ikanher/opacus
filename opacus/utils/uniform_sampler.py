@@ -743,3 +743,102 @@ class DistributedCyclicPoissonSampler(Sampler[List[int]]):
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
+
+
+class KOutOfTSampler(Sampler[List[int]]):
+    def __init__(self, *, num_samples: int, num_steps: int, num_selected: int, generator=None):
+        self.num_samples = int(num_samples)
+        self.num_steps = int(num_steps)
+        self.num_selected = int(num_selected)
+        self.generator = generator
+        self.epoch = 0
+        self._base_seed = int(generator.initial_seed()) if generator is not None else 0
+        if self.num_samples <= 0:
+            raise ValueError(f"num_samples should be positive, got {self.num_samples}")
+
+        if self.num_steps <= 0 or self.num_selected <= 0 or self.num_selected > self.num_steps:
+            raise ValueError("k_out_of_t requires 1 <= num_selected <= num_steps")
+
+        self._assignment = self._sample_assignment()
+
+    def _sample_assignment(self):
+        g = torch.Generator()
+        g.manual_seed(self._base_seed + self.epoch)
+        assignment = torch.zeros((self.num_samples, self.num_steps), dtype=torch.bool)
+        for idx in range(self.num_samples):
+            chosen = torch.randperm(self.num_steps, generator=g)[: self.num_selected]
+            assignment[idx, chosen] = True
+
+        return assignment
+
+    def __len__(self):
+        return self.num_steps
+
+    def __iter__(self):
+        for step in range(self.num_steps):
+            yield self._assignment[:, step].nonzero(as_tuple=False).reshape(-1).tolist()
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+        self._assignment = self._sample_assignment()
+
+
+class DistributedKOutOfTSampler(Sampler[List[int]]):
+    def __init__(self, *, total_size: int, num_steps: int, num_selected: int, shuffle: bool = True, shuffle_seed: int = 0, generator=None):
+        self.total_size = int(total_size)
+        self.num_steps = int(num_steps)
+        self.num_selected = int(num_selected)
+        self.shuffle = bool(shuffle)
+        self.shuffle_seed = int(shuffle_seed)
+        self.generator = generator
+        self.epoch = 0
+        self.num_replicas = torch.distributed.get_world_size()
+        self.rank = torch.distributed.get_rank()
+        self._base_seed = int(generator.initial_seed()) if generator is not None else 0
+        if self.total_size <= 0:
+            raise ValueError(f"total_size should be positive, got {self.total_size}")
+
+        if self.num_steps <= 0 or self.num_selected <= 0 or self.num_selected > self.num_steps:
+            raise ValueError("k_out_of_t requires 1 <= num_selected <= num_steps")
+
+        self.num_samples = self.total_size // self.num_replicas
+        if self.rank < self.total_size % self.num_replicas:
+            self.num_samples += 1
+
+        self._assignment = self._sample_assignment()
+
+    def _local_indices(self):
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.shuffle_seed + self.epoch)
+            indices = torch.randperm(self.total_size, generator=g)
+        else:
+            indices = torch.arange(self.total_size)
+
+        indices = indices[self.rank : self.total_size : self.num_replicas]
+        assert len(indices) == self.num_samples
+
+        return indices
+
+    def _sample_assignment(self):
+        g = torch.Generator()
+        g.manual_seed(self._base_seed + self.epoch)
+        assignment = torch.zeros((self.num_samples, self.num_steps), dtype=torch.bool)
+        for idx in range(self.num_samples):
+            chosen = torch.randperm(self.num_steps, generator=g)[: self.num_selected]
+            assignment[idx, chosen] = True
+
+        return assignment
+
+    def __len__(self):
+        return self.num_steps
+
+    def __iter__(self):
+        local_indices = self._local_indices()
+        for step in range(self.num_steps):
+            selected_local = self._assignment[:, step].nonzero(as_tuple=False).reshape(-1)
+            yield local_indices[selected_local].tolist()
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+        self._assignment = self._sample_assignment()

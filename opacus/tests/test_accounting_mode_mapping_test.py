@@ -31,6 +31,11 @@ def test_bnb_accountant_aliases_map_to_bnb_accounting_mode(accountant: str) -> N
     assert resolve_accounting_mode_from_accountant(accountant) == "bnb_accountant"
 
 
+@pytest.mark.parametrize("accountant", ["random_allocation", "random_allocation_accountant"])
+def test_random_allocation_accountant_aliases_map_to_random_allocation_accounting_mode(accountant: str) -> None:
+    assert resolve_accounting_mode_from_accountant(accountant) == "random_allocation_accountant"
+
+
 def test_unknown_accountant_name_is_rejected() -> None:
     with pytest.raises(ValueError, match="Unsupported accountant"):
         resolve_accounting_mode_from_accountant("unknown_accountant")

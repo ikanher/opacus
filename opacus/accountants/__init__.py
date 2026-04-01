@@ -18,6 +18,7 @@ from .bnb import BNBAccountant
 from .gdp import GaussianAccountant
 from .bsr import BSRAccountant
 from .prv import PRVAccountant
+from .random_allocation import RandomAllocationAccountant
 from .rdp import RDPAccountant
 from .registry import create_accountant, register_accountant
 
@@ -30,6 +31,7 @@ __all__ = [
     "BandMFAccountant",
     "BNBAccountant",
     "BSRAccountant",
+    "RandomAllocationAccountant",
     "register_accountant",
     "create_accountant",
 ]

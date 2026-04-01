@@ -1,0 +1,78 @@
+{
+  "cases": [
+    {
+      "accountant_coeffs": [
+        3.0,
+        4.0
+      ],
+      "author_source": "PLD_accounting.general_allocation_epsilon",
+      "cycle_length": 5,
+      "effective_sigma": 2.0,
+      "expected_epsilon_lower": 1.5319940616955305,
+      "expected_epsilon_upper": 2.320071259766347,
+      "horizon": 20,
+      "mechanism": "gaussian",
+      "name": "multi_step_gaussian_case",
+      "noise_multiplier": 10.0,
+      "runtime_config": {
+        "convolution_method": "geometric",
+        "loss_discretization": 0.05,
+        "max_grid_fft": 1000000,
+        "max_grid_mult": 30000,
+        "tail_truncation": 1e-06
+      },
+      "target_delta": 1e-05
+    },
+    {
+      "accountant_coeffs": [
+        3.0,
+        4.0
+      ],
+      "author_source": "PLD_accounting.general_allocation_epsilon",
+      "cycle_length": 10,
+      "num_selected": 3,
+      "effective_sigma": 2.0,
+      "expected_epsilon_lower": 2.821304935451721,
+      "expected_epsilon_upper": 3.797686529941495,
+      "horizon": 20,
+      "mechanism": "gaussian",
+      "name": "general_k_gaussian_case",
+      "noise_multiplier": 10.0,
+      "runtime_config": {
+        "convolution_method": "geometric",
+        "loss_discretization": 0.05,
+        "max_grid_fft": 1000000,
+        "max_grid_mult": 30000,
+        "tail_truncation": 1e-06
+      },
+      "target_delta": 1e-05
+    },
+    {
+      "accountant_coeffs": [
+        1.0
+      ],
+      "author_source": "PLD_accounting.general_allocation_epsilon",
+      "cycle_length": 1,
+      "effective_sigma": 2.0,
+      "expected_epsilon_lower": 1.9830991519584125,
+      "expected_epsilon_upper": 1.9980995746152586,
+      "horizon": 1,
+      "mechanism": "gaussian",
+      "name": "single_step_realization_case",
+      "noise_multiplier": 2.0,
+      "runtime_config": {
+        "convolution_method": "geometric",
+        "loss_discretization": 0.005,
+        "max_grid_fft": 1000000,
+        "max_grid_mult": 30000,
+        "tail_truncation": 1e-10
+      },
+      "target_delta": 1e-05
+    }
+  ],
+  "source": {
+    "author_package_root": "src/PLD_accounting",
+    "generator": "scripts/generate_random_allocation_pld_accounting_goldens.py",
+    "note": "Developer-only package-derived goldens for the local Opacus random_allocation runtime."
+  }
+}

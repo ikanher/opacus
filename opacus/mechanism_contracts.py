@@ -25,6 +25,7 @@ AccountingModeName = Literal[
     "bandmf_accountant",
     "bsr_accountant",
     "bnb_accountant",
+    "random_allocation_accountant",
 ]
 SamplingModeName = Literal[
     "poisson",
@@ -32,6 +33,7 @@ SamplingModeName = Literal[
     "cyclic_poisson",
     "b_min_sep",
     "balls_in_bins",
+    "k_out_of_t",
 ]
 
 
@@ -66,6 +68,8 @@ def resolve_accounting_mode_from_accountant(accountant: str) -> AccountingModeNa
         "bsr_accountant": "bsr_accountant",
         "bnb": "bnb_accountant",
         "bnb_accountant": "bnb_accountant",
+        "random_allocation": "random_allocation_accountant",
+        "random_allocation_accountant": "random_allocation_accountant",
     }
 
     normalized = accountant_to_mode.get(accountant)
@@ -89,6 +93,7 @@ class SamplingSemantics:
             "balls-in-bins": "balls_in_bins",
             "balls_in_bins_sampler": "balls_in_bins",
             "balls-in-bins-sampler": "balls_in_bins",
+            "k-out-of-t": "k_out_of_t",
         }
         normalized_sampling_mode = alias_map.get(self.sampling_mode, self.sampling_mode)
         object.__setattr__(self, "sampling_mode", normalized_sampling_mode)
@@ -99,12 +104,26 @@ class SamplingSemantics:
             "cyclic_poisson",
             "b_min_sep",
             "balls_in_bins",
+            "k_out_of_t",
         ):
             raise ValueError(
                 "sampling_mode must be one of "
-                "{'poisson', 'torch_sampler', 'cyclic_poisson', 'b_min_sep', 'balls_in_bins'} "
-                "(aliases: 'balls_n_bins', 'balls-in-bins', 'balls_in_bins_sampler')"
+                "{'poisson', 'torch_sampler', 'cyclic_poisson', 'b_min_sep', 'balls_in_bins', 'k_out_of_t'} "
+                "(aliases: 'balls_n_bins', 'balls-in-bins', 'balls_in_bins_sampler', 'k-out-of-t')"
             )
+        if self.sampling_mode == "k_out_of_t":
+            num_steps = self.privacy_metadata.get("num_steps")
+            num_selected = self.privacy_metadata.get("num_selected")
+            if num_steps is None or num_selected is None:
+                raise ValueError(
+                    "k_out_of_t sampling requires privacy_metadata['num_steps'] and privacy_metadata['num_selected']"
+                )
+            num_steps = int(num_steps)
+            num_selected = int(num_selected)
+            if num_steps < 1 or num_selected < 1 or num_selected > num_steps:
+                raise ValueError(
+                    "invalid k-out-of-t contract: require 1 <= num_selected <= num_steps"
+                )
 
 
 @dataclass(frozen=True)
@@ -125,44 +144,45 @@ class NoiseMechanismConfig:
             "bandmf_accountant",
             "bsr_accountant",
             "bnb_accountant",
+            "random_allocation_accountant",
         ):
             raise ValueError(
                 "accounting_mode must be one of "
-                "{'standard_step_accountant', 'bandmf_accountant', 'bsr_accountant', 'bnb_accountant'}"
+                "{'standard_step_accountant', 'bandmf_accountant', 'bsr_accountant', 'bnb_accountant', 'random_allocation_accountant'}"
             )
 
         if (
             mechanism == "bandmf"
-            and self.accounting_mode not in ("bandmf_accountant", "bnb_accountant")
+            and self.accounting_mode not in ("bandmf_accountant", "bnb_accountant", "random_allocation_accountant")
         ):
             raise ValueError(
-                "bandmf mechanism requires bandmf_accountant or bnb_accountant "
+                "bandmf mechanism requires bandmf_accountant, bnb_accountant, or random_allocation_accountant "
                 "for authoritative accounting"
             )
 
         if (
             mechanism == "bsr"
-            and self.accounting_mode not in ("bsr_accountant", "bnb_accountant")
+            and self.accounting_mode not in ("bsr_accountant", "bnb_accountant", "random_allocation_accountant")
         ):
             raise ValueError(
-                "bsr mechanism requires bsr_accountant or bnb_accountant "
+                "bsr mechanism requires bsr_accountant, bnb_accountant, or random_allocation_accountant "
                 "for authoritative accounting"
             )
 
         if (
             mechanism == "bisr"
-            and self.accounting_mode not in ("bsr_accountant", "bnb_accountant")
+            and self.accounting_mode not in ("bsr_accountant", "bnb_accountant", "random_allocation_accountant")
         ):
             raise ValueError(
-                "bisr mechanism requires bsr_accountant or bnb_accountant "
+                "bisr mechanism requires bsr_accountant, bnb_accountant, or random_allocation_accountant "
                 "for authoritative accounting"
             )
 
         if (
             mechanism == "bandinvmf"
-            and self.accounting_mode not in ("bsr_accountant", "bnb_accountant")
+            and self.accounting_mode not in ("bsr_accountant", "bnb_accountant", "random_allocation_accountant")
         ):
             raise ValueError(
-                "bandinvmf mechanism requires bsr_accountant or bnb_accountant "
+                "bandinvmf mechanism requires bsr_accountant, bnb_accountant, or random_allocation_accountant "
                 "for authoritative accounting"
             )

@@ -20,6 +20,7 @@ from .bnb import BNBAccountant
 from .gdp import GaussianAccountant
 from .bsr import BSRAccountant
 from .prv import PRVAccountant
+from .random_allocation import RandomAllocationAccountant
 from .rdp import RDPAccountant
 
 
@@ -30,6 +31,7 @@ _ACCOUNTANTS: Dict[str, Type[IAccountant]] = {
     "bandmf": BandMFAccountant,
     "bsr": BSRAccountant,
     "bnb": BNBAccountant,
+    "random_allocation": RandomAllocationAccountant,
 }
 
 
