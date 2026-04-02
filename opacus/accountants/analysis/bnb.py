@@ -1059,6 +1059,8 @@ def _reduce_bnb_llr_chunks_to_coordinator(
     *,
     local_chunks: list[torch.Tensor],
     distributed_mode: str,
+    backend: str,
+    device: str | torch.device | None,
 ) -> list[torch.Tensor]:
     if distributed_mode != "chunk_shard":
         return local_chunks
@@ -1068,18 +1070,57 @@ def _reduce_bnb_llr_chunks_to_coordinator(
             "bnb_distributed_mode='chunk_shard' requires torch.distributed to be initialized"
         )
 
-    world_size = dist.get_world_size()
-    gathered: list[list[torch.Tensor] | None] = [None for _ in range(world_size)]
-    payload = [chunk.detach().cpu() for chunk in local_chunks]
-    dist.all_gather_object(gathered, payload)
+    resolved_backend, resolved_device = _resolve_bnb_backend_and_device(
+        backend=backend,
+        device=device,
+    )
+    tensor_device = resolved_device if resolved_backend == "cuda" else torch.device("cpu")
     rank = dist.get_rank()
+
+    if local_chunks:
+        local_payload = torch.cat(
+            [chunk.detach().to(device=tensor_device, dtype=torch.float64).reshape(-1) for chunk in local_chunks]
+        )
+    else:
+        local_payload = torch.empty(0, dtype=torch.float64, device=tensor_device)
+
+    local_numel = torch.tensor(
+        [int(local_payload.numel())],
+        dtype=torch.int64,
+        device=tensor_device,
+    )
+    size_gather_list = (
+        [torch.empty_like(local_numel) for _ in range(dist.get_world_size())]
+        if rank == 0
+        else None
+    )
+    dist.gather(local_numel, gather_list=size_gather_list, dst=0)
+
+    max_numel_tensor = local_numel.clone()
+    dist.all_reduce(max_numel_tensor, op=dist.ReduceOp.MAX)
+    max_numel = int(max_numel_tensor.item())
+
+    padded_payload = torch.empty(max_numel, dtype=torch.float64, device=tensor_device)
+    if max_numel > 0:
+        padded_payload.zero_()
+        if int(local_numel.item()) > 0:
+            padded_payload[: int(local_numel.item())].copy_(local_payload)
+
+    payload_gather_list = (
+        [torch.empty_like(padded_payload) for _ in range(dist.get_world_size())]
+        if rank == 0
+        else None
+    )
+    dist.gather(padded_payload, gather_list=payload_gather_list, dst=0)
     if rank != 0:
         return []
 
     reduced: list[torch.Tensor] = []
-    for shard_chunks in gathered:
-        if shard_chunks:
-            reduced.extend([chunk.to(dtype=torch.float64) for chunk in shard_chunks])
+    assert size_gather_list is not None
+    assert payload_gather_list is not None
+    for shard_size, shard_payload in zip(size_gather_list, payload_gather_list):
+        numel = int(shard_size.item())
+        reduced.append(shard_payload[:numel].detach().cpu().to(dtype=torch.float64))
 
     return reduced
 
@@ -1440,6 +1481,8 @@ def sample_balls_in_bins_llr_chunks(
             return _reduce_bnb_llr_chunks_to_coordinator(
                 local_chunks=local_chunks,
                 distributed_mode=resolved_distributed_mode,
+                backend=resolved_backend,
+                device=resolved_device,
             )
 
     if num_workers <= 1:
@@ -1452,6 +1495,8 @@ def sample_balls_in_bins_llr_chunks(
             return _reduce_bnb_llr_chunks_to_coordinator(
                 local_chunks=local_chunks,
                 distributed_mode=resolved_distributed_mode,
+                backend=resolved_backend,
+                device=resolved_device,
             )
 
     if resolved_backend == "cuda":
@@ -1464,6 +1509,8 @@ def sample_balls_in_bins_llr_chunks(
             return _reduce_bnb_llr_chunks_to_coordinator(
                 local_chunks=local_chunks,
                 distributed_mode=resolved_distributed_mode,
+                backend=resolved_backend,
+                device=resolved_device,
             )
 
     max_workers = min(int(num_workers), len(specs))
@@ -1478,6 +1525,8 @@ def sample_balls_in_bins_llr_chunks(
         return _reduce_bnb_llr_chunks_to_coordinator(
             local_chunks=local_chunks,
             distributed_mode=resolved_distributed_mode,
+            backend=resolved_backend,
+            device=resolved_device,
         )
 
 

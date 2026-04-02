@@ -21,6 +21,7 @@ import torch
 from opacus.accountants.analysis.bnb import (
     _assign_bnb_chunk_specs_to_shard,
     _make_bnb_broadcast_result_tensor,
+    _reduce_bnb_llr_chunks_to_coordinator,
     _resolve_bnb_distributed_mode,
     BNBCalibrationReport,
     DeltaVerificationResult,
@@ -82,6 +83,50 @@ class BNBAnalysisTest(unittest.TestCase):
         )
         self.assertEqual(shard_0, [chunk_specs[0], chunk_specs[2], chunk_specs[4]])
         self.assertEqual(shard_1, [chunk_specs[1], chunk_specs[3]])
+
+    def test_reduce_bnb_llr_chunks_to_coordinator_uses_tensor_gather(self) -> None:
+        local_chunks = [torch.tensor([1.0, 2.0], dtype=torch.float32)]
+        gather_calls: list[tuple[torch.Tensor, object, int]] = []
+
+        def _fake_gather(payload, gather_list=None, dst=0):
+            gather_calls.append((payload.clone(), gather_list, dst))
+            self.assertEqual(dst, 0)
+            self.assertIsNotNone(gather_list)
+            if payload.dtype == torch.int64:
+                gather_list[0].copy_(payload)
+                gather_list[1].copy_(torch.tensor([1], dtype=torch.int64, device=payload.device))
+            else:
+                gather_list[0].copy_(payload)
+                remote = torch.zeros_like(payload)
+                remote[0] = 3.0
+                gather_list[1].copy_(remote)
+
+        with mock.patch("opacus.accountants.analysis.bnb.dist.is_available", return_value=True):
+            with mock.patch("opacus.accountants.analysis.bnb.dist.is_initialized", return_value=True):
+                with mock.patch("opacus.accountants.analysis.bnb.dist.get_rank", return_value=0):
+                    with mock.patch("opacus.accountants.analysis.bnb.dist.get_world_size", return_value=2):
+                        with mock.patch(
+                            "opacus.accountants.analysis.bnb.dist.gather",
+                            side_effect=_fake_gather,
+                        ) as mocked_gather:
+                            with mock.patch(
+                                "opacus.accountants.analysis.bnb.dist.all_reduce",
+                                side_effect=lambda tensor, op=None: tensor.fill_(2),
+                            ) as mocked_all_reduce:
+                                reduced = _reduce_bnb_llr_chunks_to_coordinator(
+                                    local_chunks=local_chunks,
+                                    distributed_mode="chunk_shard",
+                                    backend="cpu",
+                                    device="cpu",
+                                )
+
+        self.assertEqual(mocked_gather.call_count, 2)
+        mocked_all_reduce.assert_called_once()
+        self.assertEqual(len(gather_calls), 2)
+        self.assertEqual(len(reduced), 2)
+        self.assertEqual(reduced[0].dtype, torch.float64)
+        self.assertTrue(torch.equal(reduced[0], torch.tensor([1.0, 2.0], dtype=torch.float64)))
+        self.assertTrue(torch.equal(reduced[1], torch.tensor([3.0], dtype=torch.float64)))
 
     def test_make_bnb_broadcast_result_tensor_uses_cpu_for_cpu_backend(self) -> None:
         tensor = _make_bnb_broadcast_result_tensor(
