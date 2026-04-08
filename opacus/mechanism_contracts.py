@@ -19,11 +19,12 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Literal, Mapping, Protocol
 
 
-NoiseMechanismName = Literal["gaussian", "bandmf", "bsr", "bisr", "bandinvmf"]
+NoiseMechanismName = Literal["gaussian", "bandmf", "bsr", "bisr", "bandinvmf", "bifr", "blt"]
 AccountingModeName = Literal[
     "standard_step_accountant",
     "bandmf_accountant",
     "bsr_accountant",
+    "blt_accountant",
     "bnb_accountant",
     "random_allocation_accountant",
 ]
@@ -64,8 +65,11 @@ def resolve_accounting_mode_from_accountant(accountant: str) -> AccountingModeNa
         "bandmf_accountant": "bandmf_accountant",
         "bsr": "bsr_accountant",
         "bisr": "bsr_accountant",
+        "bifr": "bsr_accountant",
         "bandinvmf": "bsr_accountant",
         "bsr_accountant": "bsr_accountant",
+        "blt": "blt_accountant",
+        "blt_accountant": "blt_accountant",
         "bnb": "bnb_accountant",
         "bnb_accountant": "bnb_accountant",
         "random_allocation": "random_allocation_accountant",
@@ -134,35 +138,48 @@ class NoiseMechanismConfig:
 
     def __post_init__(self) -> None:
         mechanism = self.mechanism
-        if mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bandinvmf"):
+        if mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bandinvmf", "bifr", "blt"):
             raise ValueError(
-                "mechanism must be one of {'gaussian', 'bandmf', 'bsr', 'bisr', 'bandinvmf'}"
+                "mechanism must be one of {'gaussian', 'bandmf', 'bsr', 'bisr', 'bandinvmf', 'bifr', 'blt'}"
             )
 
-        if self.accounting_mode not in (
+        accounting_mode = self.accounting_mode
+        if mechanism == "blt" and accounting_mode == "standard_step_accountant":
+            # Preserve legacy call sites while making the public BLT contract
+            # explicit at the config surface.
+            accounting_mode = "blt_accountant"
+            object.__setattr__(self, "accounting_mode", accounting_mode)
+
+        if accounting_mode not in (
             "standard_step_accountant",
             "bandmf_accountant",
             "bsr_accountant",
+            "blt_accountant",
             "bnb_accountant",
             "random_allocation_accountant",
         ):
             raise ValueError(
                 "accounting_mode must be one of "
-                "{'standard_step_accountant', 'bandmf_accountant', 'bsr_accountant', 'bnb_accountant', 'random_allocation_accountant'}"
+                "{'standard_step_accountant', 'bandmf_accountant', 'bsr_accountant', 'blt_accountant', 'bnb_accountant', 'random_allocation_accountant'}"
             )
 
         if (
             mechanism == "bandmf"
-            and self.accounting_mode not in ("bandmf_accountant", "bnb_accountant", "random_allocation_accountant")
+            and accounting_mode not in ("bandmf_accountant", "bnb_accountant", "random_allocation_accountant")
         ):
             raise ValueError(
                 "bandmf mechanism requires bandmf_accountant, bnb_accountant, or random_allocation_accountant "
                 "for authoritative accounting"
             )
 
+        if mechanism == "bifr" and accounting_mode != "bsr_accountant":
+            raise ValueError(
+                "bifr mechanism requires bsr_accountant"
+            )
+
         if (
             mechanism == "bsr"
-            and self.accounting_mode not in ("bsr_accountant", "bnb_accountant", "random_allocation_accountant")
+            and accounting_mode not in ("bsr_accountant", "bnb_accountant", "random_allocation_accountant")
         ):
             raise ValueError(
                 "bsr mechanism requires bsr_accountant, bnb_accountant, or random_allocation_accountant "
@@ -171,7 +188,7 @@ class NoiseMechanismConfig:
 
         if (
             mechanism == "bisr"
-            and self.accounting_mode not in ("bsr_accountant", "bnb_accountant", "random_allocation_accountant")
+            and accounting_mode not in ("bsr_accountant", "bnb_accountant", "random_allocation_accountant")
         ):
             raise ValueError(
                 "bisr mechanism requires bsr_accountant, bnb_accountant, or random_allocation_accountant "
@@ -180,9 +197,12 @@ class NoiseMechanismConfig:
 
         if (
             mechanism == "bandinvmf"
-            and self.accounting_mode not in ("bsr_accountant", "bnb_accountant", "random_allocation_accountant")
+            and accounting_mode not in ("bsr_accountant", "bnb_accountant", "random_allocation_accountant")
         ):
             raise ValueError(
                 "bandinvmf mechanism requires bsr_accountant, bnb_accountant, or random_allocation_accountant "
                 "for authoritative accounting"
             )
+
+        if mechanism == "blt" and accounting_mode not in ("blt_accountant", "bnb_accountant"):
+            raise ValueError("blt mechanism requires blt_accountant or bnb_accountant routing")

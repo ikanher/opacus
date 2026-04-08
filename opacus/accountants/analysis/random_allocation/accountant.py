@@ -16,6 +16,9 @@ Traceability:
 - `Mf/DP/PLDRandomAllocation.lean`
 - `Mf/DP/PLDRandomAllocationKOutOfTReduction.lean`
 - `Mf/DP/PLDRandomAllocationNumerics.lean`
+- `randomAllocationTransforms`
+- `exactKOutOfTReductionTheoremTarget`
+- `BNBDeterministicRandomAllocationBridge.lean`
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from typing import Any, Literal, Sequence, TypeAlias, overload
 
 import numpy as np
 from scipy import stats
+from scipy.signal import fftconvolve
 
 
 PMF_MASS_TOL = 10 * np.finfo(float).eps
@@ -113,6 +117,12 @@ class RandomAllocationAccountantInputs:
         reduced_num_steps_per_round: Reduced per-round length passed to the
             repeated recurrence.
         reduced_num_rounds: Reduced number of repeated rounds.
+        exact_law_route: Exact-law route used by the supported public repeated
+            path, if one was resolved.
+        initial_package_route: Deterministic initial-package route used by the
+            supported public repeated path, if one was resolved.
+        pair_driven_inputs: Internal package-backed repeated-accounting object
+            used by the supported public exact-law route.
     """
 
     contract_kind: str
@@ -131,6 +141,14 @@ class RandomAllocationAccountantInputs:
     pld_num_epochs: int
     reduced_num_steps_per_round: int
     reduced_num_rounds: int
+    exact_law_route: str | None = None
+    initial_package_route: str | None = None
+    pair_driven_inputs: Any | None = None
+
+
+_SUPPORTED_PUBLIC_EXACT_MECHANISMS = frozenset(
+    {"gaussian", "bsr", "bisr", "bandmf", "bandinvmf"}
+)
 
 
 @dataclass(frozen=True)
@@ -141,25 +159,56 @@ class RandomAllocationGaussianRuntimeConfig:
 
     Attributes:
         policy_name: Stable name for the runtime policy.
+        runtime_policy: Repeated-accounting runtime policy. Public repeated
+            routes currently distinguish `strict_exact_package` from
+            `efficient_staged_grid`.
         loss_discretization: Linear grid spacing used by the one-step PLD
-            realization before optional geometric conversion.
+            realization before optional geometric conversion. In efficient mode
+            this is the requested output-grid spacing.
         tail_truncation: Total tail budget spent on truncation and
-            rediscretization during composition.
+            rediscretization during composition. In efficient mode this is the
+            output-level tail budget before staged splitting.
         max_grid_fft: Maximum grid size permitted for FFT-based convolution.
         max_grid_mult: Maximum grid size permitted for iterative multiplication.
         convolution_method: Selected composition backend, e.g. `fft` or
             `geometric`.
         matches_package_defaults: Whether the policy matches the older package
             defaults rather than the repository-fast defaults.
+        clamp_to_package_grid: Whether package-backed evaluation should force
+            runtime loss spacing down to the package realization spacing.
+        remove_convolution_method: Preferred efficient remove-side convolution
+            policy.
+        add_convolution_method: Preferred efficient add-side convolution
+            policy.
+        refinement_rounds: Maximum bounded-refinement steps for repeated
+            calibration under the efficient policy.
     """
 
     policy_name: str
+    runtime_policy: str
     loss_discretization: float
     tail_truncation: float
     max_grid_fft: int
     max_grid_mult: int
     convolution_method: str
     matches_package_defaults: bool
+    clamp_to_package_grid: bool = True
+    remove_convolution_method: str = "fft"
+    add_convolution_method: str = "geometric"
+    refinement_rounds: int = 0
+
+
+@dataclass(frozen=True)
+class _RepeatedRuntimeStages:
+    output_loss_discretization: float
+    pre_composition_loss_discretization: float
+    inner_loss_discretization: float
+    output_tail_truncation: float
+    pre_composition_tail_truncation: float
+    inner_tail_truncation: float
+    remove_convolution_method: str
+    add_convolution_method: str
+    refinement_rounds: int
 
 
 class _LinearDiscreteDist:
@@ -801,6 +850,75 @@ def _binary_self_convolve(
     return acc if acc is not None else base
 
 
+def _linear_convolve_fft(
+    dist_1: _LinearDiscreteDist,
+    dist_2: _LinearDiscreteDist,
+    tail_truncation: float,
+    bound_type: _BoundType,
+) -> _LinearDiscreteDist:
+    if not math.isclose(
+        float(dist_1.x_gap),
+        float(dist_2.x_gap),
+        rel_tol=SPACING_RTOL,
+        abs_tol=SPACING_ATOL,
+    ):
+        raise ValueError("Linear convolution requires matching x_gap")
+
+    pmf = fftconvolve(dist_1.PMF_array, dist_2.PMF_array, mode="full")
+    pmf = np.maximum(np.asarray(pmf, dtype=np.float64), 0.0)
+    p_neg_inf, p_pos_inf = _convolve_infinite_masses(
+        dist_1.p_neg_inf,
+        dist_1.p_pos_inf,
+        dist_2.p_neg_inf,
+        dist_2.p_pos_inf,
+    )
+    pmf, p_neg_inf, p_pos_inf = _enforce_mass_conservation(
+        pmf, p_neg_inf, p_pos_inf, bound_type
+    )
+    return _LinearDiscreteDist(
+        dist_1.x_min + dist_2.x_min,
+        dist_1.x_gap,
+        pmf,
+        p_neg_inf,
+        p_pos_inf,
+    ).truncate_edges(tail_truncation, bound_type)
+
+
+def _binary_self_convolve_linear(
+    dist: _LinearDiscreteDist,
+    t: int,
+    tail_truncation: float,
+    bound_type: _BoundType,
+) -> _LinearDiscreteDist:
+    if t < 1:
+        raise ValueError("T must be >= 1")
+
+    if t == 1:
+        return dist
+
+    base = dist
+    acc: _LinearDiscreteDist | None = None
+    tail = tail_truncation / 4.0
+    remaining = int(t)
+    while remaining > 0:
+        if remaining & 1:
+            acc = (
+                base
+                if acc is None
+                else _linear_convolve_fft(
+                    acc, base, tail / max(remaining, 1), bound_type
+                )
+            )
+
+        remaining >>= 1
+        if remaining > 0:
+            base = _linear_convolve_fft(
+                base, base, tail / max(remaining, 1), bound_type
+            )
+
+    return acc if acc is not None else base
+
+
 def _geometric_convolve(
     dist_1: _GeometricDiscreteDist,
     dist_2: _GeometricDiscreteDist,
@@ -1187,12 +1305,29 @@ def _compose_linear_pmfs(
     num_rounds: int,
     tail_truncation: float,
     bound_type: _BoundType,
+    convolution_method: str = "direct",
 ) -> _LinearDiscreteDist:
     if num_rounds < 1:
         raise ValueError("num_rounds must be >= 1")
 
     if num_rounds == 1:
         return round_dist
+
+    if str(convolution_method) == "fft":
+        with _timed(
+            f"compose_linear_pmfs_fft num_rounds={num_rounds} bound={bound_type.value}"
+        ):
+            result = _binary_self_convolve_linear(
+                round_dist,
+                num_rounds,
+                tail_truncation,
+                bound_type,
+            )
+            _debug_timing(
+                "compose_linear_pmfs_fft result "
+                f"bound={bound_type.value} {_dist_debug_summary(result)}"
+            )
+            return result
 
     with _timed(
         f"compose_linear_pmfs num_rounds={num_rounds} bound={bound_type.value}"
@@ -1572,6 +1707,41 @@ def _resolve_random_allocation_shape(
     )
 
 
+def _resolve_public_exact_pair_driven_inputs(
+    *,
+    mechanism: str,
+    accountant_coeffs: tuple[float, ...],
+    noise_multiplier: float,
+    num_steps: int,
+    num_selected: int,
+    num_epochs: int,
+):
+    mechanism_name = str(mechanism)
+    if mechanism_name not in _SUPPORTED_PUBLIC_EXACT_MECHANISMS:
+        raise ValueError(
+            "random_allocation public exact-law route does not support "
+            f"mechanism={mechanism_name!r}; supported mechanisms are "
+            f"{sorted(_SUPPORTED_PUBLIC_EXACT_MECHANISMS)!r}"
+        )
+
+    # Import lazily to avoid a module cycle with `initial_package.py`.
+    from .exact_laws import build_realizable_gaussian_one_step_neighboring_pair
+    from .initial_package import resolve_pair_driven_random_allocation_inputs
+
+    pair = build_realizable_gaussian_one_step_neighboring_pair(
+        mechanism=mechanism_name,
+        forward_mean=np.asarray(accountant_coeffs, dtype=np.float64),
+        reverse_mean=np.zeros(len(accountant_coeffs), dtype=np.float64),
+        noise_multiplier=float(noise_multiplier),
+    )
+    return resolve_pair_driven_random_allocation_inputs(
+        pair=pair,
+        num_steps=int(num_steps),
+        num_selected=int(num_selected),
+        num_epochs=int(num_epochs),
+    )
+
+
 def resolve_random_allocation_accountant_inputs(
     *,
     mechanism: str,
@@ -1626,6 +1796,7 @@ def resolve_random_allocation_accountant_inputs(
         num_selected=resolved_num_selected,
         horizon=resolved_horizon,
     )
+    mechanism_name = str(mechanism)
     resolved_coeffs = _resolve_accountant_coeffs(
         accountant_coeffs=accountant_coeffs, mechanism_state=state, kwargs=local_kwargs
     )
@@ -1633,17 +1804,27 @@ def resolve_random_allocation_accountant_inputs(
 
     sigma = _resolve_noise_multiplier(noise_multiplier)
     effective_sigma = sigma / l2
+    pair_driven_inputs = _resolve_public_exact_pair_driven_inputs(
+        mechanism=mechanism_name,
+        accountant_coeffs=resolved_coeffs,
+        noise_multiplier=sigma,
+        num_steps=resolved_shape.cycle_length,
+        num_selected=resolved_shape.num_selected,
+        num_epochs=resolved_shape.num_epochs,
+    )
 
     return RandomAllocationAccountantInputs(
         contract_kind="pld_accounting_random_allocation",
         package_alignment_kind="repeated_k_out_of_t",
         package_alignment_notes=(
             "Repeated k-out-of-t deterministic random-allocation route from `RA`; "
+            "resolved through an exact common-covariance one-step neighboring law and the "
+            "deterministic initial-package evaluator; "
             f"uses the {'direct k = 1 transform' if resolved_num_selected == 1 else 'reduced general k-out-of-t transform'} "
             "rather than the later fixed-bin balls-in-bins bridge."
         ),
-        route=resolved_shape.route,
-        mechanism=str(mechanism),
+        route="pair_driven_public_exact_initial_package",
+        mechanism=mechanism_name,
         accountant_coeffs=resolved_coeffs,
         accountant_coeff_l2=l2,
         noise_multiplier=sigma,
@@ -1655,12 +1836,16 @@ def resolve_random_allocation_accountant_inputs(
         pld_num_epochs=resolved_shape.num_epochs,
         reduced_num_steps_per_round=resolved_shape.reduced_num_steps_per_round,
         reduced_num_rounds=resolved_shape.reduced_num_rounds,
+        exact_law_route=pair_driven_inputs.initial_package.exact_law_route,
+        initial_package_route=pair_driven_inputs.initial_package.route,
+        pair_driven_inputs=pair_driven_inputs,
     )
 
 
 def resolve_random_allocation_gaussian_runtime_config(
     *,
     target_delta: float,
+    runtime_policy: str | None = None,
     loss_discretization: float | None = None,
     tail_truncation: float | None = None,
     max_grid_fft: int | None = None,
@@ -1684,6 +1869,9 @@ def resolve_random_allocation_gaussian_runtime_config(
     - `convolution_method = "fft"`
     """
 
+    resolved_policy = (
+        str(runtime_policy) if runtime_policy is not None else "repository_fast_random_allocation"
+    )
     resolved_loss = (
         float(loss_discretization) if loss_discretization is not None else 5e-2
     )
@@ -1696,8 +1884,27 @@ def resolve_random_allocation_gaussian_runtime_config(
     resolved_mult = int(max_grid_mult) if max_grid_mult is not None else 100_000
     resolved_conv = str(convolution_method) if convolution_method is not None else "fft"
 
+    if resolved_policy == "strict_exact_package":
+        policy_name = "strict_exact_package"
+        clamp_to_package_grid = True
+        refinement_rounds = 0
+    elif resolved_policy == "efficient_staged_grid":
+        policy_name = "efficient_staged_grid"
+        clamp_to_package_grid = False
+        refinement_rounds = 2
+    elif resolved_policy == "repository_fast_random_allocation":
+        policy_name = "repository_fast_random_allocation"
+        clamp_to_package_grid = False
+        refinement_rounds = 0
+    else:
+        raise ValueError(
+            "random_allocation runtime_policy must be one of "
+            "['strict_exact_package', 'efficient_staged_grid', 'repository_fast_random_allocation']"
+        )
+
     return RandomAllocationGaussianRuntimeConfig(
-        policy_name="repository_fast_random_allocation",
+        policy_name=policy_name,
+        runtime_policy=resolved_policy,
         loss_discretization=resolved_loss,
         tail_truncation=resolved_tail,
         max_grid_fft=resolved_fft,
@@ -1710,6 +1917,10 @@ def resolve_random_allocation_gaussian_runtime_config(
             and resolved_fft == 1_000_000
             and resolved_mult == -1
         ),
+        clamp_to_package_grid=clamp_to_package_grid,
+        remove_convolution_method="fft",
+        add_convolution_method="geometric",
+        refinement_rounds=refinement_rounds,
     )
 
 
@@ -1751,6 +1962,51 @@ def build_gaussian_random_allocation_realization(
         return realization
 
 
+def _derive_repeated_runtime_stages(
+    *,
+    inputs: RandomAllocationAccountantInputs,
+    runtime: RandomAllocationGaussianRuntimeConfig,
+) -> _RepeatedRuntimeStages:
+    if runtime.runtime_policy != "efficient_staged_grid":
+        loss = float(runtime.loss_discretization)
+        tail = float(runtime.tail_truncation)
+        return _RepeatedRuntimeStages(
+            output_loss_discretization=loss,
+            pre_composition_loss_discretization=loss,
+            inner_loss_discretization=loss,
+            output_tail_truncation=tail,
+            pre_composition_tail_truncation=tail,
+            inner_tail_truncation=tail,
+            remove_convolution_method=str(runtime.remove_convolution_method),
+            add_convolution_method=str(runtime.add_convolution_method),
+            refinement_rounds=int(runtime.refinement_rounds),
+        )
+
+    num_rounds = max(1, int(inputs.reduced_num_rounds))
+    num_steps_per_round = max(1, int(inputs.reduced_num_steps_per_round))
+    output_loss = float(runtime.loss_discretization)
+    output_tail = float(runtime.tail_truncation)
+    pre_loss = output_loss / math.sqrt(float(num_rounds))
+    inner_divisor = 2.0 * math.ceil(math.log2(float(num_steps_per_round))) + 1.0
+    inner_loss = pre_loss / inner_divisor
+    pre_tail = output_tail / float(num_rounds)
+    inner_tail = max(
+        pre_tail / float(num_steps_per_round),
+        float(np.finfo(float).eps * 1e-10),
+    )
+    return _RepeatedRuntimeStages(
+        output_loss_discretization=output_loss,
+        pre_composition_loss_discretization=pre_loss,
+        inner_loss_discretization=inner_loss,
+        output_tail_truncation=output_tail,
+        pre_composition_tail_truncation=pre_tail,
+        inner_tail_truncation=inner_tail,
+        remove_convolution_method=str(runtime.remove_convolution_method),
+        add_convolution_method=str(runtime.add_convolution_method),
+        refinement_rounds=int(runtime.refinement_rounds),
+    )
+
+
 def estimate_epsilon_random_allocation(
     *,
     inputs: RandomAllocationAccountantInputs,
@@ -1764,6 +2020,15 @@ def estimate_epsilon_random_allocation(
 
     Source: `PLD`.
     """
+
+    if inputs.pair_driven_inputs is not None:
+        from .initial_package import estimate_epsilon_random_allocation_from_initial_package
+
+        return estimate_epsilon_random_allocation_from_initial_package(
+            inputs=inputs.pair_driven_inputs,
+            target_delta=target_delta,
+            runtime_config=runtime_config,
+        )
 
     return _estimate_epsilon_random_allocation_bound(
         inputs=inputs,
@@ -1860,6 +2125,17 @@ def estimate_epsilon_range_random_allocation(
     runtime = runtime_config or resolve_random_allocation_gaussian_runtime_config(
         target_delta=target_delta
     )
+    if inputs.pair_driven_inputs is not None:
+        from .initial_package import (
+            estimate_epsilon_range_random_allocation_from_initial_package,
+        )
+
+        return estimate_epsilon_range_random_allocation_from_initial_package(
+            inputs=inputs.pair_driven_inputs,
+            target_delta=target_delta,
+            runtime_config=runtime,
+        )
+
     upper = _estimate_epsilon_random_allocation_bound(
         inputs=inputs,
         target_delta=target_delta,

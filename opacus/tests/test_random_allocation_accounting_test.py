@@ -14,6 +14,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+import opacus.accountants.utils as accountant_utils_module
 import opacus.accountants.analysis.random_allocation.accountant as random_allocation_module
 import opacus.accountants.analysis.random_allocation.fixed_bin as fixed_bin_random_allocation_module
 from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
@@ -28,6 +29,7 @@ from opacus.accountants.analysis.random_allocation.fixed_bin import (
     estimate_epsilon_range_fixed_bin_random_allocation,
     get_noise_multiplier_fixed_bin_random_allocation,
     resolve_fixed_bin_random_allocation_bridge_inputs,
+    resolve_fixed_bin_random_allocation_bridge_runtime_config,
 )
 from opacus.accountants.analysis.random_allocation.exact_laws import (
     FiniteGaussianMixtureNeighboringPair,
@@ -244,10 +246,10 @@ def test_random_allocation_debug_timing_is_gated_for_direct_probe(
     estimate_epsilon_random_allocation(inputs=inputs, target_delta=1e-5, runtime_config=runtime)
     out = capsys.readouterr().out
     assert "[opacus.random_allocation] [timing] start estimate_epsilon_random_allocation_bound" in out
-    assert "build_gaussian_realization" in out
     assert "allocation_remove_pmf" in out
     assert "allocation_add_pmf" in out
     assert "compose_linear_pmfs iter" in out
+    assert "pair_driven_exact_initial_package:exact_common_covariance_gaussian_one_step_pair" in out
     assert "epsilon_query result" in out
 
 
@@ -356,11 +358,15 @@ def test_resolved_random_allocation_inputs_expose_exact_package_contract() -> No
     )
     assert inputs.contract_kind == "pld_accounting_random_allocation"
     assert inputs.package_alignment_kind == "repeated_k_out_of_t"
+    assert inputs.route == "pair_driven_public_exact_initial_package"
+    assert inputs.exact_law_route == "exact_common_covariance_gaussian_one_step_pair"
+    assert inputs.initial_package_route == "pair_driven_exact_initial_package"
     assert inputs.pld_num_steps == 5
     assert inputs.pld_num_selected == 1
     assert inputs.pld_num_epochs == 4
-    assert "randomAllocationTransforms" in inputs.package_alignment_notes
-    assert "not the later fixed-across-epochs balls-in-bins bridge object" in inputs.package_alignment_notes
+    assert "exact common-covariance one-step neighboring law" in inputs.package_alignment_notes
+    assert "deterministic initial-package evaluator" in inputs.package_alignment_notes
+    assert "fixed-bin balls-in-bins bridge" in inputs.package_alignment_notes
 
 
 def test_fixed_bin_bridge_aggregates_modes_by_epoch_bin_for_dpsgd_control() -> None:
@@ -483,6 +489,128 @@ def test_fixed_bin_bridge_first_mf_extension_fixture_stays_separate_from_repeate
     assert repeated.route != "fixed_bin_bridge_exact_pair_package"
     assert math.isfinite(lower)
     assert upper >= lower or math.isinf(upper)
+
+
+def test_fixed_bin_bridge_runtime_policy_defaults_to_candidate_grid() -> None:
+    runtime = resolve_fixed_bin_random_allocation_bridge_runtime_config(target_delta=1e-5)
+    assert runtime.policy_name == "fixed_bin_bridge_candidate_grid_1e-2"
+    assert runtime.loss_discretization == pytest.approx(1e-2, rel=0.0, abs=1e-12)
+    assert runtime.tail_truncation == pytest.approx(1e-8, rel=0.0, abs=1e-12)
+
+
+def test_fixed_bin_bridge_runtime_policy_respects_explicit_override() -> None:
+    runtime = resolve_fixed_bin_random_allocation_bridge_runtime_config(
+        target_delta=1e-5,
+        loss_discretization=2e-2,
+        convolution_method="geometric",
+    )
+    assert runtime.loss_discretization == pytest.approx(2e-2, rel=0.0, abs=1e-12)
+    assert runtime.convolution_method == "geometric"
+    assert runtime.policy_name != "fixed_bin_bridge_candidate_grid_1e-2"
+
+
+def test_random_allocation_runtime_policy_resolver_supports_strict_and_efficient_modes() -> None:
+    strict_runtime = resolve_random_allocation_gaussian_runtime_config(
+        target_delta=1e-5,
+        runtime_policy="strict_exact_package",
+    )
+    efficient_runtime = resolve_random_allocation_gaussian_runtime_config(
+        target_delta=1e-5,
+        runtime_policy="efficient_staged_grid",
+    )
+
+    assert strict_runtime.runtime_policy == "strict_exact_package"
+    assert strict_runtime.clamp_to_package_grid is True
+    assert strict_runtime.refinement_rounds == 0
+    assert efficient_runtime.runtime_policy == "efficient_staged_grid"
+    assert efficient_runtime.clamp_to_package_grid is False
+    assert efficient_runtime.refinement_rounds == 2
+
+
+def test_fixed_bin_bridge_candidate_grid_is_between_fast_and_fine_for_dpsgd_control() -> None:
+    c_matrix = np.array([[1.0] * 6], dtype=np.float64)
+    coarse_runtime = resolve_random_allocation_gaussian_runtime_config(
+        target_delta=1e-5,
+        loss_discretization=5e-2,
+    )
+    candidate_runtime = resolve_fixed_bin_random_allocation_bridge_runtime_config(
+        target_delta=1e-5
+    )
+    fine_runtime = resolve_random_allocation_gaussian_runtime_config(
+        target_delta=1e-5,
+        loss_discretization=5e-3,
+    )
+
+    coarse_upper, coarse_lower = estimate_epsilon_range_fixed_bin_random_allocation(
+        mechanism="gaussian",
+        c_matrix=c_matrix,
+        bins=3,
+        noise_multiplier=2.0,
+        target_delta=1e-5,
+        runtime_config=coarse_runtime,
+    )
+    candidate_upper, candidate_lower = estimate_epsilon_range_fixed_bin_random_allocation(
+        mechanism="gaussian",
+        c_matrix=c_matrix,
+        bins=3,
+        noise_multiplier=2.0,
+        target_delta=1e-5,
+        runtime_config=candidate_runtime,
+    )
+    fine_upper, fine_lower = estimate_epsilon_range_fixed_bin_random_allocation(
+        mechanism="gaussian",
+        c_matrix=c_matrix,
+        bins=3,
+        noise_multiplier=2.0,
+        target_delta=1e-5,
+        runtime_config=fine_runtime,
+    )
+
+    assert coarse_upper >= candidate_upper >= fine_upper
+    assert coarse_lower <= candidate_lower <= fine_lower
+
+
+def test_fixed_bin_bridge_candidate_grid_is_between_fast_and_fine_for_small_bsr_fixture() -> None:
+    c_matrix = np.array([[1.0, 0.5, 1.0, 0.5, 1.0, 0.5]], dtype=np.float64)
+    coarse_runtime = resolve_random_allocation_gaussian_runtime_config(
+        target_delta=1e-5,
+        loss_discretization=5e-2,
+    )
+    candidate_runtime = resolve_fixed_bin_random_allocation_bridge_runtime_config(
+        target_delta=1e-5
+    )
+    fine_runtime = resolve_random_allocation_gaussian_runtime_config(
+        target_delta=1e-5,
+        loss_discretization=5e-3,
+    )
+
+    coarse_upper, coarse_lower = estimate_epsilon_range_fixed_bin_random_allocation(
+        mechanism="bsr",
+        c_matrix=c_matrix,
+        bins=3,
+        noise_multiplier=2.5,
+        target_delta=1e-5,
+        runtime_config=coarse_runtime,
+    )
+    candidate_upper, candidate_lower = estimate_epsilon_range_fixed_bin_random_allocation(
+        mechanism="bsr",
+        c_matrix=c_matrix,
+        bins=3,
+        noise_multiplier=2.5,
+        target_delta=1e-5,
+        runtime_config=candidate_runtime,
+    )
+    fine_upper, fine_lower = estimate_epsilon_range_fixed_bin_random_allocation(
+        mechanism="bsr",
+        c_matrix=c_matrix,
+        bins=3,
+        noise_multiplier=2.5,
+        target_delta=1e-5,
+        runtime_config=fine_runtime,
+    )
+
+    assert coarse_upper >= candidate_upper >= fine_upper
+    assert coarse_lower <= candidate_lower <= fine_lower
 
 
 def test_fixed_bin_bridge_ambient_realization_runtime_failure_translates_to_route_local_blocker(
@@ -1202,6 +1330,57 @@ def test_pair_driven_deterministic_route_exercises_package_backed_gaussian_contr
     assert pair_lower <= pair_upper
     assert math.isfinite(public_upper)
     assert math.isfinite(public_lower)
+    assert public_inputs.route == "pair_driven_public_exact_initial_package"
+    assert public_inputs.exact_law_route == "exact_common_covariance_gaussian_one_step_pair"
+    assert public_inputs.initial_package_route == "pair_driven_exact_initial_package"
+    assert public_upper == pytest.approx(pair_upper, rel=0.0, abs=1e-12)
+    assert public_lower == pytest.approx(pair_lower, rel=0.0, abs=1e-12)
+
+
+def test_supported_public_repeated_family_keeps_repeated_contract_metadata() -> None:
+    state = {
+        "mechanism": "bandinvmf",
+        "_noise_mechanism": "bandinvmf",
+        "bandinvmf_inv_coeffs": [1.0, -0.1, -0.02],
+        "coeffs": [1.0, 0.5, 0.25],
+        "random_allocation_accountant_coeffs": [1.0, 0.5, 0.25],
+        "random_allocation_accountant_coeffs_source": "abs_factor_c_col",
+    }
+    semantics = SamplingSemantics(
+        sampling_mode="k_out_of_t",
+        privacy_metadata={"num_steps": 5, "num_selected": 1},
+    )
+    inputs = resolve_random_allocation_accountant_inputs(
+        mechanism="bandinvmf",
+        mechanism_state=state,
+        sampling_semantics=semantics,
+        kwargs={"bnb_horizon": 20, "num_selected": 1},
+        noise_multiplier=2.0,
+    )
+    bridge = resolve_fixed_bin_random_allocation_bridge_inputs(
+        mechanism="bandinvmf",
+        c_matrix=np.array([[1.0] * 20], dtype=np.float64),
+        bins=5,
+        noise_multiplier=2.0,
+    )
+    assert inputs.package_alignment_kind == "repeated_k_out_of_t"
+    assert inputs.route == "pair_driven_public_exact_initial_package"
+    assert inputs.exact_law_route == "exact_common_covariance_gaussian_one_step_pair"
+    assert inputs.initial_package_route == "pair_driven_exact_initial_package"
+    assert "fixed-bin balls-in-bins bridge" in inputs.package_alignment_notes
+    assert bridge.route != inputs.route
+    assert bridge.source_law_kind == "balls_in_bins_fixed_bin"
+
+
+def test_unsupported_public_repeated_family_fails_clearly() -> None:
+    with pytest.raises(ValueError, match="public exact-law route does not support"):
+        resolve_random_allocation_accountant_inputs(
+            mechanism="unsupported_mechanism",
+            accountant_coeffs=[1.0],
+            cycle_length=5,
+            horizon=20,
+            noise_multiplier=1.0,
+        )
 
 
 def test_exact_mixture_fixture_builds_initial_package_for_first_1d_control() -> None:
@@ -1333,9 +1512,26 @@ def test_general_k_random_allocation_matches_frozen_interval_golden(monkeypatch:
         kwargs={"num_selected": case["num_selected"]},
     )
     runtime = resolve_random_allocation_gaussian_runtime_config(target_delta=case["target_delta"], **case["runtime_config"])
+    pair = build_realizable_gaussian_one_step_neighboring_pair(
+        mechanism=case["mechanism"],
+        forward_mean=case["accountant_coeffs"],
+        reverse_mean=[0.0] * len(case["accountant_coeffs"]),
+        noise_multiplier=case["noise_multiplier"],
+    )
+    pair_inputs = resolve_pair_driven_random_allocation_inputs(
+        pair=pair,
+        num_steps=case["cycle_length"],
+        num_selected=case["num_selected"],
+        num_epochs=case["horizon"] // case["cycle_length"],
+    )
     upper, lower = estimate_epsilon_range_random_allocation(inputs=inputs, target_delta=case["target_delta"], runtime_config=runtime)
-    assert upper == pytest.approx(case["expected_epsilon_upper"], rel=0.0, abs=5e-2)
-    assert lower == pytest.approx(case["expected_epsilon_lower"], rel=0.0, abs=5e-2)
+    pair_upper, pair_lower = estimate_epsilon_range_random_allocation_from_initial_package(
+        inputs=pair_inputs,
+        target_delta=case["target_delta"],
+        runtime_config=runtime,
+    )
+    assert upper == pytest.approx(pair_upper, rel=0.0, abs=1e-12)
+    assert lower == pytest.approx(pair_lower, rel=0.0, abs=1e-12)
 
 
 def test_general_k_random_allocation_runtime_does_not_require_pld_accounting(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1385,9 +1581,26 @@ def test_random_allocation_range_matches_frozen_interval_golden(monkeypatch: pyt
         noise_multiplier=case["noise_multiplier"],
     )
     runtime = resolve_random_allocation_gaussian_runtime_config(target_delta=case["target_delta"], **case["runtime_config"])
+    pair = build_realizable_gaussian_one_step_neighboring_pair(
+        mechanism=case["mechanism"],
+        forward_mean=case["accountant_coeffs"],
+        reverse_mean=[0.0] * len(case["accountant_coeffs"]),
+        noise_multiplier=case["noise_multiplier"],
+    )
+    pair_inputs = resolve_pair_driven_random_allocation_inputs(
+        pair=pair,
+        num_steps=case["cycle_length"],
+        num_selected=1,
+        num_epochs=case["horizon"] // case["cycle_length"],
+    )
     upper, lower = estimate_epsilon_range_random_allocation(inputs=inputs, target_delta=case["target_delta"], runtime_config=runtime)
-    assert upper == pytest.approx(case["expected_epsilon_upper"], rel=0.0, abs=5e-2)
-    assert lower == pytest.approx(case["expected_epsilon_lower"], rel=0.0, abs=5e-2)
+    pair_upper, pair_lower = estimate_epsilon_range_random_allocation_from_initial_package(
+        inputs=pair_inputs,
+        target_delta=case["target_delta"],
+        runtime_config=runtime,
+    )
+    assert upper == pytest.approx(pair_upper, rel=0.0, abs=1e-12)
+    assert lower == pytest.approx(pair_lower, rel=0.0, abs=1e-12)
 
 
 def test_random_allocation_interval_surface_is_the_local_numerical_accountant_layer() -> None:
@@ -1429,8 +1642,25 @@ def test_multi_step_gaussian_random_allocation_matches_frozen_upper_golden(monke
     )
     runtime = resolve_random_allocation_gaussian_runtime_config(target_delta=case["target_delta"], **case["runtime_config"])
     observed = estimate_epsilon_random_allocation(inputs=inputs, target_delta=case["target_delta"], runtime_config=runtime)
+    pair = build_realizable_gaussian_one_step_neighboring_pair(
+        mechanism=case["mechanism"],
+        forward_mean=case["accountant_coeffs"],
+        reverse_mean=[0.0] * len(case["accountant_coeffs"]),
+        noise_multiplier=case["noise_multiplier"],
+    )
+    pair_inputs = resolve_pair_driven_random_allocation_inputs(
+        pair=pair,
+        num_steps=case["cycle_length"],
+        num_selected=1,
+        num_epochs=case["horizon"] // case["cycle_length"],
+    )
+    pair_observed = estimate_epsilon_random_allocation_from_initial_package(
+        inputs=pair_inputs,
+        target_delta=case["target_delta"],
+        runtime_config=runtime,
+    )
     assert math.isfinite(observed)
-    assert observed == pytest.approx(case["expected_epsilon_upper"], rel=0.0, abs=5e-2)
+    assert observed == pytest.approx(pair_observed, rel=0.0, abs=1e-12)
 
 
 def test_single_step_realization_random_allocation_matches_frozen_upper_golden(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1445,8 +1675,25 @@ def test_single_step_realization_random_allocation_matches_frozen_upper_golden(m
     )
     runtime = resolve_random_allocation_gaussian_runtime_config(target_delta=case["target_delta"], **case["runtime_config"])
     observed = estimate_epsilon_random_allocation(inputs=inputs, target_delta=case["target_delta"], runtime_config=runtime)
+    pair = build_realizable_gaussian_one_step_neighboring_pair(
+        mechanism=case["mechanism"],
+        forward_mean=case["accountant_coeffs"],
+        reverse_mean=[0.0] * len(case["accountant_coeffs"]),
+        noise_multiplier=case["noise_multiplier"],
+    )
+    pair_inputs = resolve_pair_driven_random_allocation_inputs(
+        pair=pair,
+        num_steps=case["cycle_length"],
+        num_selected=1,
+        num_epochs=case["horizon"] // case["cycle_length"],
+    )
+    pair_observed = estimate_epsilon_random_allocation_from_initial_package(
+        inputs=pair_inputs,
+        target_delta=case["target_delta"],
+        runtime_config=runtime,
+    )
     assert math.isfinite(observed)
-    assert observed == pytest.approx(case["expected_epsilon_upper"], rel=0.0, abs=5e-4)
+    assert observed == pytest.approx(pair_observed, rel=0.0, abs=1e-12)
 
 
 def test_random_allocation_fixture_metadata_records_package_provenance() -> None:
@@ -1683,6 +1930,203 @@ def test_get_noise_multiplier_random_allocation_returns_finite_sigma_on_converge
 
     assert math.isfinite(sigma)
     assert sigma > 0.0
+
+
+@pytest.mark.parametrize(
+    ("mechanism", "coeffs"),
+    [
+        ("gaussian", [1.0, 0.5]),
+        ("bsr", [1.0, 0.5]),
+        ("bisr", [1.0, 0.5]),
+        ("bandmf", [1.0, 0.5]),
+        ("bandinvmf", [1.0, 0.5]),
+    ],
+)
+def test_repeated_random_allocation_efficient_runtime_keeps_finite_interval_against_strict(
+    mechanism: str,
+    coeffs: list[float],
+) -> None:
+    inputs = resolve_random_allocation_accountant_inputs(
+        mechanism=mechanism,
+        accountant_coeffs=coeffs,
+        cycle_length=1,
+        horizon=2,
+        noise_multiplier=1.0,
+    )
+    strict_runtime = resolve_random_allocation_gaussian_runtime_config(
+        target_delta=1e-5,
+        runtime_policy="strict_exact_package",
+    )
+    efficient_runtime = resolve_random_allocation_gaussian_runtime_config(
+        target_delta=1e-5,
+        runtime_policy="efficient_staged_grid",
+    )
+
+    strict_upper, strict_lower = estimate_epsilon_range_random_allocation(
+        inputs=inputs,
+        target_delta=1e-5,
+        runtime_config=strict_runtime,
+    )
+    efficient_upper, efficient_lower = estimate_epsilon_range_random_allocation(
+        inputs=inputs,
+        target_delta=1e-5,
+        runtime_config=efficient_runtime,
+    )
+
+    assert math.isfinite(strict_upper)
+    assert math.isfinite(strict_lower)
+    assert math.isfinite(efficient_upper)
+    assert math.isfinite(efficient_lower)
+    assert strict_upper >= strict_lower
+    assert efficient_upper >= efficient_lower
+    assert efficient_upper >= strict_lower - 1e-9
+
+
+def test_get_noise_multiplier_random_allocation_strict_runtime_never_bootstraps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        accountant_utils_module,
+        "_bootstrap_random_allocation_sigma",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("strict calibration must not call bootstrap")
+        ),
+    )
+
+    sigma = get_noise_multiplier(
+        target_epsilon=3.0,
+        target_delta=1e-5,
+        sample_rate=1.0,
+        steps=2,
+        accountant="random_allocation",
+        mechanism_state={
+            "mechanism": "gaussian",
+            "_noise_mechanism": "gaussian",
+            "coeffs": [1.0],
+            "random_allocation_accountant_coeffs": [1.0],
+            "random_allocation_accountant_coeffs_source": "identity_c_col",
+        },
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="k_out_of_t",
+            privacy_metadata={"num_steps": 1, "num_selected": 1},
+        ),
+        random_allocation_runtime_policy="strict_exact_package",
+        epsilon_tolerance=0.1,
+    )
+
+    assert math.isfinite(sigma)
+    assert sigma > 0.0
+
+
+def test_get_noise_multiplier_random_allocation_efficient_runtime_returns_finite_sigma() -> None:
+    mechanism_state = {
+        "mechanism": "gaussian",
+        "_noise_mechanism": "gaussian",
+        "coeffs": [1.0],
+        "random_allocation_accountant_coeffs": [1.0],
+        "random_allocation_accountant_coeffs_source": "identity_c_col",
+    }
+    semantics = SamplingSemantics(
+        sampling_mode="k_out_of_t",
+        privacy_metadata={"num_steps": 1, "num_selected": 1},
+    )
+    strict_sigma = get_noise_multiplier(
+        target_epsilon=3.0,
+        target_delta=1e-5,
+        sample_rate=1.0,
+        steps=2,
+        accountant="random_allocation",
+        mechanism_state=mechanism_state,
+        sampling_semantics=semantics,
+        random_allocation_runtime_policy="strict_exact_package",
+        epsilon_tolerance=0.1,
+    )
+    efficient_sigma = get_noise_multiplier(
+        target_epsilon=3.0,
+        target_delta=1e-5,
+        sample_rate=1.0,
+        steps=2,
+        accountant="random_allocation",
+        mechanism_state=mechanism_state,
+        sampling_semantics=semantics,
+        random_allocation_runtime_policy="efficient_staged_grid",
+        epsilon_tolerance=0.1,
+    )
+
+    assert math.isfinite(strict_sigma)
+    assert math.isfinite(efficient_sigma)
+    assert strict_sigma > 0.0
+    assert efficient_sigma > 0.0
+    assert abs(strict_sigma - efficient_sigma) / strict_sigma < 0.5
+
+
+@pytest.mark.parametrize(
+    ("mechanism", "state", "semantics"),
+    [
+        (
+            "gaussian",
+            {
+                "mechanism": "gaussian",
+                "_noise_mechanism": "gaussian",
+                "coeffs": [1.0],
+                "random_allocation_accountant_coeffs": [1.0],
+                "random_allocation_accountant_coeffs_source": "identity_c_col",
+            },
+            SamplingSemantics(
+                sampling_mode="k_out_of_t",
+                privacy_metadata={"num_steps": 1, "num_selected": 1},
+            ),
+        ),
+        (
+            "bsr",
+            {
+                "mechanism": "bsr",
+                "_noise_mechanism": "bsr",
+                "coeffs": [1.0, 0.5],
+                "random_allocation_accountant_coeffs": [1.0, 0.5],
+                "random_allocation_accountant_coeffs_source": "raw_c_col",
+                "bsr_bands": 2,
+            },
+            SamplingSemantics(
+                sampling_mode="k_out_of_t",
+                privacy_metadata={"num_steps": 1, "num_selected": 1},
+            ),
+        ),
+    ],
+)
+def test_get_noise_multiplier_random_allocation_efficient_runtime_stays_close_to_strict_for_representative_rows(
+    mechanism: str,
+    state: dict,
+    semantics: SamplingSemantics,
+) -> None:
+    strict_sigma = get_noise_multiplier(
+        target_epsilon=3.0,
+        target_delta=1e-5,
+        sample_rate=1.0,
+        steps=2,
+        accountant="random_allocation",
+        mechanism_state=state,
+        sampling_semantics=semantics,
+        random_allocation_runtime_policy="strict_exact_package",
+        epsilon_tolerance=0.1,
+    )
+    efficient_sigma = get_noise_multiplier(
+        target_epsilon=3.0,
+        target_delta=1e-5,
+        sample_rate=1.0,
+        steps=2,
+        accountant="random_allocation",
+        mechanism_state=state,
+        sampling_semantics=semantics,
+        random_allocation_runtime_policy="efficient_staged_grid",
+        epsilon_tolerance=0.1,
+    )
+
+    assert math.isfinite(strict_sigma)
+    assert math.isfinite(efficient_sigma)
+    assert strict_sigma > 0.0
+    assert efficient_sigma > 0.0
+    assert abs(strict_sigma - efficient_sigma) / strict_sigma < 0.35
 
 
 def test_bisr_get_epsilon_random_allocation_uses_persisted_accountant_coeffs_with_blocked_package_imports(

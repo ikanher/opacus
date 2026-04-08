@@ -37,13 +37,12 @@ Error For Multiepoch Differentially Private SGD (Kalinin et al., 2025)
 import math
 from typing import Iterable
 
-import torch
 
-# These are reusable from the BSR implementation
-from opacus.accountants.analysis.bsr import (
-    bsr_cyclic_poisson_epsilon_upper_bound,
-    compute_bsr_kappa_from_coeffs,
-    compute_bsr_mf_sensitivity_from_coeffs,
+# This cyclic reduction surface is shared with BSR.
+from opacus.accountants.analysis.bsr import bsr_cyclic_poisson_epsilon_upper_bound
+from opacus.accountants.analysis.toeplitz_family import (
+    InverseSideToeplitzFamily,
+    ToeplitzMechanismFamily,
 )
 
 
@@ -106,23 +105,6 @@ def generate_bisr_coeffs_from_sgd_workload(
     return coeffs
 
 
-def _build_lower_toeplitz_matrix_from_coeffs(
-    *,
-    coeffs: list[float],
-    steps: int,
-) -> torch.Tensor:
-    if steps < 1:
-        raise ValueError("steps must be >= 1")
-
-    matrix = torch.zeros((steps, steps), dtype=torch.float64)
-    max_lag = len(coeffs) - 1
-    for row in range(steps):
-        for lag in range(min(row, max_lag) + 1):
-            matrix[row, row - lag] = float(coeffs[lag])
-
-    return matrix
-
-
 def derive_bisr_factor_coeffs_from_inverse_coeffs(
     *,
     coeffs: Iterable[float],
@@ -137,28 +119,14 @@ def derive_bisr_factor_coeffs_from_inverse_coeffs(
     This helper constructs the finite-horizon lower-triangular Toeplitz inverse
     matrix, inverts it in float64, and returns the first-column coefficients of
     the resulting factor-side lower-triangular Toeplitz matrix.
+
+    Delegates to the shared Toeplitz-family numerical factor-recovery route.
     """
-    coeff_list = [float(c) for c in coeffs]
-    if len(coeff_list) == 0:
-        raise ValueError("coeffs must be non-empty")
-
-    if not all(math.isfinite(c) for c in coeff_list):
-        raise ValueError("coeffs must be finite")
-
-    if int(steps) < 1:
-        raise ValueError("steps must be >= 1")
-
-    inverse_matrix = _build_lower_toeplitz_matrix_from_coeffs(
-        coeffs=coeff_list,
+    return InverseSideToeplitzFamily(
+        inv_coeffs=[float(c) for c in coeffs],
         steps=int(steps),
-    )
-    factor_matrix = torch.linalg.inv(inverse_matrix)
-    factor_coeffs = [float(factor_matrix[row, 0]) for row in range(int(steps))]
-
-    if not all(math.isfinite(c) for c in factor_coeffs):
-        raise ValueError("derived factor coefficients must be finite")
-
-    return factor_coeffs
+        source="bisr",
+    ).factor_coeffs()
 
 
 def derive_bisr_runtime_coeffs_from_inverse_coeffs(
@@ -226,13 +194,13 @@ def compute_bisr_fixed_batch_sensitivity_from_inverse_coeffs(
         coeffs=coeffs,
         steps=steps,
     )
-    return float(
-        compute_bsr_mf_sensitivity_from_coeffs(
-            coeffs=factor_coeffs,
-            steps=steps,
-            max_participations=max_participations,
-            min_separation=min_separation,
-        )
+    return ToeplitzMechanismFamily(
+        coeffs=factor_coeffs,
+        steps=int(steps),
+        source="bisr",
+    ).fixed_batch_sensitivity(
+        max_participations=max_participations,
+        min_separation=min_separation,
     )
 
 
@@ -285,12 +253,11 @@ def compute_bisr_kappa_from_coeffs(
     if not all(math.isfinite(c) for c in coeff_list):
         raise ValueError("coeffs must be finite")
 
-    return float(
-        compute_bsr_kappa_from_coeffs(
-            coeffs=coeff_list,
-            steps=steps,
-        )
-    )
+    return ToeplitzMechanismFamily(
+        coeffs=coeff_list,
+        steps=int(steps),
+        source="bisr",
+    ).kappa()
 
 
 def bisr_cyclic_poisson_epsilon_upper_bound(

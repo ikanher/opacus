@@ -32,11 +32,12 @@ from typing import Iterable
 import numpy as np
 import torch
 
-from opacus.accountants.analysis.bisr import (
-    derive_bisr_factor_coeffs_from_inverse_coeffs,
-    generate_bisr_coeffs_from_sgd_workload,
-)
+from opacus.accountants.analysis.bisr import generate_bisr_coeffs_from_sgd_workload
 from opacus.accountants.analysis.bsr import compute_bsr_mf_sensitivity_from_coeffs
+from opacus.accountants.analysis.toeplitz_family import (
+    InverseSideToeplitzFamily,
+    ToeplitzMechanismFamily,
+)
 
 
 def _validate_workload_params(*, bands: int, momentum: float, weight_decay: float) -> None:
@@ -142,10 +143,11 @@ def derive_bandinvmf_factor_coeffs_from_inv_coeffs(
     helper keeps the BandInvMF namespace explicit while reusing the same
     finite-horizon inverse-to-factor derivation pattern as BISR.
     """
-    return derive_bisr_factor_coeffs_from_inverse_coeffs(
-        coeffs=inv_coeffs,
-        steps=steps,
-    )
+    return InverseSideToeplitzFamily(
+        inv_coeffs=[float(c) for c in inv_coeffs],
+        steps=int(steps),
+        source="bandinvmf",
+    ).factor_coeffs()
 
 
 def derive_bandinvmf_inv_coeffs_from_runtime_coeffs(
@@ -191,13 +193,13 @@ def compute_bandinvmf_fixed_batch_sensitivity_from_inv_coeffs(
         steps=steps,
     )
     factor_envelope = _decreasing_envelope(np.maximum(np.asarray(factor_coeffs, dtype=np.float64), 0.0))
-    return float(
-        compute_bsr_mf_sensitivity_from_coeffs(
-            coeffs=factor_envelope.tolist(),
-            steps=steps,
-            max_participations=max_participations,
-            min_separation=min_separation,
-        )
+    return ToeplitzMechanismFamily(
+        coeffs=factor_envelope.tolist(),
+        steps=int(steps),
+        source="bandinvmf",
+    ).fixed_batch_sensitivity(
+        max_participations=max_participations,
+        min_separation=min_separation,
     )
 
 
@@ -460,6 +462,8 @@ def optimize_bandinvmf_inv_coeffs_for_sgd_workload(
 
         loss = mean_error * total_sq
         if not torch.isfinite(loss):
+            # Keep the current objective semantics but push LBFGS back toward
+            # the finite region when the inverse-to-factor mapping explodes.
             return torch.tensor(1e100, dtype=v.dtype, device=v.device) + (
                 torch.sum(v * v) * 0.0
             )
@@ -487,6 +491,8 @@ def optimize_bandinvmf_inv_coeffs_for_sgd_workload(
             except (FloatingPointError, OverflowError, ValueError):
                 candidate_obj = math.inf
             if math.isfinite(candidate_obj) and candidate_obj < best_obj - 1e-12:
+                # CIFAR-scale line search can leave the finite region after an
+                # earlier valid improvement; keep that best finite candidate.
                 best_obj = candidate_obj
                 best_opt = candidate
         loss.backward()

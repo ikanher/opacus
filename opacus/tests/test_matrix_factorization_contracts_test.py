@@ -27,8 +27,10 @@ import opacus.privacy_engine as privacy_engine_mod
 from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
 from opacus.accountants.analysis.bandmf import generate_bandmf_coeffs_from_sgd_workload
 from opacus.accountants.analysis.bsr import generate_bsr_coeffs_from_sgd_workload
+from opacus.accountants.analysis.bifr import generate_bifr_factor_coeffs_from_sgd_workload
 from opacus.optimizers import CorrelatedNoiseMechanism, GaussianNoiseMechanism
 from opacus.utils.uniform_sampler import (
+    BMinSepSampler,
     BallsInBinsSampler,
     CyclicPoissonSampler,
 )
@@ -252,25 +254,22 @@ def test_bsr_mechanism_rejects_standard_accounting_mode() -> None:
         )
 
 
-def test_sampling_semantics_b_min_sep_is_disabled() -> None:
+def test_sampling_semantics_b_min_sep_switches_sampler_for_bnb_accountant() -> None:
     model = nn.Linear(4, 3)
-    with pytest.raises(
-        ValueError,
-        match="b_min_sep sampling is temporarily disabled",
-    ):
-        _make_private(
-            model,
-            poisson_sampling=False,
-            noise_seed=117,
-            noise_mechanism_config=NoiseMechanismConfig(
-                mechanism="gaussian",
-                accounting_mode="bnb_accountant",
-            ),
-            sampling_semantics=SamplingSemantics(
-                sampling_mode="b_min_sep",
-                privacy_metadata={"b": 2, "p": 0.2},
-            ),
-        )
+    _, _dp_optimizer, private_loader = _make_private(
+        model,
+        poisson_sampling=False,
+        noise_seed=117,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="gaussian",
+            accounting_mode="bnb_accountant",
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="b_min_sep",
+            privacy_metadata={"b": 2, "p": 0.2},
+        ),
+    )
+    assert isinstance(private_loader.batch_sampler, BMinSepSampler)
 
 
 def test_sampling_semantics_balls_in_bins_switches_sampler_for_bnb_accountant() -> None:
@@ -1514,17 +1513,18 @@ def test_resolve_calibration_sample_rate_by_sampling_mode(
     assert abs(float(got) - float(expected_rate)) < 1e-12
 
 
-def test_resolve_total_steps_sample_rate_rejects_b_min_sep() -> None:
-    with pytest.raises(ValueError, match="b_min_sep sampling is temporarily disabled"):
-        PrivacyEngine._resolve_total_steps_sample_rate(
-            poisson_sampling=False,
-            sampling_semantics=SamplingSemantics(
-                sampling_mode="b_min_sep",
-                privacy_metadata={"p": 0.25},
-            ),
-            batch_size=8,
-            dataset_size=64,
-        )
+def test_resolve_total_steps_sample_rate_uses_b_min_sep_average_participation_rate() -> None:
+    got = PrivacyEngine._resolve_total_steps_sample_rate(
+        poisson_sampling=False,
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="b_min_sep",
+            privacy_metadata={"b": 4, "p": 0.25},
+        ),
+        batch_size=8,
+        dataset_size=64,
+    )
+    expected = 0.25 / (1.0 + 0.25 * 3.0)
+    assert abs(float(got) - expected) < 1e-12
 
 
 def test_resolve_total_steps_sample_rate_uses_semantics_and_requires_explicit_custom_nonpoisson() -> None:
@@ -1949,6 +1949,122 @@ def test_bsr_config_requires_bands_or_coeffs_and_autocalibrates_z_std() -> None:
     assert isinstance(dp_optimizer.noise_mechanism, CorrelatedNoiseMechanism)
     assert tuple(dp_optimizer.noise_mechanism.coeffs) == (1.0, 0.2)
     assert float(dp_optimizer.noise_mechanism.z_std) > 0.0
+
+
+def test_bifr_config_builds_noise_mechanism() -> None:
+    model = nn.Linear(4, 3)
+    _, dp_optimizer, _ = _make_private(
+        model,
+        poisson_sampling=False,
+        noise_seed=1091,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bifr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"coeffs": [1.0, 0.3], "z_std": 0.03, "bifr_frac": 0.3},
+        ),
+    )
+    assert isinstance(dp_optimizer.noise_mechanism, CorrelatedNoiseMechanism)
+    assert tuple(dp_optimizer.noise_mechanism.coeffs) == (1.0, 0.3)
+    assert dp_optimizer.noise_mechanism.z_std == 0.03
+    state = getattr(dp_optimizer, "noise_mechanism_config").mechanism_state
+    assert state["bifr_frac"] == pytest.approx(0.3)
+
+
+def test_make_private_bifr_autoresolves_analytical_coeffs_from_bands_optimizer_and_frac() -> None:
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=0.05,
+        momentum=0.3,
+        weight_decay=0.9,
+    )
+    pe = PrivacyEngine()
+
+    _private_model, dp_optimizer, _private_loader = pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        noise_multiplier=1.0,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bifr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"bsr_bands": 4, "bifr_frac": 0.25},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="torch_sampler",
+            privacy_metadata={},
+        ),
+    )
+
+    state = getattr(dp_optimizer, "noise_mechanism_config").mechanism_state
+    assert state["bifr_frac"] == pytest.approx(0.25)
+    assert state["coeff_source"] == "analytical_auto"
+    assert state["coeffs"] == pytest.approx(
+        generate_bifr_factor_coeffs_from_sgd_workload(
+            bands=4,
+            momentum=0.3,
+            weight_decay=0.9,
+            frac=0.25,
+        )
+    )
+    assert int(state["bsr_bands"]) == 4
+
+
+def test_bifr_rejects_cyclic_contracts() -> None:
+    with pytest.raises(ValueError, match="torch_sampler"):
+        _make_private(
+            nn.Linear(4, 3),
+            poisson_sampling=False,
+            noise_seed=1092,
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bifr",
+                accounting_mode="bsr_accountant",
+                mechanism_state={"bsr_bands": 4},
+            ),
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="cyclic_poisson",
+                privacy_metadata={"bands": 4},
+            ),
+        )
+
+
+def test_make_private_with_epsilon_bifr_autoresolves_fixed_batch_terms() -> None:
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=0.05,
+        momentum=0.3,
+        weight_decay=0.9,
+    )
+    pe = PrivacyEngine()
+
+    _private_model, dp_optimizer, _private_loader = pe.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        target_epsilon=2.0,
+        target_delta=1e-5,
+        epochs=1,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bifr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"bsr_bands": 4, "bifr_frac": 0.25},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="torch_sampler",
+            privacy_metadata={},
+        ),
+    )
+
+    state = getattr(dp_optimizer, "noise_mechanism_config").mechanism_state
+    assert state["bifr_frac"] == pytest.approx(0.25)
+    assert state["coeff_source"] == "analytical_auto"
+    assert float(state["bsr_mf_sensitivity"]) > 0.0
+    assert float(state["z_std"]) > 0.0
 
 
 def test_config_conflicts_with_explicit_noise_mechanism() -> None:

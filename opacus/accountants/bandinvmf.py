@@ -32,12 +32,11 @@ from opacus.accountants.analysis.bandinvmf import (
     derive_bandinvmf_runtime_coeffs_from_inv_coeffs,
     optimize_bandinvmf_inv_coeffs_for_sgd_workload,
 )
+from opacus.mf.optimizer_utils import resolve_uniform_sgd_workload_from_optimizer
 from opacus.mechanism_contracts import NoiseMechanismConfig
 
 from .bsr import (
-    resolve_bsr_mf_sensitivity_for_fixed_batch,
     resolve_bsr_sensitivity_scale_for_cyclic,
-    resolve_uniform_sgd_workload_from_optimizer,
 )
 
 

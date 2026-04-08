@@ -106,6 +106,24 @@ def test_noise_mechanism_config_bandmf_requires_bandmf_accountant() -> None:
         )
 
 
+def test_noise_mechanism_config_blt_canonicalizes_legacy_accounting_mode() -> None:
+    cfg = NoiseMechanismConfig(
+        mechanism="blt",
+        accounting_mode="standard_step_accountant",
+        mechanism_state={"theta": [0.8], "theta_hat": [0.6], "z_std": 0.03},
+    )
+    assert cfg.accounting_mode == "blt_accountant"
+
+
+def test_noise_mechanism_config_blt_rejects_non_blt_accountant() -> None:
+    with pytest.raises(ValueError, match="blt mechanism requires blt_accountant routing"):
+        NoiseMechanismConfig(
+            mechanism="blt",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"theta": [0.8], "theta_hat": [0.6], "z_std": 0.03},
+        )
+
+
 def test_noise_mechanism_config_gaussian_accepts_bnb_accountant() -> None:
     cfg = NoiseMechanismConfig(
         mechanism="gaussian",
@@ -412,7 +430,7 @@ def test_distributed_dpoptimizer_rank0_noise_and_global_mean_semantics(
     assert torch.allclose(p1.grad, expected_global_mean, rtol=0.0, atol=1e-7)
 
 
-def test_distributed_bnb_rejects_b_min_sep_sampling(monkeypatch) -> None:
+def test_distributed_bnb_supports_b_min_sep_sampling(monkeypatch) -> None:
     monkeypatch.setattr(pe_mod, "DDP", nn.Linear)
     _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
 
@@ -420,7 +438,36 @@ def test_distributed_bnb_rejects_b_min_sep_sampling(monkeypatch) -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
-    with pytest.raises(ValueError, match="b_min_sep sampling is temporarily disabled"):
+    _, _dp_optimizer, private_loader = pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        noise_multiplier=0.0,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping="flat",
+        grad_sample_mode="hooks",
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="b_min_sep",
+            privacy_metadata={"b": 2, "p": 0.25},
+        ),
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="gaussian",
+            accounting_mode="bnb_accountant",
+        ),
+    )
+    assert isinstance(private_loader.batch_sampler, DistributedBMinSepSampler)
+
+
+def test_distributed_bnb_rejects_b_min_sep_for_unsupported_family(monkeypatch) -> None:
+    monkeypatch.setattr(pe_mod, "DDP", nn.Linear)
+    _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
+
+    pe = PrivacyEngine()
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+
+    with pytest.raises(ValueError, match="supports sampling_mode in \\{None, 'torch_sampler'\\} only"):
         pe.make_private(
             module=model,
             optimizer=optimizer,
@@ -435,13 +482,14 @@ def test_distributed_bnb_rejects_b_min_sep_sampling(monkeypatch) -> None:
                 privacy_metadata={"b": 2, "p": 0.25},
             ),
             noise_mechanism_config=NoiseMechanismConfig(
-                mechanism="gaussian",
-                accounting_mode="bnb_accountant",
+                mechanism="bifr",
+                accounting_mode="bsr_accountant",
+                mechanism_state={"coeffs": [1.0], "z_std": 0.01, "bifr_frac": 0.5},
             ),
         )
 
 
-def test_distributed_bnb_rejects_b_min_sep_sampling_alt(monkeypatch) -> None:
+def test_distributed_bnb_rejects_b_min_sep_without_bnb_accountant(monkeypatch) -> None:
     monkeypatch.setattr(pe_mod, "DDP", nn.Linear)
     _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
 
@@ -449,7 +497,7 @@ def test_distributed_bnb_rejects_b_min_sep_sampling_alt(monkeypatch) -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
-    with pytest.raises(ValueError, match="b_min_sep sampling is temporarily disabled"):
+    with pytest.raises(ValueError, match="requires accounting_mode='bnb_accountant'"):
         pe.make_private(
             module=model,
             optimizer=optimizer,
@@ -465,7 +513,7 @@ def test_distributed_bnb_rejects_b_min_sep_sampling_alt(monkeypatch) -> None:
             ),
             noise_mechanism_config=NoiseMechanismConfig(
                 mechanism="gaussian",
-                accounting_mode="bnb_accountant",
+                accounting_mode="standard_step_accountant",
             ),
         )
 

@@ -21,6 +21,8 @@ from typing import Iterable
 import numpy as np
 import torch
 
+from opacus.accountants.analysis.toeplitz_family import ToeplitzMechanismFamily
+
 
 def _validate_bands(*, bands: int) -> None:
     if bands < 1:
@@ -89,6 +91,26 @@ def materialize_bandmf_toeplitz_matrix(
         matrix[j : j + max_lag, j] = normalized[:max_lag]
 
     return matrix
+
+
+def build_bandmf_toeplitz_family_from_runtime_coeffs(
+    *,
+    coeffs: Iterable[float],
+    steps: int,
+) -> ToeplitzMechanismFamily:
+    """
+    Build the shared Toeplitz-family view of BandMF's globally normalized strategy.
+
+    This does not replace BandMF's paper/JAX fixed-batch object, which remains
+    column-normalized and therefore family-local. It only exposes the shared
+    first-column family where the contracts truly coincide.
+    """
+    normalized = normalize_bandmf_strategy_coeffs(coeffs=coeffs)
+    return ToeplitzMechanismFamily(
+        coeffs=normalized,
+        steps=int(steps),
+        source="bandmf",
+    )
 
 
 def materialize_column_normalized_banded_bandmf_matrix(

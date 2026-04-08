@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from opacus.accountants.analysis.bandmf import (
+    build_bandmf_toeplitz_family_from_runtime_coeffs,
     compute_bandmf_fixed_batch_sensitivity_from_column_normalized_matrix,
     compute_bandmf_max_column_norm_from_column_normalized_matrix,
     compute_bandmf_mf_sensitivity_from_coeffs,
@@ -28,6 +29,20 @@ def test_generate_bandmf_initial_strategy_coeffs_is_normalized() -> None:
         abs_tol=1e-12,
     )
     assert coeffs[0] > 0.0
+
+
+def test_build_bandmf_toeplitz_family_preserves_shared_first_column_surface() -> None:
+    family = build_bandmf_toeplitz_family_from_runtime_coeffs(
+        coeffs=[2.0, 1.0, 0.5],
+        steps=8,
+    )
+    assert family.source == "bandmf"
+    assert math.isclose(
+        float(np.linalg.norm(np.asarray(family.coeffs, dtype=np.float64))),
+        1.0,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    )
 
 
 def test_normalize_bandmf_strategy_coeffs_rejects_zero_vector() -> None:

@@ -12,27 +12,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from importlib import import_module
 from typing import Dict, Type
 
 from .accountant import IAccountant
-from .bandmf import BandMFAccountant
-from .bnb import BNBAccountant
-from .gdp import GaussianAccountant
-from .bsr import BSRAccountant
-from .prv import PRVAccountant
-from .random_allocation import RandomAllocationAccountant
-from .rdp import RDPAccountant
 
 
-_ACCOUNTANTS: Dict[str, Type[IAccountant]] = {
-    "rdp": RDPAccountant,
-    "gdp": GaussianAccountant,
-    "prv": PRVAccountant,
-    "bandmf": BandMFAccountant,
-    "bsr": BSRAccountant,
-    "bnb": BNBAccountant,
-    "random_allocation": RandomAllocationAccountant,
+_ACCOUNTANTS: Dict[str, Type[IAccountant] | tuple[str, str]] = {
+    "rdp": (".rdp", "RDPAccountant"),
+    "gdp": (".gdp", "GaussianAccountant"),
+    "prv": (".prv", "PRVAccountant"),
+    "bandmf": (".bandmf", "BandMFAccountant"),
+    "bsr": (".bsr", "BSRAccountant"),
+    "bnb": (".bnb", "BNBAccountant"),
+    "random_allocation": (".random_allocation", "RandomAllocationAccountant"),
+    "blt_runtime_only": (".blt_runtime_only", "BLTRuntimeOnlyAccountant"),
+    "blt": (".blt", "BLTAccountant"),
 }
+
+
+def _resolve_accountant_class(
+    accountant: Type[IAccountant] | tuple[str, str],
+) -> Type[IAccountant]:
+    if isinstance(accountant, tuple):
+        module_name, attr_name = accountant
+        module = import_module(module_name, __name__.rsplit(".", 1)[0])
+        return getattr(module, attr_name)
+    return accountant
 
 
 def register_accountant(
@@ -40,14 +46,6 @@ def register_accountant(
 ):
     r"""
     Register a new accountant class to be used with a specified mechanism name.
-
-    Args:
-        mechanism: Name of the mechanism to register the accountant for
-        accountant: Accountant class (subclass of IAccountant) to register
-        force: If True, overwrites existing accountant for the specified mechanism.
-
-    Raises:
-        ValueError: If the mechanism is already registered.
     """
     if mechanism in _ACCOUNTANTS and not force:
         raise ValueError(f"Accountant for mechanism {mechanism} is already registered")
@@ -57,19 +55,11 @@ def register_accountant(
 
 def create_accountant(mechanism: str) -> IAccountant:
     r"""
-    Creates and returns an accountant instance for the specified privacy mechanism.
-
-    Args:
-        mechanism: Name of the privacy accounting mechanism to use.
-
-    Returns:
-        An instance of the appropriate accountant class (subclass of IAccountant)
-        for the specified mechanism.
-
-    Raises:
-        ValueError: If the specified mechanism is not registered.
+    Create and return an accountant instance for the specified privacy mechanism.
     """
     if mechanism in _ACCOUNTANTS:
-        return _ACCOUNTANTS[mechanism]()
+        accountant_cls = _resolve_accountant_class(_ACCOUNTANTS[mechanism])
+        _ACCOUNTANTS[mechanism] = accountant_cls
+        return accountant_cls()
 
     raise ValueError(f"Unexpected accounting mechanism: {mechanism}")

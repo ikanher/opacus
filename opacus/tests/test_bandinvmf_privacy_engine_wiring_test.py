@@ -106,10 +106,12 @@ def test_bandinvmf_make_private_with_epsilon_fixed_batch_passes_resolved_mf_sens
     assert isinstance(dp_optimizer.noise_mechanism, InverseBandNoiseMechanism)
     assert captured["accountant"] == "bsr"
     assert float(captured["bsr_mf_sensitivity"]) > 0.0
+    assert "bsr_sensitivity_scale" not in captured
     state = pe.noise_mechanism_config.mechanism_state
     assert state["bsr_min_separation"] == 20
     assert state["bsr_max_participations"] == 4
     assert float(state["bsr_mf_sensitivity"]) > 0.0
+    assert "bsr_sensitivity_scale" not in state
     assert "bandinvmf_inv_coeffs" in state
 
 
@@ -221,6 +223,8 @@ def test_bandinvmf_fixed_batch_accountant_get_epsilon_uses_bandinvmf_resolver() 
     epsilon = pe.get_epsilon(delta=1e-5)
     assert math.isfinite(float(epsilon))
     assert float(epsilon) > 0.0
+    state = pe.noise_mechanism_config.mechanism_state
+    assert "bsr_sensitivity_scale" not in state
 
 
 def test_bandinvmf_checkpoint_resume_preserves_generated_runtime_state() -> None:

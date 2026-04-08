@@ -20,12 +20,14 @@ from .ddpoptimizer_fast_gradient_clipping import (
     DistributedDPOptimizerFastGradientClipping,
 )
 from .fsdpoptimizer_fast_gradient_clipping import FSDPOptimizerFastGradientClipping
-from .optimizer import (
+from opacus.noise_mechanisms import (
     CorrelatedNoiseMechanism,
-    DPOptimizer,
     GaussianNoiseMechanism,
     InverseBandNoiseMechanism,
     NoiseMechanism,
+)
+from .optimizer import (
+    DPOptimizer,
 )
 from .optimizer_fast_gradient_clipping import DPOptimizerFastGradientClipping
 from .perlayeroptimizer import DPPerLayerOptimizer
@@ -45,7 +47,15 @@ __all__ = [
     "GaussianNoiseMechanism",
     "CorrelatedNoiseMechanism",
     "InverseBandNoiseMechanism",
+    "optimize_blt_fixed_batch",
 ]
+
+
+def optimize_blt_fixed_batch(*args, **kwargs):
+    # BLT search belongs in optimizers, but we keep package import time light.
+    from .blt_optimization import optimize_blt_fixed_batch as _impl
+
+    return _impl(*args, **kwargs)
 
 
 def get_optimizer_class(clipping: str, distributed: bool, grad_sample_mode: str = None):

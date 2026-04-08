@@ -13,6 +13,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+Sampler implementations for runtime participation processes used by Opacus.
+
+This file mixes generic Poisson sampling with MF-specific non-Poisson samplers.
+For the MF paths, the important paper-level semantics are:
+- cyclic repeated participation, where accounting consumes
+  `q = bands * sample_rate` and `cycles = ceil(steps / bands)`;
+- balls-in-bins Monte Carlo sampling;
+- BMinSep cooldown sampling.
+
+These classes implement runtime process contracts. They do not themselves state
+privacy theorems.
+"""
+
 from typing import Iterator, List
 
 import torch

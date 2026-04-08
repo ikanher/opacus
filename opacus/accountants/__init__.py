@@ -12,14 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from importlib import import_module
+
 from .accountant import IAccountant
-from .bandmf import BandMFAccountant
-from .bnb import BNBAccountant
-from .gdp import GaussianAccountant
-from .bsr import BSRAccountant
-from .prv import PRVAccountant
-from .random_allocation import RandomAllocationAccountant
-from .rdp import RDPAccountant
 from .registry import create_accountant, register_accountant
 
 
@@ -29,9 +24,35 @@ __all__ = [
     "RDPAccountant",
     "PRVAccountant",
     "BandMFAccountant",
+    "BLTAccountant",
+    "BLTRuntimeOnlyAccountant",
     "BNBAccountant",
     "BSRAccountant",
     "RandomAllocationAccountant",
     "register_accountant",
     "create_accountant",
 ]
+
+
+_LAZY_EXPORTS = {
+    "GaussianAccountant": (".gdp", "GaussianAccountant"),
+    "RDPAccountant": (".rdp", "RDPAccountant"),
+    "PRVAccountant": (".prv", "PRVAccountant"),
+    "BandMFAccountant": (".bandmf", "BandMFAccountant"),
+    "BLTAccountant": (".blt", "BLTAccountant"),
+    "BLTRuntimeOnlyAccountant": (".blt_runtime_only", "BLTRuntimeOnlyAccountant"),
+    "BNBAccountant": (".bnb", "BNBAccountant"),
+    "BSRAccountant": (".bsr", "BSRAccountant"),
+    "RandomAllocationAccountant": (".random_allocation", "RandomAllocationAccountant"),
+}
+
+
+def __getattr__(name: str):
+    if name not in _LAZY_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+    module_name, attr_name = _LAZY_EXPORTS[name]
+    module = import_module(module_name, __name__)
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value

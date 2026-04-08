@@ -17,9 +17,16 @@ from scipy import stats
 from .accountant import (
     RandomAllocationGaussianRuntimeConfig,
     _BoundType,
+    _change_spacing_type,
+    _compose_linear_pmfs,
+    _derive_repeated_runtime_stages,
     _calc_pld_dual,
     _estimate_epsilon_random_allocation_bound,
+    _epsilon_from_remove_add_pmfs_for_delta,
+    _allocation_pmf_add_from_realization,
+    _allocation_pmf_remove_from_realization_with_dual,
     _PLDRealization,
+    _SpacingType,
     build_gaussian_random_allocation_realization,
     resolve_random_allocation_gaussian_runtime_config,
 )
@@ -1562,6 +1569,17 @@ def _estimate_epsilon_random_allocation_bound_from_package(
     runtime_config: RandomAllocationGaussianRuntimeConfig | None,
     bound_type: _BoundType,
 ) -> float:
+    @dataclass(frozen=True)
+    class _PackageBackedInputs:
+        route: str
+        mechanism: str
+        effective_sigma: float
+        pld_num_steps: int
+        pld_num_selected: int
+        pld_num_epochs: int
+        reduced_num_steps_per_round: int
+        reduced_num_rounds: int
+
     runtime = runtime_config or resolve_random_allocation_gaussian_runtime_config(
         target_delta=target_delta
     )
@@ -1587,16 +1605,164 @@ def _estimate_epsilon_random_allocation_bound_from_package(
             else package.add.realization
         )
 
-    @dataclass(frozen=True)
-    class _PackageBackedInputs:
-        route: str
-        mechanism: str
-        effective_sigma: float
-        pld_num_steps: int
-        pld_num_selected: int
-        pld_num_epochs: int
-        reduced_num_steps_per_round: int
-        reduced_num_rounds: int
+    if runtime.runtime_policy == "efficient_staged_grid":
+        stages = _derive_repeated_runtime_stages(
+            inputs=_PackageBackedInputs(
+                route=f"{inputs.route}:{package.exact_law_route}",
+                mechanism=inputs.mechanism,
+                effective_sigma=1.0,
+                pld_num_steps=int(inputs.num_steps),
+                pld_num_selected=int(inputs.num_selected),
+                pld_num_epochs=int(inputs.num_epochs),
+                reduced_num_steps_per_round=int(inputs.num_steps // inputs.num_selected),
+                reduced_num_rounds=int(inputs.num_selected * inputs.num_epochs),
+            ),
+            runtime=runtime,
+        )
+        inner_runtime = RandomAllocationGaussianRuntimeConfig(
+            policy_name=f"{runtime.policy_name}:inner",
+            runtime_policy=str(runtime.runtime_policy),
+            loss_discretization=float(stages.inner_loss_discretization),
+            tail_truncation=float(stages.inner_tail_truncation),
+            max_grid_fft=int(runtime.max_grid_fft),
+            max_grid_mult=int(runtime.max_grid_mult),
+            convolution_method=str(stages.remove_convolution_method),
+            matches_package_defaults=bool(runtime.matches_package_defaults),
+            clamp_to_package_grid=False,
+            remove_convolution_method=str(stages.remove_convolution_method),
+            add_convolution_method=str(stages.add_convolution_method),
+            refinement_rounds=int(stages.refinement_rounds),
+        )
+        package_remove_for_inner = package_remove
+        if package_remove_for_inner.x_gap < inner_runtime.loss_discretization:
+            package_remove_for_inner = _change_spacing_type(
+                package_remove_for_inner,
+                inner_runtime.tail_truncation,
+                inner_runtime.loss_discretization,
+                _SpacingType.LINEAR,
+                bound_type,
+            )
+        package_remove_dual_for_inner = package_remove_dual
+        if package_remove_dual_for_inner.x_gap < inner_runtime.loss_discretization:
+            package_remove_dual_for_inner = _change_spacing_type(
+                package_remove_dual_for_inner,
+                inner_runtime.tail_truncation,
+                inner_runtime.loss_discretization,
+                _SpacingType.LINEAR,
+                bound_type,
+            )
+        package_add_for_inner = package_add
+        if package_add_for_inner.x_gap < inner_runtime.loss_discretization:
+            package_add_for_inner = _change_spacing_type(
+                package_add_for_inner,
+                inner_runtime.tail_truncation,
+                inner_runtime.loss_discretization,
+                _SpacingType.LINEAR,
+                bound_type,
+            )
+
+        remove_round = _allocation_pmf_remove_from_realization_with_dual(
+            realization=package_remove_for_inner,
+            dual_realization=package_remove_dual_for_inner,
+            num_steps_per_round=int(inputs.num_steps // inputs.num_selected),
+            config=inner_runtime,
+            bound_type=bound_type,
+        )
+        add_runtime = RandomAllocationGaussianRuntimeConfig(
+            policy_name=f"{runtime.policy_name}:inner_add",
+            runtime_policy=str(runtime.runtime_policy),
+            loss_discretization=float(stages.inner_loss_discretization),
+            tail_truncation=float(stages.inner_tail_truncation),
+            max_grid_fft=int(runtime.max_grid_fft),
+            max_grid_mult=int(runtime.max_grid_mult),
+            convolution_method=str(stages.add_convolution_method),
+            matches_package_defaults=bool(runtime.matches_package_defaults),
+            clamp_to_package_grid=False,
+            remove_convolution_method=str(stages.remove_convolution_method),
+            add_convolution_method=str(stages.add_convolution_method),
+            refinement_rounds=int(stages.refinement_rounds),
+        )
+        add_round = _allocation_pmf_add_from_realization(
+            package_add_for_inner,
+            int(inputs.num_steps // inputs.num_selected),
+            add_runtime,
+            bound_type,
+        )
+
+        remove_round = _change_spacing_type(
+            remove_round,
+            float(stages.pre_composition_tail_truncation),
+            float(stages.pre_composition_loss_discretization),
+            _SpacingType.LINEAR,
+            bound_type,
+        )
+        add_round = _change_spacing_type(
+            add_round,
+            float(stages.pre_composition_tail_truncation),
+            float(stages.pre_composition_loss_discretization),
+            _SpacingType.LINEAR,
+            bound_type,
+        )
+        remove_final = _compose_linear_pmfs(
+            remove_round,
+            int(inputs.num_selected * inputs.num_epochs),
+            float(stages.pre_composition_tail_truncation),
+            bound_type,
+            convolution_method=str(stages.remove_convolution_method),
+        )
+        add_final = _compose_linear_pmfs(
+            add_round,
+            int(inputs.num_selected * inputs.num_epochs),
+            float(stages.pre_composition_tail_truncation),
+            bound_type,
+            convolution_method=(
+                "direct"
+                if str(stages.add_convolution_method) == "geometric"
+                else str(stages.add_convolution_method)
+            ),
+        )
+        remove_final = _change_spacing_type(
+            remove_final,
+            float(stages.output_tail_truncation),
+            float(stages.output_loss_discretization),
+            _SpacingType.LINEAR,
+            bound_type,
+        )
+        add_final = _change_spacing_type(
+            add_final,
+            float(stages.output_tail_truncation),
+            float(stages.output_loss_discretization),
+            _SpacingType.LINEAR,
+            bound_type,
+        )
+        return _epsilon_from_remove_add_pmfs_for_delta(
+            remove_final,
+            add_final,
+            float(target_delta),
+        )
+
+    effective_loss_discretization = float(runtime.loss_discretization)
+    if bool(runtime.clamp_to_package_grid):
+        effective_loss_discretization = min(
+            effective_loss_discretization,
+            float(package_remove.x_gap),
+            float(package_add.x_gap),
+        )
+    if effective_loss_discretization != float(runtime.loss_discretization):
+        runtime = RandomAllocationGaussianRuntimeConfig(
+            policy_name=str(runtime.policy_name),
+            runtime_policy=str(runtime.runtime_policy),
+            loss_discretization=effective_loss_discretization,
+            tail_truncation=float(runtime.tail_truncation),
+            max_grid_fft=int(runtime.max_grid_fft),
+            max_grid_mult=int(runtime.max_grid_mult),
+            convolution_method=str(runtime.convolution_method),
+            matches_package_defaults=bool(runtime.matches_package_defaults),
+            clamp_to_package_grid=bool(runtime.clamp_to_package_grid),
+            remove_convolution_method=str(runtime.remove_convolution_method),
+            add_convolution_method=str(runtime.add_convolution_method),
+            refinement_rounds=int(runtime.refinement_rounds),
+        )
 
     # Reuse the existing lower-level recurrence entry point but keep the public
     # repeated-k contract resolver out of this route entirely.

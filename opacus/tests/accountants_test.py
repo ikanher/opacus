@@ -1317,6 +1317,17 @@ class AccountingTest(unittest.TestCase):
         self.assertEqual(persisted["bnb_num_samples"], 12345)
         self.assertEqual(persisted["bnb_seed"], 77)
 
+    def test_gaussian_balls_in_bins_make_private_canonicalizes_legacy_bins_boundary(self) -> None:
+        state = _resolve_bnb_state_via_make_private(
+            mechanism="gaussian",
+            mechanism_state={"bnb_bins": 4},
+        )
+
+        self.assertEqual(state["bnb_bins"], 4)
+        self.assertEqual(state["bnb_cycle_length"], 4)
+        self.assertEqual(state["coeffs"], [1.0])
+        self.assertEqual(state["bsr_bands"], 1)
+
     def test_accounting_telemetry_exposes_bnb_accounting_kwargs(self) -> None:
         pe = PrivacyEngine()
         model = nn.Linear(4, 3)
@@ -1349,6 +1360,41 @@ class AccountingTest(unittest.TestCase):
         self.assertIn("bnb_accounting_kwargs", payload)
         self.assertEqual(payload["bnb_accounting_kwargs"]["bnb_num_samples"], 500_000)
         self.assertEqual(payload["bnb_accounting_kwargs"]["bnb_distributed_mode"], "none")
+
+    def test_accounting_telemetry_uses_canonicalized_mf_coeff_summary(self) -> None:
+        pe = PrivacyEngine()
+        model = nn.Linear(4, 3)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+        pe.make_private(
+            module=model,
+            optimizer=optimizer,
+            data_loader=_tiny_loader(),
+            noise_multiplier=1.0,
+            max_grad_norm=1.0,
+            poisson_sampling=False,
+            clipping="flat",
+            grad_sample_mode="hooks",
+            total_steps=16,
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bisr",
+                accounting_mode="bnb_accountant",
+                mechanism_state={"bisr_inv_coeffs": [1.0, 0.25], "bsr_bands": 2},
+            ),
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 4, "bands": 2},
+            ),
+        )
+
+        payload = pe.get_accounting_telemetry(delta=1e-5)
+
+        self.assertEqual(payload["coeff_source"], "analytical_inv_explicit")
+        self.assertEqual(payload["coeff_count"], 2)
+        self.assertEqual(payload["coeff_head"], [1.0, -0.25])
+        self.assertEqual(
+            payload["mechanism_state_summary"]["coeff_source"],
+            "analytical_inv_explicit",
+        )
 
     def test_bsr_balls_in_bins_make_private_treats_empty_coeff_list_as_missing(self) -> None:
         state = _resolve_bnb_state_via_make_private(

@@ -98,6 +98,41 @@ def test_privacy_engine_k_out_of_t_persists_sampling_semantics_in_checkpoint() -
     assert restored.sampling_semantics.privacy_metadata['num_selected'] == 2
 
 
+def test_privacy_engine_bnb_get_epsilon_uses_persisted_runtime_context() -> None:
+    pe = PrivacyEngine(accountant='bnb')
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    private_model, dp_optimizer, private_loader = pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        noise_multiplier=1.0,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping='flat',
+        grad_sample_mode='hooks',
+        total_steps=20,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism='gaussian',
+            accounting_mode='bnb_accountant',
+            mechanism_state={},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode='balls_in_bins',
+            privacy_metadata={'bins': 5, 'bands': 1},
+        ),
+        bnb_calibration_mode='optimistic',
+        bnb_num_samples=64,
+        bnb_chunk_size=64,
+    )
+    for _ in range(len(private_loader)):
+        pe.accountant.step(noise_multiplier=1.0, sample_rate=0.2)
+    epsilon = pe.get_epsilon(1e-5)
+    assert float(epsilon) > 0.0
+    persisted = pe.noise_mechanism_config.mechanism_state['_bnb_accounting_kwargs']
+    assert persisted['bnb_calibration_mode'] == 'optimistic'
+
+
 @pytest.mark.parametrize(
     'mechanism,mechanism_state',
     [

@@ -13,6 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+Privacy-engine routing for runtime MF mechanisms and accountants.
+
+This module owns the implementation contract that glues together optimizer
+state, mechanism-family runtime state, sampler semantics, and accountant-family
+selection. Paper terms still appear here (`b`, `T`, `q`, `S_{k,b}(C;T)`), but
+this file is not itself a formal proof surface. Concrete runtime noisers are owned by
+`opacus.noise_mechanisms`, while family/provider dispatch remains in
+`opacus.mf`.
+"""
+
 import logging
 import os
 import warnings
@@ -21,11 +32,31 @@ import json
 import math
 import time
 from itertools import chain
-from typing import IO, Any, BinaryIO, Dict, List, Optional, Tuple, Union
+from typing import IO, Any, BinaryIO, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
+from opacus.accountants.analysis.blt import BLTParams, BLTPairedParams
+from opacus.accountants.blt_inputs import (
+    canonicalize_blt_public_or_runtime_state,
+    resolve_blt_balls_in_bins_accountant_state,
+)
+from opacus.accountants.bnb_inputs import (
+    attach_accountant_coeff_surface,
+    resolve_canonical_bnb_cycle_length,
+    resolve_canonical_bsr_bands,
+)
+from opacus.mf.bsr_family import (
+    canonicalize_bsr_family_runtime_state,
+    summarize_bsr_runtime_state,
+)
 from opacus.mechanism_contracts import NoiseMechanismConfig, SamplingSemantics
+from opacus.mf import (
+    BLTFamilyState,
+    get_mf_family_entry,
+    mf_accounting_requires_context,
+)
 from opacus.accountants import create_accountant
+from opacus.accountants.blt import compute_blt_fixed_batch_max_loss
 from opacus.accountants.bnb import (
     resolve_bnb_b_min_sep_inputs as resolve_bnb_b_min_sep_inputs_helper,
     validate_bnb_accounting_runtime_consistency as validate_bnb_accounting_runtime_consistency_helper,
@@ -34,20 +65,16 @@ from opacus.accountants.bnb import (
 from opacus.accountants.bsr import (
     ensure_bsr_family_cyclic_coeffs as ensure_bsr_family_cyclic_coeffs_helper,
     ensure_bsr_family_fixed_analytical_coeffs as ensure_bsr_family_fixed_analytical_coeffs_helper,
-    resolve_bisr_mf_sensitivity_for_fixed_batch as resolve_bisr_mf_sensitivity_for_fixed_batch_helper,
-    resolve_bisr_sensitivity_scale_for_cyclic as resolve_bisr_sensitivity_scale_for_cyclic_helper,
-    resolve_bsr_mf_sensitivity_for_fixed_batch as resolve_bsr_mf_sensitivity_for_fixed_batch_helper,
-    resolve_bsr_sensitivity_scale_for_cyclic as resolve_bsr_sensitivity_scale_for_cyclic_helper,
-    resolve_uniform_sgd_workload_from_optimizer,
 )
+from opacus.accountants.bifr import (
+    ensure_bifr_fixed_analytical_coeffs as ensure_bifr_fixed_analytical_coeffs_helper,
+)
+from opacus.mf.optimizer_utils import resolve_uniform_sgd_workload_from_optimizer
 from opacus.accountants.bandinvmf import (
     ensure_bandinvmf_runtime_state as ensure_bandinvmf_runtime_state_helper,
-    resolve_bandinvmf_mf_sensitivity_for_fixed_batch as resolve_bandinvmf_mf_sensitivity_for_fixed_batch_helper,
-    resolve_bandinvmf_sensitivity_scale_for_cyclic as resolve_bandinvmf_sensitivity_scale_for_cyclic_helper,
 )
 from opacus.accountants.bandmf import (
     ensure_bandmf_fixed_analytical_coeffs as ensure_bandmf_fixed_analytical_coeffs_helper,
-    resolve_bandmf_mf_sensitivity_for_fixed_batch as resolve_bandmf_mf_sensitivity_for_fixed_batch_helper,
 )
 from opacus.accountants.utils import get_noise_multiplier
 from opacus.accountants.analysis.bsr import (
@@ -60,17 +87,14 @@ from opacus.accountants.analysis.bandmf import (
 )
 from opacus.accountants.analysis.bisr import (
     derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs,
-    derive_bisr_runtime_coeffs_from_inverse_coeffs,
     generate_bisr_coeffs_from_sgd_workload,
 )
 from opacus.accountants.analysis.bandinvmf import (
-    derive_bandinvmf_runtime_coeffs_from_inv_coeffs,
     derive_bandinvmf_amplified_accountant_coeffs_from_inv_coeffs,
 )
 from opacus.accountants.analysis.bnb import (
     BNBCalibrationStatus,
     build_bnb_toeplitz_c_matrix_and_contract,
-    normalize_bnb_accountant_coeffs,
     describe_bnb_calibration_report,
     make_bnb_calibration_report,
     parse_bnb_calibration_report,
@@ -86,12 +110,13 @@ from opacus.grad_sample import (
     get_gsm_class,
     wrap_model,
 )
-from opacus.optimizers import (
+from opacus.optimizers import DPOptimizer, get_optimizer_class
+from opacus.noise_mechanisms import (
+    BufferedToeplitzNoiseMechanism,
     CorrelatedNoiseMechanism,
-    DPOptimizer,
     InverseBandNoiseMechanism,
-    get_optimizer_class,
 )
+
 from opacus.schedulers import _GradClipScheduler, _NoiseScheduler
 from opacus.utils.fast_gradient_clipping_utils import DPLossFastGradientClipping
 from opacus.validators.module_validator import ModuleValidator
@@ -114,6 +139,107 @@ from torch.utils.data import DataLoader
 logger = logging.getLogger(__name__)
 
 
+def _runtime_state_value_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, torch.Tensor) and isinstance(right, torch.Tensor):
+        return torch.equal(left, right)
+    if isinstance(left, dict) and isinstance(right, dict):
+        if left.keys() != right.keys():
+            return False
+        return all(_runtime_state_value_equal(left[k], right[k]) for k in left.keys())
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        if len(left) != len(right):
+            return False
+        return all(_runtime_state_value_equal(lv, rv) for lv, rv in zip(left, right))
+    return left == right
+
+
+def _set_bsr_runtime_state_from_explicit_inverse_coeffs(*, state: Dict[str, Any], mechanism: str) -> bool:
+    canonical = canonicalize_bsr_family_runtime_state(
+        mechanism=mechanism,
+        runtime_state=state,
+    )
+    changed = not _runtime_state_value_equal(canonical, state)
+    state.clear()
+    state.update(canonical)
+    return changed
+
+
+def _generate_bsr_runtime_coeffs_for_randomized_accounting(
+    *,
+    state: Dict[str, Any],
+    mechanism: str,
+    bands: int,
+    optimizer: optim.Optimizer,
+    steps_hint: int,
+) -> None:
+    momentum, weight_decay = resolve_uniform_sgd_workload_from_optimizer(
+        optimizer=optimizer
+    )
+    if mechanism == "bisr":
+        state["bisr_inv_coeffs"] = generate_bisr_coeffs_from_sgd_workload(
+            bands=bands,
+            momentum=momentum,
+            weight_decay=weight_decay,
+        )
+        _set_bsr_runtime_state_from_explicit_inverse_coeffs(state=state, mechanism=mechanism)
+    elif mechanism == "bandmf":
+        state["coeffs"] = generate_bandmf_coeffs_from_sgd_workload(
+            bands=bands,
+            momentum=momentum,
+            weight_decay=weight_decay,
+            steps=int(steps_hint),
+        )
+    else:
+        state["coeffs"] = generate_bsr_coeffs_from_sgd_workload(
+            bands=bands,
+            momentum=momentum,
+            weight_decay=weight_decay,
+        )
+    state["coeff_source"] = "analytical_auto"
+
+
+def _build_bsr_random_allocation_accountant_coeffs(*, state: Dict[str, Any], horizon: int) -> tuple[list[float], str]:
+    return list(state["coeffs"]), "raw_c_col"
+
+
+def _build_bisr_random_allocation_accountant_coeffs(*, state: Dict[str, Any], horizon: int) -> tuple[list[float], str]:
+    coeffs = derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs(
+        coeffs=list(state.get("bisr_inv_coeffs", state["coeffs"])),
+        steps=int(horizon),
+    )
+    return list(coeffs), "abs_factor_c_col"
+
+
+def _build_bandmf_random_allocation_accountant_coeffs(*, state: Dict[str, Any], horizon: int) -> tuple[list[float], str]:
+    coeffs = derive_bandmf_amplified_accountant_coeffs_from_runtime_coeffs(
+        coeffs=list(state["coeffs"])
+    )
+    return list(coeffs), "runtime_c_col"
+
+
+def _build_bandinvmf_random_allocation_accountant_coeffs(*, state: Dict[str, Any], horizon: int) -> tuple[list[float], str]:
+    coeffs = derive_bandinvmf_amplified_accountant_coeffs_from_inv_coeffs(
+        inv_coeffs=list(state["bandinvmf_inv_coeffs"]),
+        steps=int(horizon),
+    )
+    return list(coeffs), "abs_factor_c_col"
+
+
+_RANDOM_ALLOCATION_ACCOUNTANT_COEFF_BUILDERS: Dict[str, Callable[..., tuple[list[float], str]]] = {
+    "bsr": _build_bsr_random_allocation_accountant_coeffs,
+    "bisr": _build_bisr_random_allocation_accountant_coeffs,
+    "bandmf": _build_bandmf_random_allocation_accountant_coeffs,
+    "bandinvmf": _build_bandinvmf_random_allocation_accountant_coeffs,
+}
+
+_BNB_ACCOUNTANT_COEFF_BUILDERS: Dict[str, Callable[..., tuple[list[float], str]]] = {
+    "bsr": _build_bsr_random_allocation_accountant_coeffs,
+    "bisr": _build_bisr_random_allocation_accountant_coeffs,
+    "bandmf": _build_bandmf_random_allocation_accountant_coeffs,
+    "bandinvmf": _build_bandinvmf_random_allocation_accountant_coeffs,
+}
+
+
 class PrivacyEngine:
     """
     Main entry point to the Opacus API - use ``PrivacyEngine``  to enable differential
@@ -122,6 +248,13 @@ class PrivacyEngine:
     ``PrivacyEngine`` object encapsulates current privacy state (privacy budget +
     method it's been calculated) and exposes ``make_private`` method to wrap your
     PyTorch training objects with their private counterparts.
+
+    MF note:
+    - this class resolves runtime mechanism/accountant contracts rather than
+      proving paper claims;
+    - MF-specific quantities such as `bands`, `sample_rate`, `q`,
+      `S_{k,b}(C;T)`, and calibrated correlated Gaussian scales are assembled
+      here and then delegated to family-specific accountant modules.
 
     Example:
         >>> dataloader = demo_dataloader
@@ -145,9 +278,303 @@ class PrivacyEngine:
         mechanism: str,
         mechanism_state: Dict[str, Any],
     ) -> Dict[str, Any]:
+        entry = get_mf_family_entry(mechanism)
+        if entry is not None:
+            return entry.family.canonicalize(mechanism_state)
+
         state = copy.deepcopy(mechanism_state)
         state["_noise_mechanism"] = mechanism
         return state
+
+    @staticmethod
+    def _canonicalize_blt_mechanism_state(*, mechanism_state: Dict[str, Any]) -> Dict[str, Any]:
+        return canonicalize_blt_public_or_runtime_state(mechanism_state)
+
+    @staticmethod
+    def _resolve_mf_family_entry(mechanism: str):
+        return get_mf_family_entry(mechanism)
+
+    def _resolve_mf_target_epsilon_terms(
+        self,
+        *,
+        mechanism_config: NoiseMechanismConfig,
+        sampling_semantics: Optional[SamplingSemantics],
+        steps: int,
+        sample_rate: float,
+        kwargs: Mapping[str, Any],
+        phase: str,
+    ) -> tuple[dict[str, Any], Any]:
+        entry = self._resolve_mf_family_entry(mechanism_config.mechanism)
+        resolver = (
+            getattr(entry.family, "resolve_target_epsilon_terms", None)
+            if entry is not None
+            else None
+        )
+        if resolver is None:
+            return {}, None
+        return resolver(
+            mechanism_config=mechanism_config,
+            sampling_semantics=sampling_semantics,
+            steps=int(steps),
+            sample_rate=float(sample_rate),
+            kwargs=kwargs,
+            phase=phase,
+        )
+
+    def _augment_mf_query_mechanism_config(
+        self,
+        *,
+        mechanism_config: NoiseMechanismConfig,
+        local_sampling_semantics: Optional[SamplingSemantics],
+        total_steps: int | None,
+        epochs: int | None,
+        poisson_sampling: bool,
+        data_loader: DataLoader,
+        kwargs: Mapping[str, Any],
+    ) -> NoiseMechanismConfig:
+        entry = self._resolve_mf_family_entry(mechanism_config.mechanism)
+        augmenter = (
+            getattr(entry.family, "augment_query_mechanism_config", None)
+            if entry is not None
+            else None
+        )
+        if augmenter is None:
+            return mechanism_config
+        return augmenter(
+            mechanism_config=mechanism_config,
+            local_sampling_semantics=local_sampling_semantics,
+            total_steps=total_steps,
+            epochs=epochs,
+            poisson_sampling=poisson_sampling,
+            data_loader=data_loader,
+            kwargs=kwargs,
+            resolve_total_steps_sample_rate=self._resolve_total_steps_sample_rate,
+        )
+
+    def _prepare_mf_mechanism_config(
+        self,
+        *,
+        mechanism_config: NoiseMechanismConfig,
+        optimizer: optim.Optimizer,
+        sampling_semantics: Optional[SamplingSemantics],
+        coeff_resolution_kwargs: Dict[str, Any],
+        total_steps_for_contract: int,
+        band_steps_hint: int,
+        data_loader_len: int,
+        dataset_size: int,
+        logical_batch_size: int,
+        max_grad_norm: Union[float, List[float]],
+        loss_reduction: str,
+        blt_noise_multiplier: float,
+        sample_rate_hint: float,
+        kwargs: Dict[str, Any],
+        include_random_allocation_state: bool = False,
+    ) -> NoiseMechanismConfig:
+        mechanism_config = ensure_bsr_family_fixed_analytical_coeffs_helper(
+            mechanism_config=mechanism_config,
+            optimizer=optimizer,
+            sampling_semantics=sampling_semantics,
+            kwargs=coeff_resolution_kwargs,
+        )
+        mechanism_config = ensure_bifr_fixed_analytical_coeffs_helper(
+            mechanism_config=mechanism_config,
+            optimizer=optimizer,
+            sampling_semantics=sampling_semantics,
+            kwargs=coeff_resolution_kwargs,
+        )
+        mechanism_config = ensure_bandmf_fixed_analytical_coeffs_helper(
+            mechanism_config=mechanism_config,
+            optimizer=optimizer,
+            sampling_semantics=sampling_semantics,
+            kwargs=coeff_resolution_kwargs,
+        )
+        if include_random_allocation_state:
+            mechanism_config = self._ensure_random_allocation_state(
+                mechanism_config=mechanism_config,
+                optimizer=optimizer,
+                sampling_semantics=sampling_semantics,
+                kwargs=coeff_resolution_kwargs,
+            )
+        mechanism_config = self._ensure_bnb_balls_in_bins_gaussian_state(
+            mechanism_config=mechanism_config,
+            sampling_semantics=sampling_semantics,
+            kwargs=coeff_resolution_kwargs,
+        )
+        mechanism_config = self._apply_default_fixed_batch_contract_for_torch_sampler(
+            mechanism_config=mechanism_config,
+            sampling_semantics=sampling_semantics,
+            total_steps=int(total_steps_for_contract),
+            dataloader_len=int(data_loader_len),
+            dataset_size=int(dataset_size),
+            logical_batch_size=int(logical_batch_size),
+            kwargs=kwargs,
+        )
+        if mechanism_config.mechanism == "blt":
+            mechanism_config = NoiseMechanismConfig(
+                mechanism=mechanism_config.mechanism,
+                accounting_mode=mechanism_config.accounting_mode,
+                mechanism_state=self._canonicalize_blt_mechanism_state(
+                    mechanism_state=mechanism_config.mechanism_state,
+                ),
+            )
+            mechanism_config = self._apply_default_blt_fixed_batch_contract_for_torch_sampler(
+                mechanism_config=mechanism_config,
+                sampling_semantics=sampling_semantics,
+                total_steps=int(total_steps_for_contract),
+                dataset_size=int(dataset_size),
+                logical_batch_size=int(logical_batch_size),
+                max_grad_norm=max_grad_norm,
+                loss_reduction=loss_reduction,
+                noise_multiplier=float(blt_noise_multiplier),
+                kwargs=kwargs,
+            )
+        mechanism_config = ensure_bandinvmf_runtime_state_helper(
+            mechanism_config=mechanism_config,
+            optimizer=optimizer,
+            sampling_semantics=sampling_semantics,
+            steps_hint=int(band_steps_hint),
+            sample_rate_hint=float(sample_rate_hint),
+            kwargs=coeff_resolution_kwargs,
+        )
+        return self._ensure_bnb_balls_in_bins_mf_state(
+            mechanism_config=mechanism_config,
+            optimizer=optimizer,
+            sampling_semantics=sampling_semantics,
+            kwargs=coeff_resolution_kwargs,
+        )
+
+    @staticmethod
+    def _resolve_distributed_runtime(module: nn.Module) -> tuple[bool, bool]:
+        is_dpddp = isinstance(module, DPDDP)
+        is_ddp = isinstance(module, DDP)
+        is_fsdp = isinstance(module, FSDPModule)
+        return is_dpddp or is_ddp or is_fsdp, is_fsdp
+
+    @staticmethod
+    def _validate_optimizer_matches_module(
+        *,
+        module: nn.Module,
+        optimizer: optim.Optimizer,
+    ) -> None:
+        model_parameters = set(module.parameters())
+        for p in chain.from_iterable(
+            [param_group["params"] for param_group in optimizer.param_groups]
+        ):
+            if p not in model_parameters:
+                raise ValueError(
+                    "Module parameters are different than optimizer Parameters"
+                )
+
+    def _prepare_make_private_runtime(
+        self,
+        *,
+        module: nn.Module,
+        optimizer: optim.Optimizer,
+        data_loader: DataLoader,
+        batch_first: bool,
+        max_grad_norm: Union[float, List[float]],
+        loss_reduction: str,
+        grad_sample_mode: str,
+        poisson_sampling: bool,
+        sampling_semantics: Optional[SamplingSemantics],
+        total_steps: Optional[int],
+        mechanism_config: NoiseMechanismConfig,
+        kwargs: Dict[str, Any],
+        clipping: str,
+    ) -> tuple[nn.Module, DataLoader, bool, SamplingSemantics, float, int]:
+        self._validate_optimizer_matches_module(module=module, optimizer=optimizer)
+
+        distributed, is_fsdp = self._resolve_distributed_runtime(module)
+        requested_noise_mechanism = kwargs.get("noise_mechanism")
+        if distributed and mechanism_config.mechanism == "blt":
+            self._validate_distributed_blt_support(is_fsdp=is_fsdp)
+        if distributed and (
+            mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf", "bifr")
+            or isinstance(requested_noise_mechanism, CorrelatedNoiseMechanism)
+        ):
+            self._validate_distributed_correlated_support(
+                mechanism=mechanism_config.mechanism,
+                clipping=clipping,
+                grad_sample_mode=grad_sample_mode,
+                is_fsdp=is_fsdp,
+            )
+
+        module = self._prepare_model(
+            module,
+            batch_first=batch_first,
+            max_grad_norm=max_grad_norm,
+            loss_reduction=loss_reduction,
+            grad_sample_mode=grad_sample_mode,
+        )
+
+        if poisson_sampling:
+            module.forbid_grad_accumulation()
+
+        batch_size = data_loader.batch_size
+        data_loader = self._prepare_data_loader(
+            data_loader,
+            distributed=distributed,
+            poisson_sampling=poisson_sampling,
+            sampling_semantics=sampling_semantics,
+            total_steps=total_steps,
+        )
+
+        sample_rate, expected_batch_size = self._resolve_sample_rate_and_expected_batch_size(
+            poisson_sampling=poisson_sampling,
+            sampling_semantics=sampling_semantics,
+            mechanism=mechanism_config.mechanism,
+            batch_size=batch_size,
+            dataset_size=len(data_loader.dataset),
+            data_loader_len=len(data_loader),
+            total_steps=total_steps,
+            distributed=distributed,
+        )
+        semantics = self._build_sampling_semantics(
+            poisson_sampling=poisson_sampling,
+            sample_rate=sample_rate,
+            expected_batch_size=expected_batch_size,
+            distributed=distributed,
+            explicit_sampling_semantics=sampling_semantics,
+        )
+        return module, data_loader, distributed, semantics, float(sample_rate), int(expected_batch_size)
+
+    def _finalize_make_private_result(
+        self,
+        *,
+        module: GradSampleModule,
+        optimizer: DPOptimizer,
+        criterion,
+        data_loader: DataLoader,
+        mechanism_config: NoiseMechanismConfig,
+        semantics: SamplingSemantics,
+        active_accountant,
+        sample_rate: float,
+        grad_sample_mode: str,
+        loss_reduction: str,
+        kwargs: Dict[str, Any],
+    ):
+        self.noise_mechanism_config = mechanism_config
+        self.sampling_semantics = semantics
+        self.accountant = active_accountant
+        setattr(optimizer, "accounting_mode", mechanism_config.accounting_mode)
+        setattr(optimizer, "noise_mechanism_config", mechanism_config)
+        setattr(optimizer, "sampling_semantics", semantics)
+        optimizer.attach_step_hook(
+            active_accountant.get_optimizer_hook_fn(sample_rate=sample_rate)
+        )
+
+        if "ghost" in grad_sample_mode:
+            criterion = self._prepare_criterion(
+                module=module,
+                optimizer=optimizer,
+                criterion=criterion,
+                loss_reduction=loss_reduction,
+                **kwargs,
+            )
+            return module, optimizer, criterion, data_loader
+
+        return module, optimizer, data_loader
+
 
     @staticmethod
     def _ensure_random_allocation_state(
@@ -183,98 +610,47 @@ class PrivacyEngine:
                 mechanism_state=state,
             )
 
-        metadata_bands = metadata.get("bands")
-        explicit_bands = kwargs.get("bsr_bands")
-        if explicit_bands is not None and metadata_bands is not None and int(explicit_bands) != int(metadata_bands):
-            raise ValueError(
-                "conflicting canonical inputs: `bsr_bands` must match sampling_semantics privacy_metadata['bands']"
-            )
-
-        bands = kwargs.get("bsr_bands", metadata.get("bands", state.get("bsr_bands")))
-        if bands is None:
-            raise ValueError(
-                f"{mechanism_config.mechanism} random_allocation state generation requires bands via `mechanism_state['bsr_bands']`, `sampling_semantics.privacy_metadata['bands']`, or `bsr_bands`"
-            )
-
-        bands = int(bands)
-        if bands < 1:
-            raise ValueError(f"{mechanism_config.mechanism} bands must be >= 1")
+        bands = resolve_canonical_bsr_bands(
+            runtime_state=state,
+            metadata=metadata,
+            kwargs=kwargs,
+            error_context=(
+                f"{mechanism_config.mechanism} random_allocation state generation requires bands via "
+                "`mechanism_state['bsr_bands']`, `sampling_semantics.privacy_metadata['bands']`, or `bsr_bands`"
+            ),
+        )
 
         coeffs = state.get("coeffs")
-        bisr_inv_coeffs = state.get("bisr_inv_coeffs")
-        bandinvmf_inv_coeffs = state.get("bandinvmf_inv_coeffs")
-        if (
-            mechanism_config.mechanism == "bisr"
-            and isinstance(bisr_inv_coeffs, (list, tuple))
-            and len(bisr_inv_coeffs) > 0
-            and not (isinstance(coeffs, (list, tuple)) and len(coeffs) > 0)
-        ):
-            state["bisr_inv_coeffs"] = [float(c) for c in bisr_inv_coeffs]
-            state["coeffs"] = derive_bisr_runtime_coeffs_from_inverse_coeffs(coeffs=state["bisr_inv_coeffs"])
-            state.setdefault("coeff_source", "analytical_inv_explicit")
-        elif (
-            mechanism_config.mechanism == "bandinvmf"
-            and isinstance(bandinvmf_inv_coeffs, (list, tuple))
-            and len(bandinvmf_inv_coeffs) > 0
-            and not (isinstance(coeffs, (list, tuple)) and len(coeffs) > 0)
-        ):
-            state["bandinvmf_inv_coeffs"] = [float(c) for c in bandinvmf_inv_coeffs]
-            state["coeffs"] = derive_bandinvmf_runtime_coeffs_from_inv_coeffs(
-                inv_coeffs=state["bandinvmf_inv_coeffs"]
+        _set_bsr_runtime_state_from_explicit_inverse_coeffs(
+            state=state,
+            mechanism=mechanism_config.mechanism,
+        )
+        coeffs = state.get("coeffs")
+        if not (isinstance(coeffs, (list, tuple)) and len(coeffs) > 0):
+            steps_hint = kwargs.get("total_steps", metadata.get("total_steps", num_steps))
+            _generate_bsr_runtime_coeffs_for_randomized_accounting(
+                state=state,
+                mechanism=mechanism_config.mechanism,
+                bands=bands,
+                optimizer=optimizer,
+                steps_hint=int(steps_hint),
             )
-            state.setdefault("coeff_source", "analytical_inv_explicit")
-        elif not (isinstance(coeffs, (list, tuple)) and len(coeffs) > 0):
-            momentum, weight_decay = resolve_uniform_sgd_workload_from_optimizer(
-                optimizer=optimizer
-            )
-            if mechanism_config.mechanism == "bisr":
-                state["bisr_inv_coeffs"] = generate_bisr_coeffs_from_sgd_workload(
-                    bands=bands,
-                    momentum=momentum,
-                    weight_decay=weight_decay,
-                )
-                state["coeffs"] = derive_bisr_runtime_coeffs_from_inverse_coeffs(coeffs=state["bisr_inv_coeffs"])
-            elif mechanism_config.mechanism == "bandmf":
-                steps_hint = kwargs.get("total_steps", metadata.get("total_steps", num_steps))
-                state["coeffs"] = generate_bandmf_coeffs_from_sgd_workload(
-                    bands=bands,
-                    momentum=momentum,
-                    weight_decay=weight_decay,
-                    steps=int(steps_hint),
-                )
-            else:
-                state["coeffs"] = generate_bsr_coeffs_from_sgd_workload(
-                    bands=bands,
-                    momentum=momentum,
-                    weight_decay=weight_decay,
-                )
-            state["coeff_source"] = "analytical_auto"
 
         state["bsr_bands"] = bands
-        accountant_coeffs = None
         horizon = state.get("random_allocation_horizon", kwargs.get("total_steps", kwargs.get("steps", num_steps)))
-        if mechanism_config.mechanism == "bsr":
-            accountant_coeffs = list(state["coeffs"])
-            state["random_allocation_accountant_coeffs"] = list(accountant_coeffs)
-            state["random_allocation_accountant_coeffs_source"] = "raw_c_col"
-        elif mechanism_config.mechanism == "bisr":
-            accountant_coeffs = derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs(
-                coeffs=list(state.get("bisr_inv_coeffs", state["coeffs"])),
-                steps=int(horizon),
-            )
-            state["random_allocation_accountant_coeffs"] = list(accountant_coeffs)
-            state["random_allocation_accountant_coeffs_source"] = "abs_factor_c_col"
-        elif mechanism_config.mechanism == "bandmf":
-            accountant_coeffs = derive_bandmf_amplified_accountant_coeffs_from_runtime_coeffs(coeffs=list(state["coeffs"]))
-            state["random_allocation_accountant_coeffs"] = list(accountant_coeffs)
-            state["random_allocation_accountant_coeffs_source"] = "runtime_c_col"
-        elif mechanism_config.mechanism == "bandinvmf":
-            accountant_coeffs = derive_bandinvmf_amplified_accountant_coeffs_from_inv_coeffs(
-                inv_coeffs=list(state["bandinvmf_inv_coeffs"]),
-                steps=int(horizon),
-            )
-            state["random_allocation_accountant_coeffs"] = list(accountant_coeffs)
-            state["random_allocation_accountant_coeffs_source"] = "abs_factor_c_col"
+        accountant_coeffs, accountant_coeffs_source = _RANDOM_ALLOCATION_ACCOUNTANT_COEFF_BUILDERS[
+            mechanism_config.mechanism
+        ](
+            state=state,
+            horizon=int(horizon),
+        )
+        state = attach_accountant_coeff_surface(
+            state,
+            coeff_key="random_allocation_accountant_coeffs",
+            coeff_source_key="random_allocation_accountant_coeffs_source",
+            coeffs=accountant_coeffs,
+            coeff_source=accountant_coeffs_source,
+        )
 
         return NoiseMechanismConfig(
             mechanism=mechanism_config.mechanism,
@@ -328,7 +704,43 @@ class PrivacyEngine:
         `bsr_bands`, in which case we derive coefficients from the optimizer
         workload metadata and materialize the BNB Toeplitz contract before the
         accountant validates runtime inputs.
+
+        BLT special case:
+        - this path consumes the accountant-owned forward-`c_col` bridge object
+        - it is an amplified BNB accounting contract, not the fixed-batch BLT
+          runtime accountant
+        - the BLT bridge is parameterized by canonical `theta` / `theta_hat`
+          state, not by the report-script `lambda` label
         """
+        if (
+            mechanism_config.mechanism == "blt"
+            and mechanism_config.accounting_mode == "bnb_accountant"
+            and sampling_semantics is not None
+            and sampling_semantics.sampling_mode == "balls_in_bins"
+        ):
+            state = resolve_blt_balls_in_bins_accountant_state(
+                runtime_state=mechanism_config.mechanism_state,
+                metadata=(
+                    sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
+                ),
+                kwargs=kwargs,
+                total_steps=int(
+                    kwargs.get("total_steps")
+                    or kwargs.get("steps")
+                    or (
+                        sampling_semantics.privacy_metadata.get("total_steps")
+                        if sampling_semantics is not None
+                        else 0
+                    )
+                    or 0
+                ),
+            )
+            return NoiseMechanismConfig(
+                mechanism=mechanism_config.mechanism,
+                accounting_mode=mechanism_config.accounting_mode,
+                mechanism_state=state,
+            )
+
         if mechanism_config.mechanism not in ("bsr", "bisr", "bandmf", "bandinvmf"):
             return mechanism_config
         if mechanism_config.accounting_mode != "bnb_accountant":
@@ -344,152 +756,63 @@ class PrivacyEngine:
         metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
 
         coeffs = state.get("coeffs")
-        metadata_bands = metadata.get("bands")
-        explicit_bands = kwargs.get("bsr_bands")
-        if explicit_bands is not None and metadata_bands is not None:
-            if int(explicit_bands) != int(metadata_bands):
-                raise ValueError(
-                    "conflicting canonical inputs: `bsr_bands` must match "
-                    "sampling_semantics privacy_metadata['bands']"
-                )
-        bands = kwargs.get(
-            "bsr_bands",
-            metadata.get("bands", state.get("bnb_bands", state.get("bsr_bands"))),
-        )
-        if bands is None:
-            raise ValueError(
+        bands = resolve_canonical_bsr_bands(
+            runtime_state={"bsr_bands": state.get("bnb_bands", state.get("bsr_bands"))},
+            metadata=metadata,
+            kwargs=kwargs,
+            error_context=(
                 f"{mechanism_config.mechanism} analytical auto-coeff generation requires bands via "
-                "`mechanism_state['bsr_bands']`, `sampling_semantics.privacy_metadata['bands']`, "
-                "or `bsr_bands`"
-            )
-        bands = int(bands)
-        if bands < 1:
-            raise ValueError(f"{mechanism_config.mechanism} bands must be >= 1")
-
-        metadata_bins = metadata.get("bins", metadata.get("b"))
-        explicit_cycle_length = kwargs.get("bnb_cycle_length", state.get("bnb_cycle_length"))
-        legacy_bins = state.get("bnb_bins")
-        explicit_bins = kwargs.get("bnb_b")
-
-        if explicit_cycle_length is not None:
-            explicit_cycle_length = int(explicit_cycle_length)
-            if explicit_cycle_length < 1:
-                raise ValueError("balls-in-bins cycle length must be >= 1")
-
-            if metadata_bins is not None and int(metadata_bins) != explicit_cycle_length:
-                raise ValueError(
-                    "conflicting canonical inputs: `bnb_cycle_length` must match "
-                    "sampling_semantics privacy_metadata['bins']"
-                )
-
-            if explicit_bins is not None and int(explicit_bins) != explicit_cycle_length:
-                raise ValueError(
-                    "conflicting canonical inputs: `bnb_cycle_length` must match "
-                    "`bnb_b`"
-                )
-
-            if legacy_bins is not None and int(legacy_bins) != explicit_cycle_length:
-                raise ValueError(
-                    "conflicting canonical inputs: `bnb_cycle_length` must match "
-                    "mechanism_state['bnb_bins']"
-                )
-
-        bins = kwargs.get(
-            "bnb_b",
-            metadata_bins
-            if metadata_bins is not None
-            else (
-                explicit_cycle_length
-                if explicit_cycle_length is not None
-                else state.get("bnb_cycle_length", state.get("bnb_bins"))
+                "`mechanism_state['bsr_bands']`, `sampling_semantics.privacy_metadata['bands']`, or `bsr_bands`"
             ),
         )
-        if bins is None:
-            raise ValueError(
+
+        bins = resolve_canonical_bnb_cycle_length(
+            runtime_state=state,
+            metadata=metadata,
+            kwargs=kwargs,
+            error_context=(
                 "balls-in-bins MF state generation requires `bnb_b` or "
                 "sampling_semantics privacy_metadata['bins']"
-            )
-        bins = int(bins)
-        if bins < 1:
-            raise ValueError("balls-in-bins bins must be >= 1")
+            ),
+        )
 
-        bisr_inv_coeffs = state.get("bisr_inv_coeffs")
-        if (
-            mechanism_config.mechanism == "bisr"
-            and isinstance(bisr_inv_coeffs, (list, tuple))
-            and len(bisr_inv_coeffs) > 0
-            and not (isinstance(coeffs, (list, tuple)) and len(coeffs) > 0)
-        ):
-            state["bisr_inv_coeffs"] = [float(c) for c in bisr_inv_coeffs]
-            state["coeffs"] = derive_bisr_runtime_coeffs_from_inverse_coeffs(
-                coeffs=state["bisr_inv_coeffs"],
+        _set_bsr_runtime_state_from_explicit_inverse_coeffs(
+            state=state,
+            mechanism=mechanism_config.mechanism,
+        )
+        coeffs = state.get("coeffs")
+        if not (isinstance(coeffs, (list, tuple)) and len(coeffs) > 0):
+            steps_hint = kwargs.get(
+                "total_steps",
+                metadata.get("total_steps", state.get("bnb_horizon", bins)),
             )
-            state.setdefault("coeff_source", "analytical_inv_explicit")
-        elif not (isinstance(coeffs, (list, tuple)) and len(coeffs) > 0):
-            momentum, weight_decay = PrivacyEngine._resolve_uniform_sgd_workload_from_optimizer(
-                optimizer=optimizer
+            _generate_bsr_runtime_coeffs_for_randomized_accounting(
+                state=state,
+                mechanism=mechanism_config.mechanism,
+                bands=bands,
+                optimizer=optimizer,
+                steps_hint=int(steps_hint),
             )
-            if mechanism_config.mechanism == "bisr":
-                state["bisr_inv_coeffs"] = generate_bisr_coeffs_from_sgd_workload(
-                    bands=bands,
-                    momentum=momentum,
-                    weight_decay=weight_decay,
-                )
-                state["coeffs"] = derive_bisr_runtime_coeffs_from_inverse_coeffs(
-                    coeffs=state["bisr_inv_coeffs"],
-                )
-            elif mechanism_config.mechanism == "bandmf":
-                steps_hint = kwargs.get(
-                    "total_steps",
-                    metadata.get("total_steps", state.get("bnb_horizon", bins)),
-                )
-                state["coeffs"] = generate_bandmf_coeffs_from_sgd_workload(
-                    bands=bands,
-                    momentum=momentum,
-                    weight_decay=weight_decay,
-                    steps=int(steps_hint),
-                )
-            else:
-                state["coeffs"] = generate_bsr_coeffs_from_sgd_workload(
-                    bands=bands,
-                    momentum=momentum,
-                    weight_decay=weight_decay,
-                )
-            state["coeff_source"] = "analytical_auto"
 
         state["bsr_bands"] = bands
         state["bnb_bands"] = bands
         state["bnb_bins"] = bins
         state["bnb_cycle_length"] = bins
 
-        accountant_coeffs = None
         horizon = state.get("bnb_horizon", kwargs.get("total_steps", kwargs.get("steps", bins)))
-        if mechanism_config.mechanism == "bsr":
-            accountant_coeffs = list(state["coeffs"])
-            state["bnb_accountant_coeffs"] = list(accountant_coeffs)
-            state["bnb_accountant_coeffs_source"] = "raw_c_col"
-        elif mechanism_config.mechanism == "bisr":
-            accountant_coeffs = (
-                derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs(
-                    coeffs=list(state.get("bisr_inv_coeffs", state["coeffs"])),
-                    steps=int(horizon),
-                )
-            )
-            state["bnb_accountant_coeffs"] = list(accountant_coeffs)
-            state["bnb_accountant_coeffs_source"] = "abs_factor_c_col"
-        elif mechanism_config.mechanism == "bandmf":
-            accountant_coeffs = derive_bandmf_amplified_accountant_coeffs_from_runtime_coeffs(
-                coeffs=list(state["coeffs"]),
-            )
-            state["bnb_accountant_coeffs"] = list(accountant_coeffs)
-            state["bnb_accountant_coeffs_source"] = "runtime_c_col"
-        elif mechanism_config.mechanism == "bandinvmf":
-            accountant_coeffs = derive_bandinvmf_amplified_accountant_coeffs_from_inv_coeffs(
-                inv_coeffs=list(state["bandinvmf_inv_coeffs"]),
-                steps=int(horizon),
-            )
-            state["bnb_accountant_coeffs"] = list(accountant_coeffs)
-            state["bnb_accountant_coeffs_source"] = "abs_factor_c_col"
+        accountant_coeffs, accountant_coeffs_source = _BNB_ACCOUNTANT_COEFF_BUILDERS[
+            mechanism_config.mechanism
+        ](
+            state=state,
+            horizon=int(horizon),
+        )
+        state = attach_accountant_coeff_surface(
+            state,
+            coeff_key="bnb_accountant_coeffs",
+            coeff_source_key="bnb_accountant_coeffs_source",
+            coeffs=accountant_coeffs,
+            coeff_source=accountant_coeffs_source,
+        )
 
         if mechanism_config.mechanism in ("bsr", "bisr", "bandmf", "bandinvmf"):
             c_matrix, c_matrix_contract = build_bnb_toeplitz_c_matrix_and_contract(
@@ -524,43 +847,12 @@ class PrivacyEngine:
         state = copy.deepcopy(mechanism_config.mechanism_state)
         state["_noise_mechanism"] = "gaussian"
         metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
-        metadata_bins = metadata.get("bins", metadata.get("b"))
-        explicit_cycle_length = kwargs.get("bnb_cycle_length", state.get("bnb_cycle_length"))
-        legacy_bins = state.get("bnb_bins")
-        if explicit_cycle_length is not None:
-            explicit_cycle_length = int(explicit_cycle_length)
-            if explicit_cycle_length < 1:
-                raise ValueError("balls-in-bins cycle length must be >= 1")
-
-            if metadata_bins is not None and int(metadata_bins) != explicit_cycle_length:
-                raise ValueError(
-                    "conflicting canonical inputs: `bnb_cycle_length` must match "
-                    "sampling_semantics privacy_metadata['bins']"
-                )
-
-            if legacy_bins is not None and int(legacy_bins) != explicit_cycle_length:
-                raise ValueError(
-                    "conflicting canonical inputs: `bnb_cycle_length` must match "
-                    "mechanism_state['bnb_bins']"
-                )
-
-        bins = (
-            metadata_bins
-            if metadata_bins is not None
-            else (
-                explicit_cycle_length
-                if explicit_cycle_length is not None
-                else state.get("bnb_cycle_length", state.get("bnb_bins"))
-            )
+        bins = resolve_canonical_bnb_cycle_length(
+            runtime_state=state,
+            metadata=metadata,
+            kwargs=kwargs,
+            error_context="gaussian balls_in_bins accounting requires privacy_metadata['bins']",
         )
-        if bins is None:
-            raise ValueError(
-                "gaussian balls_in_bins accounting requires privacy_metadata['bins']"
-            )
-
-        bins = int(bins)
-        if bins < 1:
-            raise ValueError("gaussian balls_in_bins bins must be >= 1")
 
         state["coeffs"] = [1.0]
         state["bsr_bands"] = 1
@@ -585,24 +877,18 @@ class PrivacyEngine:
 
     @staticmethod
     def _summarize_bsr_state(mechanism_state: Dict[str, Any]) -> Dict[str, Any]:
-        coeffs = mechanism_state.get("coeffs")
-        coeff_count = len(coeffs) if isinstance(coeffs, (list, tuple)) else None
-        coeff_head = list(coeffs[:5]) if isinstance(coeffs, (list, tuple)) else None
-        coeff_source = mechanism_state.get("coeff_source")
-        if coeff_source is None and coeff_count:
-            coeff_source = "explicit_or_precomputed"
-        return {
-            "coeff_count": coeff_count,
-            "coeff_head": coeff_head,
-            "coeff_source": coeff_source,
-            "z_std": mechanism_state.get("z_std"),
-            "bsr_sensitivity_scale": mechanism_state.get("bsr_sensitivity_scale"),
-            "bsr_mf_sensitivity": mechanism_state.get("bsr_mf_sensitivity"),
-            "bsr_min_separation": mechanism_state.get("bsr_min_separation"),
-            "bsr_max_participations": mechanism_state.get("bsr_max_participations"),
-            "bsr_iterations_number": mechanism_state.get("bsr_iterations_number"),
-            "bsr_bands": mechanism_state.get("bsr_bands"),
-        }
+        return summarize_bsr_runtime_state(mechanism_state)
+
+    @staticmethod
+    def _summarize_mf_state(
+        *,
+        mechanism: str,
+        mechanism_state: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        entry = get_mf_family_entry(mechanism)
+        if entry is None:
+            return None
+        return entry.family.summarize(mechanism_state)
 
     @staticmethod
     def _apply_default_fixed_batch_contract_for_torch_sampler(
@@ -615,7 +901,7 @@ class PrivacyEngine:
         logical_batch_size: int,
         kwargs: Dict[str, Any],
     ) -> NoiseMechanismConfig:
-        if mechanism_config.mechanism not in ("bandmf", "bsr", "bisr", "bandinvmf"):
+        if mechanism_config.mechanism not in ("bandmf", "bsr", "bisr", "bandinvmf", "bifr", "blt"):
             return mechanism_config
 
         if sampling_semantics is None or sampling_semantics.sampling_mode != "torch_sampler":
@@ -681,6 +967,104 @@ class PrivacyEngine:
             accounting_mode=mechanism_config.accounting_mode,
             mechanism_state=state,
         )
+
+    @staticmethod
+    def _apply_default_blt_fixed_batch_contract_for_torch_sampler(
+        *,
+        mechanism_config: NoiseMechanismConfig,
+        sampling_semantics: Optional[SamplingSemantics],
+        total_steps: int,
+        dataset_size: int,
+        logical_batch_size: int,
+        max_grad_norm: Union[float, List[float]],
+        loss_reduction: str,
+        noise_multiplier: float,
+        kwargs: Dict[str, Any],
+    ) -> NoiseMechanismConfig:
+        """
+        Fill in default fixed-batch BLT metadata for `torch_sampler` runs.
+
+        This is the fixed-batch BLT path that later feeds the BLT accountant and
+        runtime `z_std` calibration. It is distinct from the amplified BNB
+        route, which instead packages a forward normalized `c_col` bridge for
+        `balls_in_bins`.
+        """
+        if mechanism_config.mechanism != "blt":
+            return mechanism_config
+
+        if sampling_semantics is None or sampling_semantics.sampling_mode != "torch_sampler":
+            return mechanism_config
+
+        if total_steps < 1 or dataset_size < 1 or logical_batch_size < 1:
+            return mechanism_config
+
+        if isinstance(max_grad_norm, list):
+            return mechanism_config
+
+        metadata = (
+            sampling_semantics.privacy_metadata
+            if sampling_semantics is not None
+            else {}
+        )
+        state = BLTFamilyState.from_input_state(mechanism_config.mechanism_state)
+        changed = state.apply_explicit_overrides(metadata=metadata, kwargs=kwargs)
+        changed = (
+            state.apply_torch_sampler_defaults(
+                total_steps=int(total_steps),
+                dataset_size=int(dataset_size),
+                logical_batch_size=int(logical_batch_size),
+                max_grad_norm=float(max_grad_norm),
+                calibration_denominator=PrivacyEngine._bsr_calibration_denominator(
+                    loss_reduction=loss_reduction,
+                    expected_batch_size=int(logical_batch_size),
+                ),
+            )
+            or changed
+        )
+
+        if not changed:
+            return mechanism_config
+
+        return NoiseMechanismConfig(
+            mechanism=mechanism_config.mechanism,
+            accounting_mode=mechanism_config.accounting_mode,
+            mechanism_state=state.to_state_dict(),
+        )
+
+    @staticmethod
+    def _blt_supports_fixed_batch_accountant(
+        *,
+        mechanism_config: NoiseMechanismConfig,
+        sampling_semantics: Optional[SamplingSemantics],
+    ) -> bool:
+        """
+        Return whether the current BLT state supports the fixed-batch accountant.
+
+        This is a runtime/accountant contract check only. It does not make any
+        statement about the amplified BNB bridge.
+        """
+        if mechanism_config.mechanism != "blt":
+            return False
+
+        if sampling_semantics is None or sampling_semantics.sampling_mode != "torch_sampler":
+            return False
+
+        try:
+            state = BLTFamilyState.from_input_state(mechanism_config.mechanism_state)
+            if not state.supports_fixed_batch_accountant():
+                return False
+            pair = state.pair.canonicalized()
+            pair.validate()
+            compute_blt_fixed_batch_max_loss(
+                pair=pair,
+                horizon=int(state.metadata["blt_horizon"]),
+                max_participations=int(state.metadata["blt_max_participations"]),
+                min_separation=int(state.metadata["blt_min_separation"]),
+            )
+        except Exception:
+            return False
+
+        return True
 
     @staticmethod
     def _log_bsr_trace(
@@ -772,11 +1156,23 @@ class PrivacyEngine:
             )
 
     @staticmethod
-    def _accountant_for_mechanism(*, mechanism_config: NoiseMechanismConfig, default_accountant):
+    def _accountant_for_mechanism(
+        *,
+        mechanism_config: NoiseMechanismConfig,
+        default_accountant,
+        sampling_semantics: Optional[SamplingSemantics] = None,
+    ):
         if mechanism_config.accounting_mode == "bnb_accountant":
             return create_accountant(mechanism="bnb")
         if mechanism_config.accounting_mode == "random_allocation_accountant":
             return create_accountant(mechanism="random_allocation")
+        if mechanism_config.mechanism == "blt":
+            if PrivacyEngine._blt_supports_fixed_batch_accountant(
+                mechanism_config=mechanism_config,
+                sampling_semantics=sampling_semantics,
+            ):
+                return create_accountant(mechanism="blt")
+            return create_accountant(mechanism="blt_runtime_only")
         if mechanism_config.mechanism in ("bandmf", "bsr"):
             return create_accountant(mechanism=mechanism_config.mechanism)
         if mechanism_config.mechanism in ("bisr", "bandinvmf"):
@@ -875,6 +1271,21 @@ class PrivacyEngine:
             )
 
     @staticmethod
+    def _validate_distributed_blt_support(
+        *,
+        is_fsdp: bool,
+    ) -> None:
+        if is_fsdp:
+            raise ValueError(
+                "blt noise mechanism is not yet supported with FSDP; "
+                "the validated BLT contract is single-process only"
+            )
+        raise ValueError(
+            "blt noise mechanism is not yet supported in distributed mode; "
+            "the validated BLT contract is single-process only"
+        )
+
+    @staticmethod
     def _build_noise_mechanism_from_config(config: NoiseMechanismConfig):
         if config.mechanism == "gaussian":
             return None
@@ -886,6 +1297,20 @@ class PrivacyEngine:
             raise ValueError(
                 f"{mechanism_name} mechanism requires `mechanism_state['z_std']`"
             )
+
+        if mechanism_name == "blt":
+            pair = BLTPairedParams(
+                forward=BLTParams(
+                    theta=state["forward"]["theta"],
+                    omega=state["forward"]["omega"],
+                ),
+                inverse=BLTParams(
+                    theta=state["inverse"]["theta"],
+                    omega=state["inverse"]["omega"],
+                ),
+            ).canonicalized()
+            pair.validate()
+            return BufferedToeplitzNoiseMechanism(pair=pair, z_std=float(z_std))
 
         if mechanism_name == "bisr":
             inverse_coeffs = state.get("bisr_inv_coeffs")
@@ -1162,7 +1587,7 @@ class PrivacyEngine:
         if isinstance(data_loader.dataset, torch.utils.data.IterableDataset):
             raise ValueError("b_min_sep sampling is not supported for IterableDataset")
 
-        # `b` is min-separation; `p` is per-step participation probability.
+        # `b` is min-separation; `p` is the eligibility Bernoulli parameter when available.
         steps = total_steps if total_steps is not None else len(data_loader)
         generator = self._sampler_generator(data_loader)
         if distributed:
@@ -1244,63 +1669,22 @@ class PrivacyEngine:
         cyclic requires ``q = b·p ∈ (0,1]``, fixed-batch BSR uses ``S_{k,b}(C;T)``,
         and BNB requires b-min-sep/balls-in-bins semantics.
 
-        Source: BandMF (Choquette-Choo et al., 2023), Section 5 and Theorems 4 and 5; and
-        BMinSep (Dong and Ganesh, 2026):
-            Section 4 and Section 5, Equations (2)-(4), Theorem 5.1.
+        Source: BandMF (Choquette-Choo et al., 2023, Section 5, Theorems 4 and 5);
+        BMinSep (Dong and Ganesh, 2026, Section 4, Section 5,
+        BMinSep (Dong and Ganesh, 2026, Equations (2)-(4), Theorem 5.1)).
         """
         mechanism = mechanism_config.mechanism
         accounting_mode = mechanism_config.accounting_mode
-        if mechanism in ("bandmf", "bsr", "bisr", "bandinvmf") and poisson_sampling:
-            raise ValueError(
-                f"{mechanism} mechanism requires fixed-batch semantics; "
-                "set poisson_sampling=False"
+        entry = get_mf_family_entry(mechanism)
+        family = entry.family if entry is not None else None
+        validator = getattr(family, "validate_sampling_compatibility", None)
+        if validator is not None:
+            validator(
+                mechanism_config=mechanism_config,
+                poisson_sampling=poisson_sampling,
+                sampling_semantics=sampling_semantics,
+                validate_cyclic_poisson_mode=validate_cyclic_poisson_mode,
             )
-
-        if mechanism == "bandmf":
-            if sampling_semantics is None:
-                raise ValueError(
-                    f"{mechanism} mechanism requires explicit sampling_semantics "
-                    "with sampling_mode in {'cyclic_poisson', 'balls_in_bins'}"
-                )
-            if (
-                mechanism == "bandmf"
-                and
-                accounting_mode == "bandmf_accountant"
-                and sampling_semantics.sampling_mode not in ("cyclic_poisson", "torch_sampler")
-            ):
-                raise ValueError(
-                    "bandmf mechanism with bandmf_accountant supports sampling_mode in "
-                    "{'cyclic_poisson', 'torch_sampler'} only"
-                )
-            if accounting_mode == "bnb_accountant" and sampling_semantics.sampling_mode != "balls_in_bins":
-                raise ValueError(
-                    f"{mechanism} mechanism with bnb_accountant requires sampling_mode='balls_in_bins'"
-                )
-            if accounting_mode == "random_allocation_accountant" and sampling_semantics.sampling_mode != "k_out_of_t":
-                raise ValueError(
-                    f"{mechanism} mechanism with random_allocation_accountant requires sampling_mode='k_out_of_t'"
-                )
-
-        if mechanism == "bandinvmf":
-            if accounting_mode == "bnb_accountant":
-                if sampling_semantics is None or sampling_semantics.sampling_mode != "balls_in_bins":
-                    raise ValueError(
-                        "bandinvmf mechanism with bnb_accountant requires sampling_mode='balls_in_bins'"
-                    )
-            elif accounting_mode == "random_allocation_accountant":
-                if sampling_semantics is None or sampling_semantics.sampling_mode != "k_out_of_t":
-                    raise ValueError(
-                        "bandinvmf mechanism with random_allocation_accountant requires sampling_mode='k_out_of_t'"
-                    )
-            elif accounting_mode == "bsr_accountant":
-                if (
-                    sampling_semantics is not None
-                    and sampling_semantics.sampling_mode not in ("torch_sampler", "cyclic_poisson")
-                ):
-                    raise ValueError(
-                        "bandinvmf mechanism with bsr_accountant supports sampling_mode in "
-                        "{'torch_sampler', 'cyclic_poisson'} only"
-                    )
 
         self._validate_bnb_sampling_policy(
             sampling_semantics=sampling_semantics,
@@ -1312,17 +1696,23 @@ class PrivacyEngine:
             sampling_semantics is not None
             and sampling_semantics.sampling_mode == "b_min_sep"
         ):
-            raise ValueError(
-                "b_min_sep sampling is temporarily disabled pending p-aware BNB accounting"
-            )
+            if accounting_mode != "bnb_accountant":
+                raise ValueError(
+                    "b_min_sep sampling requires accounting_mode='bnb_accountant'"
+                )
+            if mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bandinvmf", "blt"):
+                raise ValueError(
+                    "b_min_sep sampling is supported only for mechanism in "
+                    "{'gaussian', 'bandmf', 'bsr', 'bisr', 'bandinvmf', 'blt'}"
+                )
 
         if (
             sampling_semantics is not None
             and sampling_semantics.sampling_mode == "balls_in_bins"
-            and mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bandinvmf")
+            and mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bandinvmf", "blt")
         ):
             raise ValueError(
-                "balls_in_bins sampling is supported only for mechanism in {'gaussian', 'bandmf', 'bsr', 'bisr', 'bandinvmf'}"
+                "balls_in_bins sampling is supported only for mechanism in {'gaussian', 'bandmf', 'bsr', 'bisr', 'bandinvmf', 'blt'}"
             )
 
         if (
@@ -1350,6 +1740,18 @@ class PrivacyEngine:
             )
 
     @staticmethod
+    def _resolve_b_min_sep_average_participation_rate(
+        *,
+        b: int,
+        p: float,
+    ) -> float:
+        """
+        Resolve the unconditional per-step participation rate for `b_min_sep`.
+        Math: if `p` is the eligibility Bernoulli parameter, then `p0 = p / (1 + p (b - 1))`.
+        """
+        return float(p) / (1.0 + float(p) * float(int(b) - 1))
+
+    @staticmethod
     def _resolve_total_steps_sample_rate(
         *,
         poisson_sampling: bool,
@@ -1364,7 +1766,7 @@ class PrivacyEngine:
             else None
         )
         if not poisson_sampling and sampling_mode in (None, "torch_sampler"):
-            if mechanism in ("bandmf", "bsr", "bisr", "bandinvmf"):
+            if mechanism in ("bandmf", "bsr", "bisr", "bandinvmf", "bifr", "blt"):
                 return batch_size / dataset_size
 
             raise ValueError(
@@ -1373,8 +1775,19 @@ class PrivacyEngine:
             )
 
         if not poisson_sampling and sampling_mode == "b_min_sep":
-            raise ValueError(
-                "b_min_sep sampling is temporarily disabled pending p-aware BNB accounting"
+            b_min_sep_b = sampling_semantics.privacy_metadata.get("b")
+            b_min_sep_p = sampling_semantics.privacy_metadata.get("p")
+            if b_min_sep_b is None:
+                raise ValueError(
+                    "b_min_sep sampling requires privacy_metadata['b']"
+                )
+            if b_min_sep_p is None:
+                raise ValueError(
+                    "b_min_sep sampling requires privacy_metadata['p']"
+                )
+            return PrivacyEngine._resolve_b_min_sep_average_participation_rate(
+                b=int(b_min_sep_b),
+                p=float(b_min_sep_p),
             )
 
         if not poisson_sampling and sampling_mode == "k_out_of_t":
@@ -1429,7 +1842,12 @@ class PrivacyEngine:
         data_loader: DataLoader,
     ) -> Optional[SamplingSemantics]:
         local_sampling_semantics = sampling_semantics
-        if mechanism in ("bsr", "bisr", "bandinvmf") and local_sampling_semantics is None:
+        entry = get_mf_family_entry(mechanism)
+        if (
+            entry is not None
+            and entry.needs_default_local_sampling_semantics
+            and local_sampling_semantics is None
+        ):
             if total_steps:
                 local_sample_rate = data_loader.batch_size / len(data_loader.dataset)
             else:
@@ -1545,70 +1963,15 @@ class PrivacyEngine:
                 dataset_size=len(data_loader.dataset),
             )
 
-            bsr_mf_sensitivity = None
-            if (
-                mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf")
-                and sampling_semantics is not None
-                and sampling_semantics.sampling_mode == "cyclic_poisson"
-            ):
-                if mechanism_config.mechanism == "bisr":
-                    nm_kwargs["bsr_sensitivity_scale"] = resolve_bisr_sensitivity_scale_for_cyclic_helper(
-                        mechanism_state=mechanism_config.mechanism_state,
-                        sampling_semantics=sampling_semantics,
-                        steps=int(total_steps),
-                        kwargs=kwargs,
-                    )
-                elif mechanism_config.mechanism == "bandinvmf":
-                    nm_kwargs["bsr_sensitivity_scale"] = resolve_bandinvmf_sensitivity_scale_for_cyclic_helper(
-                        mechanism_state=mechanism_config.mechanism_state,
-                        sampling_semantics=sampling_semantics,
-                        steps=int(total_steps),
-                        kwargs=kwargs,
-                    )
-                else:
-                    nm_kwargs["bsr_sensitivity_scale"] = resolve_bsr_sensitivity_scale_for_cyclic_helper(
-                        mechanism_state=mechanism_config.mechanism_state,
-                        sampling_semantics=sampling_semantics,
-                        steps=int(total_steps),
-                        kwargs=kwargs,
-                    )
-            if (
-                mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf")
-                and sampling_semantics is not None
-                and sampling_semantics.sampling_mode == "torch_sampler"
-            ):
-                if mechanism_config.mechanism == "bandmf":
-                    bsr_mf_sensitivity = resolve_bandmf_mf_sensitivity_for_fixed_batch_helper(
-                        mechanism_state=mechanism_config.mechanism_state,
-                        sampling_semantics=sampling_semantics,
-                        steps=int(total_steps),
-                        sample_rate=sample_rate,
-                        kwargs=kwargs,
-                    )
-                elif mechanism_config.mechanism == "bisr":
-                    bsr_mf_sensitivity = resolve_bisr_mf_sensitivity_for_fixed_batch_helper(
-                        mechanism_state=mechanism_config.mechanism_state,
-                        sampling_semantics=sampling_semantics,
-                        steps=int(total_steps),
-                        sample_rate=sample_rate,
-                        kwargs=kwargs,
-                    )
-                elif mechanism_config.mechanism == "bandinvmf":
-                    bsr_mf_sensitivity = resolve_bandinvmf_mf_sensitivity_for_fixed_batch_helper(
-                        mechanism_state=mechanism_config.mechanism_state,
-                        sampling_semantics=sampling_semantics,
-                        steps=int(total_steps),
-                        sample_rate=sample_rate,
-                        kwargs=kwargs,
-                    )
-                else:
-                    bsr_mf_sensitivity = resolve_bsr_mf_sensitivity_for_fixed_batch_helper(
-                        mechanism_state=mechanism_config.mechanism_state,
-                        sampling_semantics=sampling_semantics,
-                        steps=int(total_steps),
-                        sample_rate=sample_rate,
-                        kwargs=kwargs,
-                    )
+            extra_nm_kwargs, bsr_mf_sensitivity = self._resolve_mf_target_epsilon_terms(
+                mechanism_config=mechanism_config,
+                sampling_semantics=sampling_semantics,
+                steps=int(total_steps),
+                sample_rate=float(sample_rate),
+                kwargs=kwargs,
+                phase="total_steps",
+            )
+            nm_kwargs.update(extra_nm_kwargs)
 
             t0 = time.perf_counter()
             noise_multiplier = get_noise_multiplier(
@@ -1656,55 +2019,15 @@ class PrivacyEngine:
             dataset_size=len(data_loader.dataset),
         )
         implied_steps = int(float(epochs) * float(len(data_loader)))
-        bsr_mf_sensitivity = None
-        if (
-            mechanism_config.mechanism in ("bandmf", "bisr")
-            and sampling_semantics is not None
-            and sampling_semantics.sampling_mode == "cyclic_poisson"
-        ):
-            if mechanism_config.mechanism == "bisr":
-                nm_kwargs["bsr_sensitivity_scale"] = resolve_bisr_sensitivity_scale_for_cyclic_helper(
-                    mechanism_state=mechanism_config.mechanism_state,
-                    sampling_semantics=sampling_semantics,
-                    steps=implied_steps,
-                    kwargs=kwargs,
-                )
-            else:
-                nm_kwargs["bsr_sensitivity_scale"] = resolve_bsr_sensitivity_scale_for_cyclic_helper(
-                    mechanism_state=mechanism_config.mechanism_state,
-                    sampling_semantics=sampling_semantics,
-                    steps=implied_steps,
-                    kwargs=kwargs,
-                )
-        if (
-            mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf")
-            and sampling_semantics is not None
-            and sampling_semantics.sampling_mode == "torch_sampler"
-        ):
-            if mechanism_config.mechanism == "bandmf":
-                bsr_mf_sensitivity = resolve_bandmf_mf_sensitivity_for_fixed_batch_helper(
-                    mechanism_state=mechanism_config.mechanism_state,
-                    sampling_semantics=sampling_semantics,
-                    steps=implied_steps,
-                    sample_rate=sample_rate,
-                    kwargs=kwargs,
-                )
-            elif mechanism_config.mechanism == "bisr":
-                bsr_mf_sensitivity = resolve_bisr_mf_sensitivity_for_fixed_batch_helper(
-                    mechanism_state=mechanism_config.mechanism_state,
-                    sampling_semantics=sampling_semantics,
-                    steps=implied_steps,
-                    sample_rate=sample_rate,
-                    kwargs=kwargs,
-                )
-            else:
-                bsr_mf_sensitivity = resolve_bsr_mf_sensitivity_for_fixed_batch_helper(
-                    mechanism_state=mechanism_config.mechanism_state,
-                    sampling_semantics=sampling_semantics,
-                    steps=implied_steps,
-                    sample_rate=sample_rate,
-                    kwargs=kwargs,
-                )
+        extra_nm_kwargs, bsr_mf_sensitivity = self._resolve_mf_target_epsilon_terms(
+            mechanism_config=mechanism_config,
+            sampling_semantics=sampling_semantics,
+            steps=int(implied_steps),
+            sample_rate=float(sample_rate),
+            kwargs=kwargs,
+            phase="epochs",
+        )
+        nm_kwargs.update(extra_nm_kwargs)
 
         t0 = time.perf_counter()
         noise_multiplier = get_noise_multiplier(
@@ -1980,9 +2303,9 @@ class PrivacyEngine:
         )
 
         if bool(calibration_cfg["bnb_require_evr_pass"]) and not verification.accepted:
-            raise ValueError(
-                "bnb verification guard failed for calibrated noise multiplier; "
-                "increase noise, sample budget, or loosen targets"
+            logger.warning(
+                "bnb calibration report EVR verification did not accept the calibrated "
+                "noise multiplier; persisting report metadata without raising"
             )
 
         return make_bnb_calibration_report(
@@ -2006,7 +2329,7 @@ class PrivacyEngine:
         kwargs: Dict[str, Any],
         distributed_dp_runtime: bool,
     ) -> Optional[Dict[str, Any]]:
-        if mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bandinvmf"):
+        if mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bandinvmf", "blt"):
             return None
 
         calibration_cfg = resolve_bnb_calibration_kwargs(
@@ -2075,7 +2398,7 @@ class PrivacyEngine:
         bnb_calibration_report: Optional[Dict[str, Any]],
         bnb_accounting_kwargs: Optional[Dict[str, Any]] = None,
     ) -> NoiseMechanismConfig:
-        if mechanism_config.mechanism not in ("bandmf", "bsr", "bisr", "bandinvmf"):
+        if mechanism_config.mechanism not in ("bandmf", "bsr", "bisr", "bandinvmf", "bifr", "blt"):
             return mechanism_config
 
         if isinstance(max_grad_norm, list):
@@ -2090,6 +2413,8 @@ class PrivacyEngine:
             max_grad_norm=float(max_grad_norm),
             denominator=float(correlated_denominator),
         )
+        if mechanism_config.mechanism == "blt":
+            state["noise_multiplier_ref"] = float(noise_multiplier)
 
         if bnb_calibration_report is not None:
             state["_bnb_calibration_report"] = bnb_calibration_report
@@ -2156,9 +2481,26 @@ class PrivacyEngine:
             return self._rebuild_data_loader_with_batch_sampler(data_loader, sampler)
 
         if sampling_semantics is not None and sampling_semantics.sampling_mode == "b_min_sep":
-            raise ValueError(
-                "b_min_sep sampling is temporarily disabled pending p-aware BNB accounting"
+            b = sampling_semantics.privacy_metadata.get("b")
+            p = sampling_semantics.privacy_metadata.get("p")
+            if b is None:
+                raise ValueError(
+                    "b_min_sep sampling requires privacy_metadata['b']"
+                )
+            if p is None:
+                raise ValueError(
+                    "b_min_sep sampling requires privacy_metadata['p']"
+                )
+
+            sampler = self._build_b_min_sep_sampler(
+                data_loader=data_loader,
+                distributed=distributed,
+                b=int(b),
+                p=float(p),
+                total_steps=total_steps,
             )
+
+            return self._rebuild_data_loader_with_batch_sampler(data_loader, sampler)
 
         if sampling_semantics is not None and sampling_semantics.sampling_mode == "balls_in_bins":
             bins = sampling_semantics.privacy_metadata.get("bins")
@@ -2321,7 +2663,7 @@ class PrivacyEngine:
         ModuleValidator.validate(module, strict=True)
 
     @classmethod
-    def get_compatible_module(cls, module: nn.Module) -> nn.Module:
+    def get_compatible_module(_cls, module: nn.Module) -> nn.Module:
         """
         Return a privacy engine compatible module. Also validates the module after
         running registered fixes.
@@ -2447,129 +2789,50 @@ class PrivacyEngine:
                 "pass either noise_mechanism_config or noise_mechanism, not both"
             )
 
-        active_accountant = self._accountant_for_mechanism(
-            mechanism_config=mechanism_config,
-            default_accountant=self.default_accountant,
-        )
-
-        # compare module parameter with optimizer parameters
-        model_parameters = set(module.parameters())
-        for p in chain.from_iterable(
-            [param_group["params"] for param_group in optimizer.param_groups]
-        ):
-            if p not in model_parameters:
-                raise ValueError(
-                    "Module parameters are different than optimizer Parameters"
-                )
-
-        is_dpddp = isinstance(module, DPDDP)
-        is_ddp = isinstance(module, DDP)
-        is_fsdp = isinstance(module, FSDPModule)
-        distributed = is_dpddp or is_ddp or is_fsdp
-
-        requested_noise_mechanism = kwargs.get("noise_mechanism")
-        if distributed and (
-            mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf")
-            or isinstance(requested_noise_mechanism, CorrelatedNoiseMechanism)
-        ):
-            self._validate_distributed_correlated_support(
-                mechanism=mechanism_config.mechanism,
-                clipping=clipping,
+        module, data_loader, distributed, semantics, sample_rate, expected_batch_size = (
+            self._prepare_make_private_runtime(
+                module=module,
+                optimizer=optimizer,
+                data_loader=data_loader,
+                batch_first=batch_first,
+                max_grad_norm=max_grad_norm,
+                loss_reduction=loss_reduction,
                 grad_sample_mode=grad_sample_mode,
-                is_fsdp=is_fsdp,
+                poisson_sampling=poisson_sampling,
+                sampling_semantics=sampling_semantics,
+                total_steps=total_steps,
+                mechanism_config=mechanism_config,
+                kwargs=kwargs,
+                clipping=clipping,
             )
-
-        module = self._prepare_model(
-            module,
-            batch_first=batch_first,
-            max_grad_norm=max_grad_norm,
-            loss_reduction=loss_reduction,
-            grad_sample_mode=grad_sample_mode,
-        )
-
-        if poisson_sampling:
-            module.forbid_grad_accumulation()
-
-        # save batch size from original data loader
-        batch_size = data_loader.batch_size
-
-        data_loader = self._prepare_data_loader(
-            data_loader,
-            distributed=distributed,
-            poisson_sampling=poisson_sampling,
-            sampling_semantics=sampling_semantics,
-            total_steps=total_steps,
-        )
-
-        sample_rate, expected_batch_size = self._resolve_sample_rate_and_expected_batch_size(
-            poisson_sampling=poisson_sampling,
-            sampling_semantics=sampling_semantics,
-            mechanism=mechanism_config.mechanism,
-            batch_size=batch_size,
-            dataset_size=len(data_loader.dataset),
-            data_loader_len=len(data_loader),
-            total_steps=total_steps,
-            distributed=distributed,
-        )
-        semantics = self._build_sampling_semantics(
-            poisson_sampling=poisson_sampling,
-            sample_rate=sample_rate,
-            expected_batch_size=expected_batch_size,
-            distributed=distributed,
-            explicit_sampling_semantics=sampling_semantics,
         )
 
         coeff_resolution_kwargs = dict(kwargs)
         if total_steps is not None:
             coeff_resolution_kwargs["total_steps"] = int(total_steps)
-        mechanism_config = ensure_bsr_family_fixed_analytical_coeffs_helper(
-            mechanism_config=mechanism_config,
-            optimizer=optimizer,
-            sampling_semantics=sampling_semantics,
-            kwargs=coeff_resolution_kwargs,
-        )
-        mechanism_config = ensure_bandmf_fixed_analytical_coeffs_helper(
-            mechanism_config=mechanism_config,
-            optimizer=optimizer,
-            sampling_semantics=sampling_semantics,
-            kwargs=coeff_resolution_kwargs,
-        )
-        mechanism_config = self._ensure_random_allocation_state(
+        mechanism_config = self._prepare_mf_mechanism_config(
             mechanism_config=mechanism_config,
             optimizer=optimizer,
             sampling_semantics=semantics,
-            kwargs=coeff_resolution_kwargs,
-        )
-        mechanism_config = self._ensure_bnb_balls_in_bins_gaussian_state(
-            mechanism_config=mechanism_config,
-            sampling_semantics=sampling_semantics,
-            kwargs=coeff_resolution_kwargs,
-        )
-        mechanism_config = self._apply_default_fixed_batch_contract_for_torch_sampler(
-            mechanism_config=mechanism_config,
-            sampling_semantics=semantics,
-            total_steps=int(total_steps) if total_steps is not None else 0,
-            dataloader_len=int(len(data_loader)),
+            coeff_resolution_kwargs=coeff_resolution_kwargs,
+            total_steps_for_contract=(
+                int(total_steps) if total_steps is not None else 0
+            ),
+            band_steps_hint=(
+                int(total_steps) if total_steps is not None else int(len(data_loader))
+            ),
+            data_loader_len=int(len(data_loader)),
             dataset_size=int(len(data_loader.dataset)),
-            logical_batch_size=int(batch_size) if batch_size is not None else 0,
-            kwargs=kwargs,
-        )
-        mechanism_config = ensure_bandinvmf_runtime_state_helper(
-            mechanism_config=mechanism_config,
-            optimizer=optimizer,
-            sampling_semantics=semantics,
-            steps_hint=int(total_steps) if total_steps is not None else int(len(data_loader)),
+            logical_batch_size=int(data_loader.batch_size) if data_loader.batch_size is not None else 0,
+            max_grad_norm=max_grad_norm,
+            loss_reduction=loss_reduction,
+            blt_noise_multiplier=float(noise_multiplier),
             sample_rate_hint=float(sample_rate),
-            kwargs=coeff_resolution_kwargs,
-        )
-        mechanism_config = self._ensure_bnb_balls_in_bins_mf_state(
-            mechanism_config=mechanism_config,
-            optimizer=optimizer,
-            sampling_semantics=semantics,
-            kwargs=coeff_resolution_kwargs,
+            kwargs=kwargs,
+            include_random_allocation_state=True,
         )
         if (
-            mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf")
+            mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf", "bifr")
             and mechanism_config.mechanism_state.get("z_std") is None
         ):
             state = copy.deepcopy(mechanism_config.mechanism_state)
@@ -2623,6 +2886,12 @@ class PrivacyEngine:
                 kwargs=kwargs,
             )
 
+        active_accountant = self._accountant_for_mechanism(
+            mechanism_config=mechanism_config,
+            default_accountant=self.default_accountant,
+            sampling_semantics=semantics,
+        )
+
         configured_noise_mechanism = self._build_noise_mechanism_from_config(
             mechanism_config
         )
@@ -2660,28 +2929,19 @@ class PrivacyEngine:
             correlated_denominator=None,
         )
 
-        self.noise_mechanism_config = mechanism_config
-        self.sampling_semantics = semantics
-        self.accountant = active_accountant
-        setattr(optimizer, "accounting_mode", mechanism_config.accounting_mode)
-        setattr(optimizer, "noise_mechanism_config", mechanism_config)
-        setattr(optimizer, "sampling_semantics", semantics)
-
-        optimizer.attach_step_hook(
-            active_accountant.get_optimizer_hook_fn(sample_rate=sample_rate)
+        return self._finalize_make_private_result(
+            module=module,
+            optimizer=optimizer,
+            criterion=criterion,
+            data_loader=data_loader,
+            mechanism_config=mechanism_config,
+            semantics=semantics,
+            active_accountant=active_accountant,
+            sample_rate=float(sample_rate),
+            grad_sample_mode=grad_sample_mode,
+            loss_reduction=loss_reduction,
+            kwargs=kwargs,
         )
-        if "ghost" in grad_sample_mode:
-            criterion = self._prepare_criterion(
-                module=module,
-                optimizer=optimizer,
-                criterion=criterion,
-                loss_reduction=loss_reduction,
-                **kwargs,
-            )
-
-            return module, optimizer, criterion, data_loader
-
-        return module, optimizer, data_loader
 
     def make_private_with_epsilon(
         self,
@@ -2772,11 +3032,6 @@ class PrivacyEngine:
                 "make_private_with_epsilon requires either `epochs` or `total_steps`"
             )
 
-        active_accountant = self._accountant_for_mechanism(
-            mechanism_config=mechanism_config,
-            default_accountant=self.default_accountant,
-        )
-
         self._validate_mechanism_sampling_compatibility(
             mechanism_config=mechanism_config,
             poisson_sampling=poisson_sampling,
@@ -2797,23 +3052,6 @@ class PrivacyEngine:
             coeff_resolution_kwargs["total_steps"] = int(total_steps)
         elif epochs is not None:
             coeff_resolution_kwargs["total_steps"] = int(float(epochs) * float(len(data_loader)))
-        mechanism_config = ensure_bsr_family_fixed_analytical_coeffs_helper(
-            mechanism_config=mechanism_config,
-            optimizer=optimizer,
-            sampling_semantics=local_sampling_semantics,
-            kwargs=coeff_resolution_kwargs,
-        )
-        mechanism_config = ensure_bandmf_fixed_analytical_coeffs_helper(
-            mechanism_config=mechanism_config,
-            optimizer=optimizer,
-            sampling_semantics=local_sampling_semantics,
-            kwargs=coeff_resolution_kwargs,
-        )
-        mechanism_config = self._ensure_bnb_balls_in_bins_gaussian_state(
-            mechanism_config=mechanism_config,
-            sampling_semantics=local_sampling_semantics,
-            kwargs=coeff_resolution_kwargs,
-        )
         batch_size = data_loader.batch_size
         sample_rate_hint = (
             self._resolve_total_steps_sample_rate(
@@ -2826,45 +3064,53 @@ class PrivacyEngine:
             if total_steps is not None
             else (1.0 / float(len(data_loader)))
         )
-        mechanism_config = self._apply_default_fixed_batch_contract_for_torch_sampler(
+        mechanism_config = self._prepare_mf_mechanism_config(
             mechanism_config=mechanism_config,
+            optimizer=optimizer,
             sampling_semantics=local_sampling_semantics,
-            total_steps=(
+            coeff_resolution_kwargs=coeff_resolution_kwargs,
+            total_steps_for_contract=(
                 int(total_steps)
                 if total_steps is not None
                 else int(float(epochs) * float(len(data_loader)))
             ),
-            dataloader_len=int(len(data_loader)),
+            band_steps_hint=(
+                int(total_steps)
+                if total_steps is not None
+                else int(float(epochs) * float(len(data_loader)))
+            ),
+            data_loader_len=int(len(data_loader)),
             dataset_size=int(len(data_loader.dataset)),
             logical_batch_size=int(batch_size) if batch_size is not None else 0,
-            kwargs=kwargs,
-        )
-        mechanism_config = ensure_bandinvmf_runtime_state_helper(
-            mechanism_config=mechanism_config,
-            optimizer=optimizer,
-            sampling_semantics=local_sampling_semantics,
-            steps_hint=(
-                int(total_steps)
-                if total_steps is not None
-                else int(float(epochs) * float(len(data_loader)))
+            max_grad_norm=max_grad_norm,
+            loss_reduction=loss_reduction,
+            blt_noise_multiplier=float(
+                mechanism_config.mechanism_state.get("noise_multiplier_ref", 1.0)
             ),
             sample_rate_hint=float(sample_rate_hint),
-            kwargs=coeff_resolution_kwargs,
+            kwargs=kwargs,
         )
-        mechanism_config = self._ensure_bnb_balls_in_bins_mf_state(
+
+        active_accountant = self._accountant_for_mechanism(
             mechanism_config=mechanism_config,
-            optimizer=optimizer,
+            default_accountant=self.default_accountant,
             sampling_semantics=local_sampling_semantics,
-            kwargs=coeff_resolution_kwargs,
         )
+        if mechanism_config.mechanism == "blt" and active_accountant.mechanism() not in ("blt", "bnb"):
+            raise ValueError(
+                "BLT target-epsilon calibration is only supported for the BLT fixed-batch "
+                "or supported amplified BNB accountant contracts"
+            )
 
         is_dpddp = isinstance(module, DPDDP)
         is_ddp = isinstance(module, DDP)
         is_fsdp = isinstance(module, FSDPModule)
         distributed = is_dpddp or is_ddp or is_fsdp
+        if distributed and mechanism_config.mechanism == "blt":
+            self._validate_distributed_blt_support(is_fsdp=is_fsdp)
 
         correlated_denominator = None
-        if mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf"):
+        if mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf", "bifr", "blt"):
             _, calibration_expected_batch_size = self._resolve_sample_rate_and_expected_batch_size(
                 poisson_sampling=poisson_sampling,
                 sampling_semantics=local_sampling_semantics,
@@ -2969,100 +3215,15 @@ class PrivacyEngine:
             ),
         )
 
-        if (
-            mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf")
-            and local_sampling_semantics is not None
-            and local_sampling_semantics.sampling_mode == "cyclic_poisson"
-        ):
-            if total_steps is not None:
-                scale_steps = int(total_steps)
-            else:
-                sample_rate = 1.0 / len(data_loader)
-                scale_steps = int(epochs / sample_rate)
-
-            if mechanism_config.mechanism == "bisr":
-                resolved_scale = resolve_bisr_sensitivity_scale_for_cyclic_helper(
-                    mechanism_state=mechanism_config.mechanism_state,
-                    sampling_semantics=local_sampling_semantics,
-                    steps=scale_steps,
-                    kwargs=kwargs,
-                )
-            elif mechanism_config.mechanism == "bandinvmf":
-                resolved_scale = resolve_bandinvmf_sensitivity_scale_for_cyclic_helper(
-                    mechanism_state=mechanism_config.mechanism_state,
-                    sampling_semantics=local_sampling_semantics,
-                    steps=scale_steps,
-                    kwargs=kwargs,
-                )
-            else:
-                resolved_scale = resolve_bsr_sensitivity_scale_for_cyclic_helper(
-                    mechanism_state=mechanism_config.mechanism_state,
-                    sampling_semantics=local_sampling_semantics,
-                    steps=scale_steps,
-                    kwargs=kwargs,
-                )
-            state = copy.deepcopy(mechanism_config.mechanism_state)
-            state["_noise_mechanism"] = mechanism_config.mechanism
-            state["bsr_sensitivity_scale"] = float(resolved_scale)
-
-            mechanism_config = NoiseMechanismConfig(
-                mechanism=mechanism_config.mechanism,
-                accounting_mode=mechanism_config.accounting_mode,
-                mechanism_state=state,
-            )
-        elif (
-            mechanism_config.mechanism in ("bsr", "bisr", "bandinvmf")
-            and (
-                local_sampling_semantics is None
-                or local_sampling_semantics.sampling_mode == "torch_sampler"
-            )
-        ):
-            sample_rate = self._resolve_total_steps_sample_rate(
-                poisson_sampling=poisson_sampling,
-                sampling_semantics=local_sampling_semantics,
-                mechanism=mechanism_config.mechanism,
-                batch_size=data_loader.batch_size,
-                dataset_size=len(data_loader.dataset),
-            )
-            if total_steps is not None:
-                mf_steps = int(total_steps)
-            else:
-                mf_steps = int(epochs / sample_rate)
-
-            if mechanism_config.mechanism == "bisr":
-                resolved_mf_sensitivity = resolve_bisr_mf_sensitivity_for_fixed_batch_helper(
-                    mechanism_state=mechanism_config.mechanism_state,
-                    sampling_semantics=local_sampling_semantics,
-                    steps=mf_steps,
-                    sample_rate=sample_rate,
-                    kwargs=kwargs,
-                )
-            elif mechanism_config.mechanism == "bandinvmf":
-                resolved_mf_sensitivity = resolve_bandinvmf_mf_sensitivity_for_fixed_batch_helper(
-                    mechanism_state=mechanism_config.mechanism_state,
-                    sampling_semantics=local_sampling_semantics,
-                    steps=mf_steps,
-                    sample_rate=sample_rate,
-                    kwargs=kwargs,
-                )
-            else:
-                resolved_mf_sensitivity = resolve_bsr_mf_sensitivity_for_fixed_batch_helper(
-                    mechanism_state=mechanism_config.mechanism_state,
-                    sampling_semantics=local_sampling_semantics,
-                    steps=mf_steps,
-                    sample_rate=sample_rate,
-                    kwargs=kwargs,
-                )
-
-            state = copy.deepcopy(mechanism_config.mechanism_state)
-            state["_noise_mechanism"] = mechanism_config.mechanism
-            state["bsr_mf_sensitivity"] = float(resolved_mf_sensitivity)
-
-            mechanism_config = NoiseMechanismConfig(
-                mechanism=mechanism_config.mechanism,
-                accounting_mode=mechanism_config.accounting_mode,
-                mechanism_state=state,
-            )
+        mechanism_config = self._augment_mf_query_mechanism_config(
+            mechanism_config=mechanism_config,
+            local_sampling_semantics=local_sampling_semantics,
+            total_steps=total_steps,
+            epochs=epochs,
+            poisson_sampling=poisson_sampling,
+            data_loader=data_loader,
+            kwargs=kwargs,
+        )
 
         bnb_calibration_report = self._build_bnb_calibration_report(
             mechanism=mechanism_config.mechanism,
@@ -3145,7 +3306,11 @@ class PrivacyEngine:
         Returns:
             Privacy budget (epsilon) expended so far.
         """
-        if self.accountant.mechanism() in ("bandmf", "bsr", "bisr", "bnb", "bandinvmf", "random_allocation"):
+        accountant_mechanism = self.accountant.mechanism()
+        if (
+            mf_accounting_requires_context(accountant_mechanism)
+            or accountant_mechanism in {"bnb", "random_allocation"}
+        ):
             kwargs.setdefault(
                 "mechanism_state", self.noise_mechanism_config.mechanism_state
             )
@@ -3165,6 +3330,12 @@ class PrivacyEngine:
             if mechanism_config is not None and isinstance(mechanism_config.mechanism_state, dict)
             else {}
         )
+        summarized_mf_state = None
+        if mechanism_config is not None:
+            summarized_mf_state = self._summarize_mf_state(
+                mechanism=mechanism_config.mechanism,
+                mechanism_state=mechanism_state,
+            )
         coeffs = mechanism_state.get("coeffs")
         coeff_count = len(coeffs) if isinstance(coeffs, (list, tuple)) else None
         coeff_head = list(coeffs[:5]) if isinstance(coeffs, (list, tuple)) else None
@@ -3175,6 +3346,11 @@ class PrivacyEngine:
                 mechanism_config.accounting_mode if mechanism_config is not None else None
             ),
             "accountant": accountant.mechanism() if accountant is not None else None,
+            "accounting_supported": (
+                accountant.mechanism() != "blt_runtime_only"
+                if accountant is not None
+                else None
+            ),
             "sampling_mode": (
                 sampling_semantics.sampling_mode if sampling_semantics is not None else None
             ),
@@ -3185,9 +3361,21 @@ class PrivacyEngine:
             ),
             "events_recorded": int(len(accountant)) if accountant is not None else None,
             "z_std": mechanism_state.get("z_std"),
-            "coeff_count": coeff_count,
-            "coeff_head": coeff_head,
-            "coeff_source": mechanism_state.get("coeff_source"),
+            "coeff_count": (
+                summarized_mf_state.get("coeff_count", coeff_count)
+                if summarized_mf_state is not None
+                else coeff_count
+            ),
+            "coeff_head": (
+                summarized_mf_state.get("coeff_head", coeff_head)
+                if summarized_mf_state is not None
+                else coeff_head
+            ),
+            "coeff_source": (
+                summarized_mf_state.get("coeff_source", mechanism_state.get("coeff_source"))
+                if summarized_mf_state is not None
+                else mechanism_state.get("coeff_source")
+            ),
             "ts_unix": round(time.time(), 6),
         }
 
@@ -3199,9 +3387,14 @@ class PrivacyEngine:
             )
 
         if mechanism_config is not None:
-            if mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf"):
-                payload["mechanism_state_summary"] = self._summarize_bsr_state(
-                    mechanism_state
+            if summarized_mf_state is not None:
+                payload["mechanism_state_summary"] = summarized_mf_state
+            if mechanism_config.mechanism == "blt":
+                payload["distributed_support"] = mechanism_state.get(
+                    "_blt_distributed_policy", "single_process_only"
+                )
+                payload["distributed_runtime"] = bool(
+                    mechanism_state.get("_blt_distributed_runtime", False)
                 )
 
         if delta is not None and accountant is not None:
@@ -3335,7 +3528,11 @@ class PrivacyEngine:
         module.load_state_dict(
             checkpoint["module_state_dict"], **(module_load_dict_kwargs or {})
         )
-        self.accountant.load_state_dict(checkpoint["privacy_accountant_state_dict"])
+        accountant_state = checkpoint["privacy_accountant_state_dict"]
+        accountant_mechanism = accountant_state.get("mechanism")
+        if accountant_mechanism is not None:
+            self.accountant = create_accountant(mechanism=accountant_mechanism)
+        self.accountant.load_state_dict(accountant_state)
         mechanism_cfg_payload = checkpoint.get("noise_mechanism_config")
 
         if isinstance(mechanism_cfg_payload, dict):

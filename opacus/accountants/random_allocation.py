@@ -145,6 +145,13 @@ class RandomAllocationAccountant(IAccountant):
         )
         runtime_cfg = resolve_random_allocation_gaussian_runtime_config(
             target_delta=float(delta),
+            runtime_policy=kwargs.get(
+                "random_allocation_runtime_policy",
+                persisted_kwargs.get(
+                    "random_allocation_runtime_policy",
+                    "strict_exact_package",
+                ),
+            ),
             loss_discretization=kwargs.get(
                 "random_allocation_loss_discretization",
                 persisted_kwargs.get("random_allocation_loss_discretization"),

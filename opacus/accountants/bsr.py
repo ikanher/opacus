@@ -14,6 +14,23 @@
 
 from __future__ import annotations
 
+"""
+Accountant adapter for BSR-family fixed-batch and cyclic accounting.
+
+This module is the accountant-facing contract layer for square-root and
+inverse-square-root MF families. It resolves runtime mechanism state into the
+paper quantities consumed by the reduced Gaussian accountants:
+
+- fixed-batch: `S_{k,b}(C;T)` and the single-event Gaussian comparison from
+  BSR (Kalinin and Lampert, 2024, Section 3.2);
+- cyclic: effective `q = bands * sample_rate` and a finite-horizon
+  `kappa(T)`-style scaling used by the repeated-participation route.
+
+The implementation is intentionally runtime-shaped: explicit overrides, legacy
+state keys, and optimizer-derived coefficient generation are all
+implementation-contract details layered on top of the paper quantities.
+"""
+
 import copy
 import math
 from typing import Any, Dict, Optional
@@ -35,42 +52,11 @@ from opacus.accountants.analysis.bsr import (
     resolve_bsr_cyclic_gaussian_contract,
     resolve_bsr_fixed_batch_gaussian_contract,
 )
+from opacus.mf import BSRFamilyState
+from opacus.mf.optimizer_utils import resolve_uniform_sgd_workload_from_optimizer
 from opacus.mechanism_contracts import NoiseMechanismConfig
 
 from .accountant import IAccountant
-
-
-def resolve_uniform_sgd_workload_from_optimizer(
-    *,
-    optimizer: optim.Optimizer,
-) -> tuple[float, float]:
-    momenta: list[float] = []
-    decays: list[float] = []
-
-    for group in optimizer.param_groups:
-        momenta.append(float(group.get("momentum", 0.0)))
-        decays.append(float(group.get("weight_decay", 0.0)))
-
-    if len(momenta) == 0:
-        raise ValueError("optimizer must contain at least one parameter group")
-
-    m0 = float(momenta[0])
-    d0 = float(decays[0])
-    for m in momenta[1:]:
-        if not math.isclose(float(m), m0, rel_tol=0.0, abs_tol=1e-12):
-            raise ValueError(
-                "bsr analytical auto-coeff generation requires uniform optimizer momentum "
-                "across parameter groups"
-            )
-
-    for d in decays[1:]:
-        if not math.isclose(float(d), d0, rel_tol=0.0, abs_tol=1e-12):
-            raise ValueError(
-                "bsr analytical auto-coeff generation requires uniform optimizer weight_decay "
-                "across parameter groups"
-            )
-
-    return m0, d0
 
 
 def ensure_bsr_family_cyclic_coeffs(
@@ -84,30 +70,15 @@ def ensure_bsr_family_cyclic_coeffs(
     if mechanism_config.mechanism not in ("bsr", "bisr"):
         return mechanism_config
 
-    state = copy.deepcopy(mechanism_config.mechanism_state)
-    state["_noise_mechanism"] = mechanism_config.mechanism
-    coeffs = state.get("coeffs")
-    inv_coeffs = state.get("bisr_inv_coeffs")
-
-    if mechanism_config.mechanism == "bisr":
-        if isinstance(inv_coeffs, (list, tuple)) and len(inv_coeffs) > 0:
-            state["bisr_inv_coeffs"] = [float(c) for c in inv_coeffs]
-            if not (isinstance(coeffs, (list, tuple)) and len(coeffs) > 0):
-                state["coeffs"] = derive_bisr_runtime_coeffs_from_inverse_coeffs(
-                    coeffs=state["bisr_inv_coeffs"],
-                )
-
-            return NoiseMechanismConfig(
-                mechanism=mechanism_config.mechanism,
-                accounting_mode=mechanism_config.accounting_mode,
-                mechanism_state=state,
-            )
-
-    if isinstance(coeffs, (list, tuple)) and len(coeffs) > 0:
+    state = BSRFamilyState.from_state(
+        mechanism=mechanism_config.mechanism,
+        mechanism_state=mechanism_config.mechanism_state,
+    )
+    if state.ensure_bisr_runtime_coeffs_from_inverse() or state.has_runtime_coeffs():
         return NoiseMechanismConfig(
             mechanism=mechanism_config.mechanism,
             accounting_mode=mechanism_config.accounting_mode,
-            mechanism_state=state,
+            mechanism_state=state.to_state_dict(),
         )
 
     if (
@@ -121,25 +92,7 @@ def ensure_bsr_family_cyclic_coeffs(
         if sampling_semantics is not None
         else {}
     )
-    metadata_bands = metadata.get("bands")
-    explicit_bands = kwargs.get("bsr_bands")
-    if explicit_bands is not None and metadata_bands is not None:
-        if int(explicit_bands) != int(metadata_bands):
-            raise ValueError(
-                "conflicting canonical inputs: `bsr_bands` must match "
-                "sampling_semantics privacy_metadata['bands']"
-            )
-
-    bands = kwargs.get("bsr_bands", metadata.get("bands", state.get("bsr_bands")))
-    if bands is None:
-        raise ValueError(
-            "auto coeff generation requires bands via `mechanism_state['bsr_bands']`, "
-            "`sampling_semantics.privacy_metadata['bands']`, or `bsr_bands`"
-        )
-
-    bands = int(bands)
-    if bands <= 0:
-        raise ValueError("bands must be > 0")
+    bands = state.resolve_bands(metadata=metadata, kwargs=kwargs)
 
     if int(steps) < bands:
         raise ValueError(
@@ -147,31 +100,15 @@ def ensure_bsr_family_cyclic_coeffs(
             f"got steps={int(steps)}, bands={bands}"
         )
 
-    momentum, weight_decay = resolve_uniform_sgd_workload_from_optimizer(
-        optimizer=optimizer
+    state.generate_analytical_coeffs(
+        bands=bands,
+        optimizer=optimizer,
     )
-    if mechanism_config.mechanism == "bisr":
-        state["bisr_inv_coeffs"] = generate_bisr_coeffs_from_sgd_workload(
-            bands=bands,
-            momentum=momentum,
-            weight_decay=weight_decay,
-        )
-        state["coeffs"] = derive_bisr_runtime_coeffs_from_inverse_coeffs(
-            coeffs=state["bisr_inv_coeffs"],
-        )
-    else:
-        state["coeffs"] = generate_bsr_coeffs_from_sgd_workload(
-            bands=bands,
-            momentum=momentum,
-            weight_decay=weight_decay,
-        )
-    state["bsr_bands"] = bands
-    state["coeff_source"] = "analytical_auto"
 
     return NoiseMechanismConfig(
         mechanism=mechanism_config.mechanism,
         accounting_mode=mechanism_config.accounting_mode,
-        mechanism_state=state,
+        mechanism_state=state.to_state_dict(),
     )
 
 
@@ -185,46 +122,23 @@ def ensure_bsr_family_fixed_analytical_coeffs(
     if mechanism_config.mechanism not in ("bsr", "bisr"):
         return mechanism_config
 
-    state = copy.deepcopy(mechanism_config.mechanism_state)
-    coeffs = state.get("coeffs")
-    inv_coeffs = state.get("bisr_inv_coeffs")
-    if mechanism_config.mechanism == "bisr":
-        if isinstance(inv_coeffs, (list, tuple)) and len(inv_coeffs) > 0:
-            state["bisr_inv_coeffs"] = [float(c) for c in inv_coeffs]
-            if not (isinstance(coeffs, (list, tuple)) and len(coeffs) > 0):
-                state["coeffs"] = derive_bisr_runtime_coeffs_from_inverse_coeffs(
-                    coeffs=state["bisr_inv_coeffs"],
-                )
-            return NoiseMechanismConfig(
-                mechanism=mechanism_config.mechanism,
-                accounting_mode=mechanism_config.accounting_mode,
-                mechanism_state=state,
-            )
-    if isinstance(coeffs, (list, tuple)) and len(coeffs) > 0:
+    state = BSRFamilyState.from_state(
+        mechanism=mechanism_config.mechanism,
+        mechanism_state=mechanism_config.mechanism_state,
+    )
+    if state.ensure_bisr_runtime_coeffs_from_inverse():
+        return NoiseMechanismConfig(
+            mechanism=mechanism_config.mechanism,
+            accounting_mode=mechanism_config.accounting_mode,
+            mechanism_state=state.to_state_dict(),
+        )
+    if state.has_runtime_coeffs():
         return mechanism_config
 
     metadata = (
         sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
     )
-    metadata_bands = metadata.get("bands")
-    explicit_bands = kwargs.get("bsr_bands")
-    if explicit_bands is not None and metadata_bands is not None:
-        if int(explicit_bands) != int(metadata_bands):
-            raise ValueError(
-                "conflicting canonical inputs: `bsr_bands` must match "
-                "sampling_semantics privacy_metadata['bands']"
-            )
-    bands = kwargs.get("bsr_bands", metadata.get("bands", state.get("bsr_bands")))
-    if bands is None:
-        raise ValueError(
-            f"{mechanism_config.mechanism} analytical auto-coeff generation requires bands via "
-            "`mechanism_state['bsr_bands']`, `sampling_semantics.privacy_metadata['bands']`, "
-            "or `bsr_bands`"
-        )
-
-    bands = int(bands)
-    if bands < 1:
-        raise ValueError(f"{mechanism_config.mechanism} bands must be >= 1")
+    bands = state.resolve_bands(metadata=metadata, kwargs=kwargs)
 
     steps_hint = kwargs.get("total_steps", metadata.get("total_steps"))
     if steps_hint is not None and int(steps_hint) < bands:
@@ -233,31 +147,15 @@ def ensure_bsr_family_fixed_analytical_coeffs(
             f"got steps={int(steps_hint)}, bands={bands}"
         )
 
-    momentum, weight_decay = resolve_uniform_sgd_workload_from_optimizer(
-        optimizer=optimizer
+    state.generate_analytical_coeffs(
+        bands=bands,
+        optimizer=optimizer,
     )
-    if mechanism_config.mechanism == "bisr":
-        state["bisr_inv_coeffs"] = generate_bisr_coeffs_from_sgd_workload(
-            bands=bands,
-            momentum=momentum,
-            weight_decay=weight_decay,
-        )
-        state["coeffs"] = derive_bisr_runtime_coeffs_from_inverse_coeffs(
-            coeffs=state["bisr_inv_coeffs"],
-        )
-    else:
-        state["coeffs"] = generate_bsr_coeffs_from_sgd_workload(
-            bands=bands,
-            momentum=momentum,
-            weight_decay=weight_decay,
-        )
-    state["bsr_bands"] = bands
-    state["coeff_source"] = "analytical_auto"
 
     return NoiseMechanismConfig(
         mechanism=mechanism_config.mechanism,
         accounting_mode=mechanism_config.accounting_mode,
-        mechanism_state=state,
+        mechanism_state=state.to_state_dict(),
     )
 
 

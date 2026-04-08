@@ -312,23 +312,21 @@ def _run_balls_in_bins_mf_training_smoke_autocoeff(*, mechanism: str, bands: int
 
 
 def test_bnb_accountant_b_min_sep_training_smoke_loop() -> None:
-    with pytest.raises(ValueError, match="b_min_sep sampling is temporarily disabled"):
-        _run_bnb_accountant_training_smoke(
-            sampling_semantics=SamplingSemantics(
-                sampling_mode="b_min_sep",
-                privacy_metadata={"b": 2, "p": 0.2},
-            )
+    _run_bnb_accountant_training_smoke(
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="b_min_sep",
+            privacy_metadata={"b": 2, "p": 0.2},
         )
+    )
 
 
 def test_bnb_accountant_b_min_sep_training_smoke_loop_alt() -> None:
-    with pytest.raises(ValueError, match="b_min_sep sampling is temporarily disabled"):
-        _run_bnb_accountant_training_smoke(
-            sampling_semantics=SamplingSemantics(
-                sampling_mode="b_min_sep",
-                privacy_metadata={"b": 3, "p": 0.25},
-            ),
-        )
+    _run_bnb_accountant_training_smoke(
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="b_min_sep",
+            privacy_metadata={"b": 3, "p": 0.25},
+        ),
+    )
 
 
 def test_bandmf_cyclic_poisson_training_smoke_loop() -> None:

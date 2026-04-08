@@ -45,6 +45,8 @@ import os
 import time
 from contextlib import contextmanager
 from typing import Any, Dict, Tuple
+
+from opacus.accountants.bnb_inputs import resolve_canonical_bnb_cycle_length
 from opacus.accountants.analysis.bnb import (
     estimate_balls_in_bins_epsilon_monte_carlo,
     estimate_balls_in_bins_epsilon_monte_carlo_optimistic,
@@ -89,6 +91,15 @@ def resolve_bnb_b_min_sep_inputs(
     sampling_semantics,
     kwargs: Dict[str, Any],
 ) -> Tuple[Any, int, int, Dict[str, Any]]:
+    """
+    Resolve the matrix/metadata bundle consumed by the BNB accountant.
+
+    For BLT amplified accounting, the `c_matrix` and contract are expected to
+    come from the accountant-side forward-`c_col` bridge, not from the runtime
+    noiser. The returned tuple is shared by both supported BNB consumers:
+    `balls_in_bins` through the public BLT accountant route, and `b_min_sep`
+    through the direct analysis-side Monte Carlo path.
+    """
     state = mechanism_state if isinstance(mechanism_state, dict) else {}
     metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
     c_matrix = kwargs.get(
@@ -127,15 +138,12 @@ def resolve_bnb_b_min_sep_inputs(
             "`bnb_c_matrix`, `bnb_bands`, and `bnb_c_matrix_contract`"
         )
 
-    cycle_length = kwargs.get(
-        "bnb_cycle_length",
-        metadata.get(
-            "bins",
-            state.get("bnb_cycle_length", state.get("bnb_bins")),
-        ),
+    cycle_length = resolve_canonical_bnb_cycle_length(
+        runtime_state=state,
+        metadata=metadata,
+        kwargs=kwargs,
+        error_context="bnb calibration requires bnb cycle length or sampling bins metadata",
     )
-    if cycle_length is None:
-        cycle_length = bands
 
     return c_matrix, int(bands), int(cycle_length), c_matrix_contract
 
@@ -148,6 +156,7 @@ def validate_bnb_accounting_runtime_consistency(
     bands: int,
     c_matrix_contract: Dict[str, Any],
 ) -> None:
+    """Validate that a runtime/accountant BLT or MF state matches the BNB contract."""
     validate_bnb_runtime_consistency(
         mechanism_state=mechanism_state,
         sampling_semantics=sampling_semantics,
@@ -163,19 +172,20 @@ def validate_bnb_sampling_policy(
     sampling_semantics,
     mechanism: str,
 ) -> None:
-    if mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bandinvmf") or sampling_semantics is None:
+    """
+    Validate that the chosen sampling mode is supported by the current BNB path.
+
+    BLT participates here only through the amplified BNB bridge. This validation
+    does not say that BLT has a standalone BNB proof artifact; it only checks
+    the runtime/accountant contract supported by the current implementation.
+    """
+    if mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bandinvmf", "blt") or sampling_semantics is None:
         return
     mode = sampling_semantics.sampling_mode
-    if mode == "b_min_sep":
+    if mode not in ("balls_in_bins", "b_min_sep"):
         raise ValueError(
-            "b_min_sep sampling is temporarily disabled pending p-aware BNB accounting; "
-            "use sampling_mode='balls_in_bins'"
-        )
-
-    if mode not in ("balls_in_bins",):
-        raise ValueError(
-            "balls-in-bins accountant path requires sampling_semantics in "
-            "{'balls_in_bins'}"
+            "bnb accountant path requires sampling_semantics in "
+            "{'balls_in_bins', 'b_min_sep'}"
         )
 
 
@@ -348,172 +358,172 @@ class BNBAccountant(IAccountant):
             if value is not None:
                 resolved_overrides[key] = value
 
-            with _timed("resolve_bnb_calibration_kwargs"):
-                calibration_cfg = resolve_bnb_calibration_kwargs(
-                    overrides=resolved_overrides,
+        with _timed("resolve_bnb_calibration_kwargs"):
+            calibration_cfg = resolve_bnb_calibration_kwargs(
+                overrides=resolved_overrides,
+            )
+
+        num_samples = int(calibration_cfg["bnb_num_samples"])
+        seed = int(calibration_cfg["bnb_seed"])
+        reduce_dimensionality = bool(calibration_cfg["bnb_reduce_dimensionality"])
+        tolerance = float(calibration_cfg["bnb_tolerance"])
+        max_iterations = int(calibration_cfg["bnb_max_iterations"])
+        chunk_size = calibration_cfg["bnb_chunk_size"]
+        num_workers = int(calibration_cfg["bnb_num_workers"])
+        backend = str(calibration_cfg["bnb_backend"])
+        device = calibration_cfg["bnb_device"]
+        distributed_mode = calibration_cfg["bnb_distributed_mode"]
+        distributed_dp_runtime = bool(calibration_cfg["bnb_distributed_dp_runtime"])
+        calibration_mode = str(calibration_cfg["bnb_calibration_mode"])
+        accounting_backend = str(
+            kwargs.get(
+                "bnb_accounting_backend",
+                persisted_kwargs.get("bnb_accounting_backend", "monte_carlo"),
+            )
+        )
+        _debug_timing(
+            "get_epsilon config "
+            f"accounting_backend={accounting_backend} calibration_mode={calibration_mode} "
+            f"num_samples={num_samples} seed={seed} tolerance={tolerance} "
+            f"max_iterations={max_iterations} chunk_size={chunk_size} num_workers={num_workers} "
+            f"backend={backend} device={device} distributed_mode={distributed_mode}"
+        )
+        if sampling_mode == "b_min_sep" and c_matrix is not None and bands is not None and c_matrix_contract is not None:
+            if cycle_length is None:
+                cycle_length = bands
+
+            with _timed("validate_b_min_sep_consistency"):
+                self._validate_builtin_b_min_sep_consistency(
+                    mechanism_state=state,
+                    sampling_semantics=sampling_semantics,
+                    c_matrix=c_matrix,
+                    bands=int(bands),
+                    c_matrix_contract=c_matrix_contract,
+                )
+            with _timed("estimate_b_min_sep_epsilon_monte_carlo"):
+                return float(
+                    estimate_b_min_sep_epsilon_monte_carlo(
+                        c_matrix=c_matrix,
+                        bands=int(bands),
+                        cycle_length=int(cycle_length),
+                        noise_multiplier=float(noise_multiplier),
+                        target_delta=float(delta),
+                        num_samples=num_samples,
+                        seed=seed,
+                        reduce_dimensionality=reduce_dimensionality,
+                        tolerance=float(tolerance),
+                        max_iterations=max_iterations,
+                        chunk_size=chunk_size,
+                        num_workers=num_workers,
+                    )
                 )
 
-            num_samples = int(calibration_cfg["bnb_num_samples"])
-            seed = int(calibration_cfg["bnb_seed"])
-            reduce_dimensionality = bool(calibration_cfg["bnb_reduce_dimensionality"])
-            tolerance = float(calibration_cfg["bnb_tolerance"])
-            max_iterations = int(calibration_cfg["bnb_max_iterations"])
-            chunk_size = calibration_cfg["bnb_chunk_size"]
-            num_workers = int(calibration_cfg["bnb_num_workers"])
-            backend = str(calibration_cfg["bnb_backend"])
-            device = calibration_cfg["bnb_device"]
-            distributed_mode = calibration_cfg["bnb_distributed_mode"]
-            distributed_dp_runtime = bool(calibration_cfg["bnb_distributed_dp_runtime"])
-            calibration_mode = str(calibration_cfg["bnb_calibration_mode"])
-            accounting_backend = str(
-                kwargs.get(
-                    "bnb_accounting_backend",
-                    persisted_kwargs.get("bnb_accounting_backend", "monte_carlo"),
+        if sampling_mode == "balls_in_bins" and c_matrix is not None and bands is not None and c_matrix_contract is not None:
+            if cycle_length is None:
+                cycle_length = bands
+
+            with _timed("validate_balls_in_bins_consistency"):
+                self._validate_builtin_b_min_sep_consistency(
+                    mechanism_state=state,
+                    sampling_semantics=sampling_semantics,
+                    c_matrix=c_matrix,
+                    bands=int(bands),
+                    c_matrix_contract=c_matrix_contract,
                 )
+            accountant_coeffs = kwargs.get(
+                "bnb_accountant_coeffs",
+                state.get("bnb_accountant_coeffs", state.get("coeffs")),
             )
+            if accountant_coeffs is None:
+                raise ValueError(
+                    "balls_in_bins accounting requires accountant-side coefficients "
+                    "via `bnb_accountant_coeffs` or `coeffs`"
+                )
+
+            horizon = int(c_matrix.shape[1])
             _debug_timing(
-                "get_epsilon config "
-                f"accounting_backend={accounting_backend} calibration_mode={calibration_mode} "
-                f"num_samples={num_samples} seed={seed} tolerance={tolerance} "
-                f"max_iterations={max_iterations} chunk_size={chunk_size} num_workers={num_workers} "
-                f"backend={backend} device={device} distributed_mode={distributed_mode}"
+                "balls_in_bins contract "
+                f"bands={int(bands)} cycle_length={int(cycle_length)} horizon={horizon} "
+                f"coeff_len={len(accountant_coeffs)}"
             )
-            if sampling_mode == "b_min_sep" and c_matrix is not None and bands is not None and c_matrix_contract is not None:
-                if cycle_length is None:
-                    cycle_length = bands
-
-                with _timed("validate_b_min_sep_consistency"):
-                    self._validate_builtin_b_min_sep_consistency(
+            if accounting_backend == "deterministic":
+                with _timed("resolve_random_allocation_inputs"):
+                    inputs = resolve_random_allocation_accountant_inputs(
+                        mechanism=str(state.get("mechanism", state.get("name", "gaussian"))),
                         mechanism_state=state,
                         sampling_semantics=sampling_semantics,
-                        c_matrix=c_matrix,
-                        bands=int(bands),
-                        c_matrix_contract=c_matrix_contract,
+                        kwargs={
+                            "bnb_accountant_coeffs": accountant_coeffs,
+                            "bnb_cycle_length": int(cycle_length),
+                            "bnb_horizon": int(horizon),
+                        },
+                        noise_multiplier=float(noise_multiplier),
                     )
-                with _timed("estimate_b_min_sep_epsilon_monte_carlo"):
+                with _timed("resolve_random_allocation_runtime_config"):
+                    runtime_cfg = resolve_random_allocation_gaussian_runtime_config(
+                        target_delta=float(delta),
+                        loss_discretization=kwargs.get(
+                            "random_allocation_loss_discretization",
+                            persisted_kwargs.get("random_allocation_loss_discretization"),
+                        ),
+                        tail_truncation=kwargs.get(
+                            "random_allocation_tail_truncation",
+                            persisted_kwargs.get("random_allocation_tail_truncation"),
+                        ),
+                        max_grid_fft=kwargs.get(
+                            "random_allocation_max_grid_fft",
+                            persisted_kwargs.get("random_allocation_max_grid_fft"),
+                        ),
+                        max_grid_mult=kwargs.get(
+                            "random_allocation_max_grid_mult",
+                            persisted_kwargs.get("random_allocation_max_grid_mult"),
+                        ),
+                        convolution_method=kwargs.get(
+                            "random_allocation_convolution_method",
+                            persisted_kwargs.get("random_allocation_convolution_method"),
+                        ),
+                    )
+                with _timed("estimate_epsilon_random_allocation"):
                     return float(
-                        estimate_b_min_sep_epsilon_monte_carlo(
-                            c_matrix=c_matrix,
-                            bands=int(bands),
-                            cycle_length=int(cycle_length),
-                            noise_multiplier=float(noise_multiplier),
+                        estimate_epsilon_random_allocation(
+                            inputs=inputs,
                             target_delta=float(delta),
-                            num_samples=num_samples,
-                            seed=seed,
-                            reduce_dimensionality=reduce_dimensionality,
-                            tolerance=float(tolerance),
-                            max_iterations=max_iterations,
-                            chunk_size=chunk_size,
-                            num_workers=num_workers,
+                            runtime_config=runtime_cfg,
                         )
                     )
-
-            if sampling_mode == "balls_in_bins" and c_matrix is not None and bands is not None and c_matrix_contract is not None:
-                if cycle_length is None:
-                    cycle_length = bands
-
-                with _timed("validate_balls_in_bins_consistency"):
-                    self._validate_builtin_b_min_sep_consistency(
-                        mechanism_state=state,
-                        sampling_semantics=sampling_semantics,
-                        c_matrix=c_matrix,
-                        bands=int(bands),
-                        c_matrix_contract=c_matrix_contract,
+            estimator = estimate_balls_in_bins_epsilon_monte_carlo
+            if calibration_mode == "optimistic":
+                estimator = estimate_balls_in_bins_epsilon_monte_carlo_optimistic
+            with _timed(f"{estimator.__name__}"):
+                return float(
+                    estimator(
+                        coeffs=accountant_coeffs,
+                        cycle_length=int(cycle_length),
+                        horizon=horizon,
+                        noise_multiplier=float(noise_multiplier),
+                        target_delta=float(delta),
+                        num_samples=num_samples,
+                        seed=seed,
+                        tolerance=float(tolerance),
+                        max_iterations=max_iterations,
+                        chunk_size=chunk_size,
+                        num_workers=num_workers,
+                        backend=backend,
+                        device=device,
+                        distributed_mode=distributed_mode,
+                        distributed_dp_runtime=distributed_dp_runtime,
                     )
-                accountant_coeffs = kwargs.get(
-                    "bnb_accountant_coeffs",
-                    state.get("bnb_accountant_coeffs", state.get("coeffs")),
                 )
-                if accountant_coeffs is None:
-                    raise ValueError(
-                        "balls_in_bins accounting requires accountant-side coefficients "
-                        "via `bnb_accountant_coeffs` or `coeffs`"
-                    )
 
-                horizon = int(c_matrix.shape[1])
-                _debug_timing(
-                    "balls_in_bins contract "
-                    f"bands={int(bands)} cycle_length={int(cycle_length)} horizon={horizon} "
-                    f"coeff_len={len(accountant_coeffs)}"
-                )
-                if accounting_backend == "deterministic":
-                    with _timed("resolve_random_allocation_inputs"):
-                        inputs = resolve_random_allocation_accountant_inputs(
-                            mechanism=str(state.get("mechanism", state.get("name", "gaussian"))),
-                            mechanism_state=state,
-                            sampling_semantics=sampling_semantics,
-                            kwargs={
-                                "bnb_accountant_coeffs": accountant_coeffs,
-                                "bnb_cycle_length": int(cycle_length),
-                                "bnb_horizon": int(horizon),
-                            },
-                            noise_multiplier=float(noise_multiplier),
-                        )
-                    with _timed("resolve_random_allocation_runtime_config"):
-                        runtime_cfg = resolve_random_allocation_gaussian_runtime_config(
-                            target_delta=float(delta),
-                            loss_discretization=kwargs.get(
-                                "random_allocation_loss_discretization",
-                                persisted_kwargs.get("random_allocation_loss_discretization"),
-                            ),
-                            tail_truncation=kwargs.get(
-                                "random_allocation_tail_truncation",
-                                persisted_kwargs.get("random_allocation_tail_truncation"),
-                            ),
-                            max_grid_fft=kwargs.get(
-                                "random_allocation_max_grid_fft",
-                                persisted_kwargs.get("random_allocation_max_grid_fft"),
-                            ),
-                            max_grid_mult=kwargs.get(
-                                "random_allocation_max_grid_mult",
-                                persisted_kwargs.get("random_allocation_max_grid_mult"),
-                            ),
-                            convolution_method=kwargs.get(
-                                "random_allocation_convolution_method",
-                                persisted_kwargs.get("random_allocation_convolution_method"),
-                            ),
-                        )
-                    with _timed("estimate_epsilon_random_allocation"):
-                        return float(
-                            estimate_epsilon_random_allocation(
-                                inputs=inputs,
-                                target_delta=float(delta),
-                                runtime_config=runtime_cfg,
-                            )
-                        )
-                estimator = estimate_balls_in_bins_epsilon_monte_carlo
-                if calibration_mode == "optimistic":
-                    estimator = estimate_balls_in_bins_epsilon_monte_carlo_optimistic
-                with _timed(f"{estimator.__name__}"):
-                    return float(
-                        estimator(
-                            coeffs=accountant_coeffs,
-                            cycle_length=int(cycle_length),
-                            horizon=horizon,
-                            noise_multiplier=float(noise_multiplier),
-                            target_delta=float(delta),
-                            num_samples=num_samples,
-                            seed=seed,
-                            tolerance=float(tolerance),
-                            max_iterations=max_iterations,
-                            chunk_size=chunk_size,
-                            num_workers=num_workers,
-                            backend=backend,
-                            device=device,
-                            distributed_mode=distributed_mode,
-                            distributed_dp_runtime=distributed_dp_runtime,
-                        )
-                    )
-
-            raise ValueError(
-                "bnb accountant built-in calibration requires b_min_sep/balls_in_bins "
-                "inputs (`c_matrix`, `bands`, `c_matrix_contract`, and "
-                "sampling_mode in {'b_min_sep', 'balls_in_bins'})"
-            )
+        raise ValueError(
+            "bnb accountant built-in calibration requires b_min_sep/balls_in_bins "
+            "inputs (`c_matrix`, `bands`, `c_matrix_contract`, and "
+            "sampling_mode in {'b_min_sep', 'balls_in_bins'})"
+        )
 
     def __len__(self):
         return len(self.history)
 
     @classmethod
-    def mechanism(cls) -> str:
+    def mechanism(_cls) -> str:
         return "bnb"

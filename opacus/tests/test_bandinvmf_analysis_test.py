@@ -116,7 +116,14 @@ def test_bandinvmf_optimization_handles_cifar_like_search_instability() -> None:
         momentum=kwargs["momentum"],
         weight_decay=kwargs["weight_decay"],
     )
+    runtime_coeffs = derive_bandinvmf_runtime_coeffs_from_inv_coeffs(inv_coeffs=coeffs)
+    factor_coeffs = derive_bandinvmf_factor_coeffs_from_inv_coeffs(
+        inv_coeffs=coeffs,
+        steps=kwargs["steps"],
+    )
     assert all(math.isfinite(c) for c in coeffs)
+    assert all(math.isfinite(c) for c in runtime_coeffs)
+    assert all(math.isfinite(c) for c in factor_coeffs)
     assert math.isfinite(obj)
 
 
@@ -208,6 +215,32 @@ def test_bandinvmf_factor_side_fixed_batch_sensitivity_is_distinct_from_runtime_
     assert math.isfinite(runtime_sensitivity)
     assert math.isfinite(factor_side_sensitivity)
     assert factor_side_sensitivity > runtime_sensitivity
+
+
+def test_bandinvmf_fixed_batch_sensitivity_bypasses_raw_bsr_monotonicity_guard() -> None:
+    inv_coeffs = [1.0, -1.2, 0.7]
+    runtime_coeffs = derive_bandinvmf_runtime_coeffs_from_inv_coeffs(inv_coeffs=inv_coeffs)
+
+    with pytest.raises(
+        ValueError,
+        match="closed-form Toeplitz sensitivity requires nonnegative decreasing coefficients",
+    ):
+        compute_bsr_mf_sensitivity_from_coeffs(
+            coeffs=runtime_coeffs,
+            steps=20,
+            max_participations=3,
+            min_separation=4,
+        )
+
+    sensitivity = compute_bandinvmf_fixed_batch_sensitivity_from_inv_coeffs(
+        inv_coeffs=inv_coeffs,
+        steps=20,
+        max_participations=3,
+        min_separation=4,
+    )
+
+    assert math.isfinite(sensitivity)
+    assert sensitivity > 0.0
 
 
 def test_bandinvmf_fixed_batch_sensitivity_handles_pretrained_sun397_nonamplified_row() -> None:

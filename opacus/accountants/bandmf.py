@@ -14,6 +14,21 @@
 
 from __future__ import annotations
 
+"""
+Accountant adapter for BandMF fixed-batch and cyclic accounting.
+
+Paper mapping:
+- `bands` -> band width / minimum-separation parameter `b`
+- `steps` -> finite horizon `T`
+- `sample_rate` -> base participation probability `p`
+- `bsr_mf_sensitivity` -> fixed-batch Toeplitz sensitivity `S_{k,b}(C;T)`
+
+Source lineage:
+- Multi-Epoch MF (Choquette-Choo et al., 2023) for banded MF strategy context
+- BSR (Kalinin and Lampert, 2024) for the reduced fixed-batch Gaussian path
+  after BandMF has been packaged as a Toeplitz family.
+"""
+
 import copy
 import math
 from typing import Any, Dict
@@ -31,9 +46,9 @@ from opacus.accountants.analysis.bsr import (
     resolve_bsr_fixed_batch_gaussian_contract,
     resolve_bsr_cyclic_gaussian_contract,
 )
+from opacus.mf.optimizer_utils import resolve_uniform_sgd_workload_from_optimizer
 from opacus.mechanism_contracts import NoiseMechanismConfig
 
-from .bsr import resolve_uniform_sgd_workload_from_optimizer
 from .accountant import IAccountant
 
 

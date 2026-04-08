@@ -52,6 +52,7 @@ __all__ = [
     "FixedBinRandomAllocationBridgeInputs",
     "build_fixed_bin_exact_law_pair",
     "resolve_fixed_bin_random_allocation_bridge_inputs",
+    "resolve_fixed_bin_random_allocation_bridge_runtime_config",
     "estimate_epsilon_range_fixed_bin_random_allocation",
     "get_noise_multiplier_fixed_bin_random_allocation",
 ]
@@ -135,6 +136,49 @@ class _FixedBinNoiseSearchState:
     last_finite_epsilon: float | None = None
     last_nonfinite_sigma: float | None = None
     iterations: int = 0
+
+
+def resolve_fixed_bin_random_allocation_bridge_runtime_config(
+    *,
+    target_delta: float,
+    loss_discretization: float | None = None,
+    tail_truncation: float | None = None,
+    max_grid_fft: int | None = None,
+    max_grid_mult: int | None = None,
+    convolution_method: str | None = None,
+) -> RandomAllocationGaussianRuntimeConfig:
+    """Resolve the deterministic runtime policy for the fixed-bin bridge.
+
+    The fixed-bin bridge intentionally uses a coarser default loss grid than
+    the fine package-backed clamp kept for the public exact repeated route.
+    Callers may still override any field explicitly.
+    """
+
+    base = resolve_random_allocation_gaussian_runtime_config(
+        target_delta=target_delta,
+        loss_discretization=loss_discretization,
+        tail_truncation=tail_truncation,
+        max_grid_fft=max_grid_fft,
+        max_grid_mult=max_grid_mult,
+        convolution_method=convolution_method,
+    )
+    if loss_discretization is not None:
+        return base
+
+    return RandomAllocationGaussianRuntimeConfig(
+        policy_name="fixed_bin_bridge_candidate_grid_1e-2",
+        runtime_policy=str(base.runtime_policy),
+        loss_discretization=1e-2,
+        tail_truncation=float(base.tail_truncation),
+        max_grid_fft=int(base.max_grid_fft),
+        max_grid_mult=int(base.max_grid_mult),
+        convolution_method=str(base.convolution_method),
+        matches_package_defaults=False,
+        clamp_to_package_grid=bool(base.clamp_to_package_grid),
+        remove_convolution_method=str(base.remove_convolution_method),
+        add_convolution_method=str(base.add_convolution_method),
+        refinement_rounds=int(base.refinement_rounds),
+    )
 
 
 def _aggregate_fixed_bin_mode_family(
@@ -425,7 +469,7 @@ def estimate_epsilon_range_fixed_bin_random_allocation(
     Source: `BSR`, `PLD`.
     """
 
-    runtime = runtime_config or resolve_random_allocation_gaussian_runtime_config(
+    runtime = runtime_config or resolve_fixed_bin_random_allocation_bridge_runtime_config(
         target_delta=target_delta
     )
     matrix = np.asarray(c_matrix, dtype=np.float64)
@@ -480,7 +524,7 @@ def _diagnose_fixed_bin_ambient_nonfinite_upper_bound(
     target_delta: float,
     runtime_config: RandomAllocationGaussianRuntimeConfig | None = None,
 ) -> _FixedBinAmbientNonfiniteUpperDiagnostic | None:
-    runtime = runtime_config or resolve_random_allocation_gaussian_runtime_config(
+    runtime = runtime_config or resolve_fixed_bin_random_allocation_bridge_runtime_config(
         target_delta=target_delta
     )
     pair_inputs = _resolve_fixed_bin_bridge_pair_inputs(
@@ -747,7 +791,7 @@ def get_noise_multiplier_fixed_bin_random_allocation(
             finite upper bracket.
     """
 
-    runtime = runtime_config or resolve_random_allocation_gaussian_runtime_config(
+    runtime = runtime_config or resolve_fixed_bin_random_allocation_bridge_runtime_config(
         target_delta=target_delta
     )
     state = _FixedBinNoiseSearchState()
