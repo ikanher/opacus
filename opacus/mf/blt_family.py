@@ -23,6 +23,22 @@ from opacus.mf.state import BLTFamilyState
 from opacus.optimizers.blt_optimization import optimize_blt_fixed_batch
 
 
+def _first_non_none(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+
+    return None
+
+
+def _resolve_optional_int(*values: Any, default: int = 0) -> int:
+    value = _first_non_none(*values)
+    if value is None:
+        return int(default)
+
+    return int(value)
+
+
 def canonicalize_blt_public_or_runtime_state(
     mechanism_state: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -88,6 +104,50 @@ def resolve_blt_workload_mechanism_state(**kwargs) -> dict[str, Any]:
     return _resolve_blt_workload_mechanism_state(**kwargs)
 
 
+def augment_blt_family_query_state(
+    *,
+    mechanism_state: Mapping[str, Any],
+    sampling_semantics,
+    total_steps: int,
+    dataset_size: int,
+    logical_batch_size: int,
+    max_grad_norm: float | None,
+    loss_reduction: str,
+    kwargs: Mapping[str, Any],
+) -> dict[str, Any]:
+    state = BLTFamilyState.from_input_state(mechanism_state)
+    metadata = (
+        sampling_semantics.privacy_metadata
+        if sampling_semantics is not None
+        else {}
+    )
+    changed = state.apply_explicit_overrides(metadata=metadata, kwargs=kwargs)
+    if (
+        sampling_semantics is None
+        or sampling_semantics.sampling_mode != "torch_sampler"
+        or total_steps < 1
+        or dataset_size < 1
+        or logical_batch_size < 1
+        or max_grad_norm is None
+    ):
+        return state.to_state_dict() if changed else dict(mechanism_state)
+
+    calibration_denominator = (
+        1.0 if loss_reduction == "sum" else float(logical_batch_size)
+    )
+    changed = (
+        state.apply_torch_sampler_defaults(
+            total_steps=int(total_steps),
+            dataset_size=int(dataset_size),
+            logical_batch_size=int(logical_batch_size),
+            max_grad_norm=float(max_grad_norm),
+            calibration_denominator=float(calibration_denominator),
+        )
+        or changed
+    )
+    return state.to_state_dict() if changed else dict(mechanism_state)
+
+
 @dataclass(frozen=True)
 class BLTFamily:
     """Registry-facing BLT family entry used by `PrivacyEngine` and MF dispatch."""
@@ -150,6 +210,7 @@ class BLTFamily:
     def optimize(self, *, objective: Any, context: Mapping[str, Any]) -> Any:
         kwargs = dict(context)
         kwargs.update(dict(objective) if isinstance(objective, Mapping) else {})
+
         return optimize_blt_fixed_batch(**kwargs)
 
     def resolve_target_epsilon_terms(
@@ -161,7 +222,10 @@ class BLTFamily:
         sample_rate: float,
         kwargs: Mapping[str, Any],
         phase: str,
+        query_runtime_context: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], None]:
+        del query_runtime_context
+
         return {}, None
 
     def augment_query_mechanism_config(
@@ -175,6 +239,82 @@ class BLTFamily:
         data_loader,
         kwargs: Mapping[str, Any],
         resolve_total_steps_sample_rate,
+        optimizer=None,
+        query_runtime_context: Mapping[str, Any] | None = None,
     ):
+        from opacus.mechanism_contracts import NoiseMechanismConfig
+
         del resolve_total_steps_sample_rate
-        return mechanism_config
+        del optimizer
+        context = dict(query_runtime_context or {})
+        sampling_mode = (
+            None if local_sampling_semantics is None else local_sampling_semantics.sampling_mode
+        )
+        if sampling_mode in ("balls_in_bins", "b_min_sep"):
+            resolved_total_steps = _resolve_optional_int(
+                total_steps,
+                context.get("total_steps"),
+                default=0,
+            )
+            return NoiseMechanismConfig(
+                mechanism=mechanism_config.mechanism,
+                accounting_mode=mechanism_config.accounting_mode,
+                mechanism_state=self.resolve_balls_in_bins(
+                    mechanism_state=mechanism_config.mechanism_state,
+                    context={
+                        "metadata": local_sampling_semantics.privacy_metadata,
+                        "kwargs": kwargs,
+                        "total_steps": resolved_total_steps,
+                    },
+                ),
+            )
+
+        max_grad_norm = context.get("max_grad_norm")
+        if isinstance(max_grad_norm, list):
+            max_grad_norm = None
+
+        loader_dataset_size = (
+            len(data_loader.dataset)
+            if data_loader is not None and getattr(data_loader, "dataset", None) is not None
+            else None
+        )
+        dataset_size = _resolve_optional_int(
+            context.get("dataset_size"),
+            loader_dataset_size,
+            default=0,
+        )
+        loader_batch_size = (
+            getattr(data_loader, "batch_size", None)
+            if data_loader is not None
+            else None
+        )
+        logical_batch_size = _resolve_optional_int(
+            context.get("logical_batch_size"),
+            loader_batch_size,
+            default=0,
+        )
+        resolved_total_steps = _resolve_optional_int(
+            total_steps,
+            context.get("total_steps"),
+            default=0,
+        )
+        state = augment_blt_family_query_state(
+            mechanism_state=mechanism_config.mechanism_state,
+            sampling_semantics=local_sampling_semantics,
+            total_steps=resolved_total_steps,
+            dataset_size=dataset_size,
+            logical_batch_size=logical_batch_size,
+            max_grad_norm=(
+                None if max_grad_norm is None else float(max_grad_norm)
+            ),
+            loss_reduction=str(context.get("loss_reduction", "mean")),
+            kwargs=kwargs,
+        )
+        if state == mechanism_config.mechanism_state:
+            return mechanism_config
+
+        return NoiseMechanismConfig(
+            mechanism=mechanism_config.mechanism,
+            accounting_mode=mechanism_config.accounting_mode,
+            mechanism_state=state,
+        )

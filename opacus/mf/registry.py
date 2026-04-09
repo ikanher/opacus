@@ -55,7 +55,7 @@ _BIFR_ENTRY = MFFamilyEntry(
     family=BIFRFamily(),
     supports_fixed_batch=True,
     supports_cyclic=False,
-    supports_balls_in_bins=False,
+    supports_balls_in_bins=True,
     needs_default_local_sampling_semantics=True,
     accounting_requires_context=True,
 )

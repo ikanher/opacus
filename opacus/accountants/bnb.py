@@ -179,7 +179,7 @@ def validate_bnb_sampling_policy(
     does not say that BLT has a standalone BNB proof artifact; it only checks
     the runtime/accountant contract supported by the current implementation.
     """
-    if mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bandinvmf", "blt") or sampling_semantics is None:
+    if mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bandinvmf", "bifr", "blt") or sampling_semantics is None:
         return
     mode = sampling_semantics.sampling_mode
     if mode not in ("balls_in_bins", "b_min_sep"):

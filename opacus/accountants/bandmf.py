@@ -241,7 +241,10 @@ class BandMFAccountant(IAccountant):
                 state.get("bsr_mf_sensitivity"),
             ),
         )
-        explicit_mf_sensitivity_override = "bsr_mf_sensitivity" in kwargs
+        explicit_mf_sensitivity_override = (
+            "bsr_mf_sensitivity" in kwargs
+            and not bool(kwargs.get("_derived_bsr_mf_sensitivity", False))
+        )
         coeffs = state.get("coeffs")
         max_participations = kwargs.get(
             "bsr_max_participations",

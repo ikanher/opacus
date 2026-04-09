@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import pytest
+import torch
 from opacus import NoiseMechanismConfig
+from opacus.mechanism_contracts import SamplingSemantics
 from opacus.mf.interfaces import SupportsBallsInBins
 
 from opacus.mf import (
@@ -145,3 +148,108 @@ def test_blt_family_exposes_balls_in_bins_accountant_state() -> None:
     assert resolved["bnb_horizon"] == 12
     assert resolved["bnb_accountant_coeffs_source"] == "normalized_forward_c_col"
     assert len(resolved["bnb_accountant_coeffs"]) == 12
+
+
+def test_bifr_family_exposes_bnb_accountant_state() -> None:
+    entry = get_mf_family_entry("bifr")
+    assert entry is not None
+    assert entry.supports_balls_in_bins is True
+    assert isinstance(entry.family, SupportsBallsInBins)
+
+    resolved = entry.family.resolve_balls_in_bins(
+        mechanism_state={
+            "coeffs": [1.0, 0.2],
+            "bsr_bands": 2,
+            "bifr_frac": 1.0,
+        },
+        context={
+            "metadata": {"bins": 8, "bands": 2},
+            "kwargs": {},
+            "total_steps": 12,
+        },
+    )
+
+    assert resolved["bnb_bands"] == 2
+    assert resolved["bnb_cycle_length"] == 8
+    assert resolved["bnb_horizon"] == 12
+    assert resolved["bnb_accountant_coeffs_source"] == "abs_factor_c_col"
+    assert resolved["bifr_frac"] == pytest.approx(1.0)
+
+
+def test_blt_family_augment_query_mechanism_config_applies_fixed_batch_defaults() -> None:
+    entry = get_mf_family_entry("blt")
+    assert entry is not None
+
+    config = entry.family.augment_query_mechanism_config(
+        mechanism_config=NoiseMechanismConfig(
+            mechanism="blt",
+            accounting_mode="blt_accountant",
+            mechanism_state={
+                "theta": [0.8, 0.3],
+                "theta_hat": [0.6, 0.1],
+                "z_std": 0.03,
+            },
+        ),
+        local_sampling_semantics=SamplingSemantics(
+            sampling_mode="torch_sampler",
+            privacy_metadata={},
+        ),
+        total_steps=8,
+        epochs=None,
+        poisson_sampling=False,
+        data_loader=None,
+        kwargs={},
+        resolve_total_steps_sample_rate=lambda **_: 0.25,
+        query_runtime_context={
+            "dataset_size": 32,
+            "logical_batch_size": 8,
+            "max_grad_norm": 1.0,
+            "loss_reduction": "mean",
+            "total_steps": 8,
+        },
+    )
+
+    state = config.mechanism_state
+    assert state["blt_horizon"] == 8
+    assert state["blt_min_separation"] == 4
+    assert state["blt_max_participations"] == 2
+    assert math.isclose(state["noise_multiplier_ref"], 0.24)
+
+
+def test_bsr_family_augment_query_mechanism_config_builds_balls_in_bins_state() -> None:
+    entry = get_mf_family_entry("bsr")
+    assert entry is not None
+    optimizer = torch.optim.SGD(torch.nn.Linear(4, 3).parameters(), lr=0.05)
+
+    config = entry.family.augment_query_mechanism_config(
+        mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bnb_accountant",
+            mechanism_state={},
+        ),
+        local_sampling_semantics=SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bands": 2, "bins": 8},
+        ),
+        total_steps=12,
+        epochs=None,
+        poisson_sampling=False,
+        data_loader=None,
+        kwargs={"total_steps": 12},
+        resolve_total_steps_sample_rate=lambda **_: 0.25,
+        optimizer=optimizer,
+        query_runtime_context={"total_steps": 12},
+    )
+
+    state = config.mechanism_state
+    assert state["bsr_bands"] == 2
+    assert state["bnb_bands"] == 2
+    assert state["bnb_cycle_length"] == 8
+    assert state["bnb_horizon"] == 12
+    assert len(state["bnb_accountant_coeffs"]) == 2
+    assert tuple(state["bnb_c_matrix"].shape) == (12, 12)
+
+
+def test_bifr_accountant_module_does_not_import_provider_canonicalizer() -> None:
+    text = (Path(__file__).resolve().parents[1] / "accountants" / "bifr.py").read_text()
+    assert "from opacus.mf.bifr_family import canonicalize_bifr_runtime_state" not in text

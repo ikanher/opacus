@@ -2,17 +2,25 @@ from __future__ import annotations
 
 import copy
 import math
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Mapping, Optional
 
 from torch import optim
 
 from opacus.accountants.analysis.bifr import (
+    build_bifr_amplified_bnb_inputs_from_factor_coeffs,
     compute_bifr_fixed_batch_sensitivity_from_sgd_workload,
+    derive_bifr_amplified_accountant_coeffs_from_factor_coeffs,
     generate_bifr_factor_coeffs_from_sgd_workload,
+    resolve_bifr_factor_coeffs_for_accounting,
     validate_bifr_frac,
 )
+from opacus.accountants.bifr_inputs import canonicalize_bifr_runtime_state
+from opacus.accountants.bnb_inputs import (
+    attach_accountant_coeff_surface,
+    resolve_canonical_bnb_cycle_length,
+    resolve_canonical_bsr_bands,
+)
 from opacus.accountants.analysis.toeplitz_family import ToeplitzMechanismFamily
-from opacus.mf.input_resolution import resolve_canonical_bsr_bands
 from opacus.mf.optimizer_utils import resolve_uniform_sgd_workload_from_optimizer
 from opacus.mechanism_contracts import NoiseMechanismConfig
 
@@ -63,6 +71,7 @@ def ensure_bifr_fixed_analytical_coeffs(
     state["bsr_bands"] = int(bands)
     state["bifr_frac"] = float(frac)
     state["coeff_source"] = "analytical_auto"
+
     return NoiseMechanismConfig(
         mechanism=mechanism_config.mechanism,
         accounting_mode=mechanism_config.accounting_mode,
@@ -87,6 +96,7 @@ def resolve_bifr_mf_sensitivity_for_fixed_batch(
         value = float(explicit)
         if (not math.isfinite(value)) or value <= 0.0:
             raise ValueError("bsr_mf_sensitivity must be finite and > 0")
+
         return value
 
     bands = resolve_canonical_bsr_bands(
@@ -104,12 +114,14 @@ def resolve_bifr_mf_sensitivity_for_fixed_batch(
     )
     if sample_rate is None:
         raise ValueError("sample_rate must be provided for bifr fixed-batch sensitivity resolution")
+
     max_participations = kwargs.get(
         "bsr_max_participations",
         metadata.get("bsr_max_participations", mechanism_state.get("bsr_max_participations")),
     )
     if max_participations is None:
         max_participations = max(1, int(math.ceil(float(sample_rate) * float(sensitivity_steps))))
+
     min_separation = kwargs.get(
         "bsr_min_separation",
         metadata.get("bsr_min_separation", mechanism_state.get("bsr_min_separation", 1)),
@@ -134,7 +146,9 @@ def resolve_bifr_mf_sensitivity_for_fixed_batch(
         raise ValueError(
             "fixed-batch bifr accounting requires either runtime coeffs or analytic workload parameters via auto-generated BIFR state"
         )
+
     frac = validate_bifr_frac(float(kwargs.get("bifr_frac", mechanism_state.get("bifr_frac", metadata.get("bifr_frac", 0.5)))))
+
     return float(
         compute_bifr_fixed_batch_sensitivity_from_sgd_workload(
             bands=int(bands),
@@ -147,3 +161,101 @@ def resolve_bifr_mf_sensitivity_for_fixed_batch(
             allow_disjoint_fallback=True,
         )
     )
+
+
+def resolve_bifr_amplified_accountant_coeffs(
+    *,
+    mechanism_state: Mapping[str, Any],
+    sampling_semantics,
+    optimizer: optim.Optimizer | None = None,
+    kwargs: Mapping[str, Any],
+    total_steps: int,
+) -> tuple[list[float], str, dict[str, Any]]:
+    metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
+    state = canonicalize_bifr_runtime_state(runtime_state=mechanism_state)
+    bands = resolve_canonical_bsr_bands(
+        runtime_state=state,
+        metadata=metadata,
+        kwargs=kwargs,
+        error_context=(
+            "amplified bifr accounting requires bands via `mechanism_state['bsr_bands']`, "
+            "`sampling_semantics.privacy_metadata['bands']`, or `bsr_bands`"
+        ),
+    )
+
+    frac = validate_bifr_frac(
+        float(kwargs.get("bifr_frac", state.get("bifr_frac", metadata.get("bifr_frac", 0.5))))
+    )
+    momentum = kwargs.get("momentum", state.get("momentum", metadata.get("momentum")))
+    weight_decay = kwargs.get(
+        "weight_decay",
+        state.get("weight_decay", metadata.get("weight_decay")),
+    )
+    if optimizer is not None and (momentum is None or weight_decay is None):
+        momentum, weight_decay = resolve_uniform_sgd_workload_from_optimizer(
+            optimizer=optimizer
+        )
+
+    factor_coeffs, factor_source = resolve_bifr_factor_coeffs_for_accounting(
+        coeffs=state.get("coeffs"),
+        bands=int(bands),
+        momentum=None if momentum is None else float(momentum),
+        weight_decay=None if weight_decay is None else float(weight_decay),
+        frac=float(frac),
+    )
+    accountant_coeffs = derive_bifr_amplified_accountant_coeffs_from_factor_coeffs(
+        coeffs=factor_coeffs
+    )
+    inputs = build_bifr_amplified_bnb_inputs_from_factor_coeffs(
+        coeffs=factor_coeffs,
+        bands=int(bands),
+        horizon=int(total_steps),
+    )
+    inputs["bnb_accountant_coeffs_source"] = str(inputs["bnb_accountant_coeffs_source"])
+    state["coeffs"] = [float(c) for c in factor_coeffs]
+    state["bsr_bands"] = int(bands)
+    state["bifr_frac"] = float(frac)
+    if state.get("coeff_source") is None:
+        state["coeff_source"] = str(factor_source)
+
+    return accountant_coeffs, str(inputs["bnb_accountant_coeffs_source"]), {
+        **state,
+        **inputs,
+    }
+
+
+def resolve_bifr_bnb_accountant_state(
+    *,
+    mechanism_state: Mapping[str, Any],
+    sampling_semantics,
+    optimizer: optim.Optimizer | None = None,
+    kwargs: Mapping[str, Any],
+    total_steps: int,
+) -> dict[str, Any]:
+    metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
+    cycle_length = resolve_canonical_bnb_cycle_length(
+        runtime_state=mechanism_state,
+        metadata=metadata,
+        kwargs=kwargs,
+        error_context="bifr amplified accounting requires BNB cycle length or sampling bins metadata",
+    )
+    accountant_coeffs, accountant_source, state = resolve_bifr_amplified_accountant_coeffs(
+        mechanism_state=mechanism_state,
+        sampling_semantics=sampling_semantics,
+        optimizer=optimizer,
+        kwargs=kwargs,
+        total_steps=int(total_steps),
+    )
+    state = attach_accountant_coeff_surface(
+        state,
+        coeff_key="bnb_accountant_coeffs",
+        coeff_source_key="bnb_accountant_coeffs_source",
+        coeffs=accountant_coeffs,
+        coeff_source=accountant_source,
+    )
+    state["bnb_bands"] = int(state["bnb_bands"])
+    state["bnb_horizon"] = int(total_steps)
+    state["bnb_cycle_length"] = int(cycle_length)
+    state["bnb_bins"] = int(cycle_length)
+
+    return state

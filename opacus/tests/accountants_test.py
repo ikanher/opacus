@@ -48,6 +48,10 @@ from opacus.accountants.analysis.bandmf import (
 from opacus.accountants.analysis.bandinvmf import (
     derive_bandinvmf_amplified_accountant_coeffs_from_inv_coeffs,
 )
+from opacus.accountants.analysis.bifr import (
+    derive_bifr_amplified_accountant_coeffs_from_factor_coeffs,
+    generate_bifr_factor_coeffs_from_sgd_workload,
+)
 from opacus.accountants.analysis.bisr import (
     derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs,
     derive_bisr_runtime_coeffs_from_inverse_coeffs,
@@ -1172,6 +1176,9 @@ class AccountingTest(unittest.TestCase):
                 sampling_mode="balls_in_bins",
                 privacy_metadata={"bins": 4, "bands": 2},
             ),
+            bnb_backend="cpu",
+            bnb_device="cpu",
+            bnb_num_workers=0,
         )
 
         self.assertGreater(noise_multiplier, 0.0)
@@ -1210,6 +1217,43 @@ class AccountingTest(unittest.TestCase):
                 sampling_mode="balls_in_bins",
                 privacy_metadata={"bins": 4, "bands": 2},
             ),
+        )
+
+        self.assertGreater(noise_multiplier, 0.0)
+
+    def test_get_noise_multiplier_bifr_balls_in_bins_uses_bnb_accountant(self) -> None:
+        delta = 0.2
+        sample_rate = 0.25
+        epsilon = 0.5
+        epochs = 1
+        coeffs = [1.0, 0.2]
+        accountant_coeffs = derive_bifr_amplified_accountant_coeffs_from_factor_coeffs(
+            coeffs=coeffs,
+        )
+        c_matrix = _lower_toeplitz_from_coeffs(accountant_coeffs, horizon=4)
+
+        noise_multiplier = get_noise_multiplier(
+            target_epsilon=epsilon,
+            target_delta=delta,
+            sample_rate=sample_rate,
+            epochs=epochs,
+            accountant="bnb",
+            mechanism_state={
+                "coeffs": coeffs,
+                "bnb_accountant_coeffs": accountant_coeffs,
+                "bsr_bands": 2,
+                "bifr_frac": 1.0,
+                "bnb_c_matrix": c_matrix,
+                "bnb_c_matrix_contract": _bnb_c_matrix_contract(c_matrix=c_matrix, bands=2),
+                "_noise_mechanism": "bifr",
+            },
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="balls_in_bins",
+                privacy_metadata={"bins": 4, "bands": 2},
+            ),
+            bnb_backend="cpu",
+            bnb_device="cpu",
+            bnb_num_workers=0,
         )
 
         self.assertGreater(noise_multiplier, 0.0)
@@ -1442,6 +1486,44 @@ class AccountingTest(unittest.TestCase):
         self.assertIn("bnb_c_matrix", state)
         self.assertIn("bnb_c_matrix_contract", state)
 
+    def test_bifr_balls_in_bins_make_private_resolves_state_from_explicit_factor_coeffs(self) -> None:
+        state = _resolve_bnb_state_via_make_private(
+            mechanism="bifr",
+            mechanism_state={"coeffs": [1.0, 0.3], "bsr_bands": 2, "bifr_frac": 1.0},
+        )
+
+        self.assertEqual(state["bnb_accountant_coeffs_source"], "abs_factor_c_col")
+        self.assertEqual(
+            state["bnb_accountant_coeffs"],
+            derive_bifr_amplified_accountant_coeffs_from_factor_coeffs(
+                coeffs=[1.0, 0.3],
+            ),
+        )
+        self.assertEqual(state["bifr_frac"], 1.0)
+        self.assertIn("bnb_c_matrix", state)
+        self.assertIn("bnb_c_matrix_contract", state)
+
+    def test_bifr_balls_in_bins_make_private_resolves_state_from_auto_coeffs(self) -> None:
+        state = _resolve_bnb_state_via_make_private(
+            mechanism="bifr",
+            mechanism_state={"bsr_bands": 2, "bifr_frac": 0.25},
+        )
+
+        self.assertEqual(state["coeff_source"], "analytical_auto")
+        self.assertEqual(state["bnb_accountant_coeffs_source"], "abs_factor_c_col")
+        self.assertEqual(state["bifr_frac"], 0.25)
+        self.assertEqual(
+            state["coeffs"],
+            generate_bifr_factor_coeffs_from_sgd_workload(
+                bands=2,
+                momentum=0.9,
+                weight_decay=0.9999,
+                frac=0.25,
+            ),
+        )
+        self.assertIn("bnb_c_matrix", state)
+        self.assertIn("bnb_c_matrix_contract", state)
+
     def test_get_noise_multiplier_bsr_balls_in_bins_separates_cycle_length_from_matrix_bandwidth(self) -> None:
         delta = 0.2
         sample_rate = 0.25
@@ -1469,6 +1551,9 @@ class AccountingTest(unittest.TestCase):
                 sampling_mode="balls_in_bins",
                 privacy_metadata={"bins": 4, "bands": 2},
             ),
+            bnb_backend="torch",
+            bnb_device="cpu",
+            bnb_num_workers=0,
         )
 
         self.assertGreater(noise_multiplier, 0.0)

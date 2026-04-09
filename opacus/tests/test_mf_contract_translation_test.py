@@ -3,6 +3,11 @@ from __future__ import annotations
 import pytest
 
 import opacus.mf.bsr_family as bsr_family_mod
+from opacus.accountants.bnb_inputs import (
+    attach_accountant_coeff_surface,
+    resolve_canonical_bnb_cycle_length,
+    resolve_canonical_bsr_bands,
+)
 from opacus.mf.bsr_family import (
     augment_bsr_family_cyclic_query_state,
     augment_bsr_family_fixed_batch_query_state,
@@ -15,11 +20,6 @@ from opacus.mf.blt_family import (
     summarize_blt_report_surface,
     summarize_blt_runtime_state,
 )
-from opacus.mf.input_resolution import (
-    resolve_canonical_bnb_cycle_length,
-    resolve_canonical_bsr_bands,
-)
-from opacus.mf.state_utils import attach_mf_accountant_coeff_surface
 from opacus import SamplingSemantics
 
 
@@ -140,8 +140,8 @@ def test_bsr_family_query_augmentation_and_summary_distinguish_surfaces() -> Non
     assert cyclic_summary["bsr_sensitivity_scale"] > 0.0
 
 
-def test_attach_mf_accountant_coeff_surface_canonicalizes_coeff_payload() -> None:
-    state = attach_mf_accountant_coeff_surface(
+def test_attach_accountant_coeff_surface_canonicalizes_coeff_payload() -> None:
+    state = attach_accountant_coeff_surface(
         {"coeffs": [1.0], "coeff_source": "explicit_or_precomputed"},
         coeff_key="bnb_accountant_coeffs",
         coeff_source_key="bnb_accountant_coeffs_source",

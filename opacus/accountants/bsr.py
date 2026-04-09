@@ -703,7 +703,10 @@ class BSRAccountant(IAccountant):
             ),
         )
 
-        explicit_mf_sensitivity_override = "bsr_mf_sensitivity" in kwargs
+        explicit_mf_sensitivity_override = (
+            "bsr_mf_sensitivity" in kwargs
+            and not bool(kwargs.get("_derived_bsr_mf_sensitivity", False))
+        )
         coeffs = state.get("coeffs")
         max_participations = kwargs.get(
             "bsr_max_participations",
@@ -867,6 +870,16 @@ class BSRAccountant(IAccountant):
             from .bandinvmf import resolve_bandinvmf_mf_sensitivity_for_fixed_batch
 
             resolved_mf_sensitivity = resolve_bandinvmf_mf_sensitivity_for_fixed_batch(
+                mechanism_state=state,
+                sampling_semantics=None,
+                steps=total_steps,
+                sample_rate=sample_rate,
+                kwargs=kwargs,
+            )
+        elif mechanism == "bifr":
+            from .bifr import resolve_bifr_mf_sensitivity_for_fixed_batch
+
+            resolved_mf_sensitivity = resolve_bifr_mf_sensitivity_for_fixed_batch(
                 mechanism_state=state,
                 sampling_semantics=None,
                 steps=total_steps,

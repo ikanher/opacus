@@ -8,11 +8,11 @@ from typing import Any, Dict, Mapping
 from torch import optim
 
 from opacus.accountants.analysis.blt import BLTParams, BLTPairedParams
+from opacus.accountants.bnb_inputs import resolve_canonical_bsr_bands
 from opacus.accountants.blt_inputs import (
     canonicalize_blt_public_or_runtime_state,
     resolve_blt_fixed_batch_accountant_inputs,
 )
-from opacus.mf.input_resolution import resolve_canonical_bsr_bands
 from opacus.mf.optimizer_utils import resolve_uniform_sgd_workload_from_optimizer
 
 

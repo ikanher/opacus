@@ -3,9 +3,12 @@ from __future__ import annotations
 import pytest
 
 from opacus.accountants.analysis.bifr import (
+    build_bifr_amplified_bnb_inputs_from_factor_coeffs,
     build_bifr_analytic_factor_family,
     compute_bifr_fixed_batch_sensitivity_from_sgd_workload,
+    derive_bifr_amplified_accountant_coeffs_from_factor_coeffs,
     generate_bifr_factor_coeffs_from_sgd_workload,
+    resolve_bifr_factor_coeffs_for_accounting,
 )
 from opacus.accountants.analysis.bsr import generate_bsr_coeffs_from_sgd_workload
 
@@ -78,3 +81,29 @@ def test_bifr_family_keeps_analysis_only_boundary_explicit() -> None:
         frac=0.5,
     )
     assert family.source == "bifr"
+
+
+def test_resolve_bifr_factor_coeffs_for_accounting_accepts_explicit_factor_state() -> None:
+    coeffs, source = resolve_bifr_factor_coeffs_for_accounting(coeffs=[1.0, 0.2, 0.1])
+    assert coeffs == pytest.approx([1.0, 0.2, 0.1])
+    assert source == "explicit_factor_c_col"
+
+
+def test_derive_bifr_amplified_accountant_coeffs_returns_abs_factor_column() -> None:
+    coeffs = derive_bifr_amplified_accountant_coeffs_from_factor_coeffs(
+        coeffs=[1.0, -0.2, 0.05]
+    )
+    assert coeffs == pytest.approx([1.0, 0.2, 0.05])
+
+
+def test_build_bifr_amplified_bnb_inputs_returns_matrix_and_contract() -> None:
+    resolved = build_bifr_amplified_bnb_inputs_from_factor_coeffs(
+        coeffs=[1.0, 0.2],
+        bands=2,
+        horizon=6,
+    )
+    assert resolved["bnb_accountant_coeffs_source"] == "abs_factor_c_col"
+    assert resolved["bnb_bands"] == 2
+    assert resolved["bnb_horizon"] == 6
+    assert tuple(resolved["bnb_c_matrix"].shape) == (6, 6)
+    assert resolved["bnb_c_matrix_contract"]["bands"] == 2

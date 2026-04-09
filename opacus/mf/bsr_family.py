@@ -1,8 +1,25 @@
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Mapping, Optional
+
+from torch import optim
+
+
+def _first_non_none(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _resolve_optional_int(*values: Any, default: int = 0) -> int:
+    value = _first_non_none(*values)
+    if value is None:
+        return int(default)
+    return int(value)
 
 
 def _noop_bsr_runtime_state_normalizer(*, state: Dict[str, Any]) -> None:
@@ -326,6 +343,139 @@ def augment_bsr_family_fixed_batch_query_state(
     return state
 
 
+def augment_bsr_family_balls_in_bins_query_state(
+    *,
+    mechanism: str,
+    runtime_state: Mapping[str, Any],
+    sampling_semantics,
+    optimizer: optim.Optimizer,
+    total_steps: int,
+    kwargs: Mapping[str, Any],
+) -> Dict[str, Any]:
+    from opacus.accountants.analysis.bandinvmf import (
+        derive_bandinvmf_amplified_accountant_coeffs_from_inv_coeffs,
+    )
+    from opacus.accountants.analysis.bandmf import (
+        derive_bandmf_amplified_accountant_coeffs_from_runtime_coeffs,
+        generate_bandmf_coeffs_from_sgd_workload,
+    )
+    from opacus.accountants.analysis.bisr import (
+        derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs,
+        generate_bisr_coeffs_from_sgd_workload,
+    )
+    from opacus.accountants.analysis.bnb import (
+        build_bnb_toeplitz_c_matrix_and_contract,
+    )
+    from opacus.accountants.analysis.bsr import generate_bsr_coeffs_from_sgd_workload
+    from opacus.accountants.bnb_inputs import (
+        attach_accountant_coeff_surface,
+        resolve_canonical_bnb_cycle_length,
+        resolve_canonical_bsr_bands,
+    )
+    from opacus.mf.optimizer_utils import resolve_uniform_sgd_workload_from_optimizer
+
+    state = canonicalize_bsr_family_runtime_state(
+        mechanism=mechanism,
+        runtime_state=runtime_state,
+    )
+    metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
+    bands = resolve_canonical_bsr_bands(
+        runtime_state={"bsr_bands": state.get("bnb_bands", state.get("bsr_bands"))},
+        metadata=metadata,
+        kwargs=kwargs,
+        error_context=(
+            f"{mechanism} analytical auto-coeff generation requires bands via "
+            "`mechanism_state['bsr_bands']`, `sampling_semantics.privacy_metadata['bands']`, or `bsr_bands`"
+        ),
+    )
+    bins = resolve_canonical_bnb_cycle_length(
+        runtime_state=state,
+        metadata=metadata,
+        kwargs=kwargs,
+        error_context=(
+            "balls-in-bins MF state generation requires `bnb_b` or "
+            "sampling_semantics privacy_metadata['bins']"
+        ),
+    )
+    if not (isinstance(state.get("coeffs"), (list, tuple)) and len(state["coeffs"]) > 0):
+        momentum, weight_decay = resolve_uniform_sgd_workload_from_optimizer(
+            optimizer=optimizer
+        )
+        steps_hint = int(
+            kwargs.get("total_steps", metadata.get("total_steps", state.get("bnb_horizon", bins)))
+        )
+        if mechanism == "bisr":
+            state["bisr_inv_coeffs"] = generate_bisr_coeffs_from_sgd_workload(
+                bands=bands,
+                momentum=momentum,
+                weight_decay=weight_decay,
+            )
+            state = canonicalize_bsr_family_runtime_state(
+                mechanism=mechanism,
+                runtime_state=state,
+            )
+        elif mechanism == "bandmf":
+            state["coeffs"] = generate_bandmf_coeffs_from_sgd_workload(
+                bands=bands,
+                momentum=momentum,
+                weight_decay=weight_decay,
+                steps=steps_hint,
+            )
+        elif mechanism == "bandinvmf":
+            raise ValueError(
+                "bandinvmf balls-in-bins state shaping requires explicit inverse/runtime coeffs before family augmentation"
+            )
+        else:
+            state["coeffs"] = generate_bsr_coeffs_from_sgd_workload(
+                bands=bands,
+                momentum=momentum,
+                weight_decay=weight_decay,
+            )
+        state["coeff_source"] = "analytical_auto"
+
+    horizon = int(state.get("bnb_horizon", kwargs.get("total_steps", kwargs.get("steps", bins))))
+    if mechanism == "bsr":
+        accountant_coeffs, accountant_source = list(state["coeffs"]), "raw_c_col"
+    elif mechanism == "bisr":
+        accountant_coeffs = derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs(
+            coeffs=list(state.get("bisr_inv_coeffs", state["coeffs"])),
+            steps=horizon,
+        )
+        accountant_source = "abs_factor_c_col"
+    elif mechanism == "bandmf":
+        accountant_coeffs = derive_bandmf_amplified_accountant_coeffs_from_runtime_coeffs(
+            coeffs=list(state["coeffs"])
+        )
+        accountant_source = "runtime_c_col"
+    else:
+        accountant_coeffs = derive_bandinvmf_amplified_accountant_coeffs_from_inv_coeffs(
+            inv_coeffs=list(state["bandinvmf_inv_coeffs"]),
+            steps=horizon,
+        )
+        accountant_source = "abs_factor_c_col"
+
+    state["bsr_bands"] = int(bands)
+    state["bnb_bands"] = int(bands)
+    state["bnb_horizon"] = int(horizon)
+    state["bnb_bins"] = int(bins)
+    state["bnb_cycle_length"] = int(bins)
+    state = attach_accountant_coeff_surface(
+        state,
+        coeff_key="bnb_accountant_coeffs",
+        coeff_source_key="bnb_accountant_coeffs_source",
+        coeffs=accountant_coeffs,
+        coeff_source=accountant_source,
+    )
+    c_matrix, c_matrix_contract = build_bnb_toeplitz_c_matrix_and_contract(
+        coeffs=list(accountant_coeffs),
+        bands=int(bands),
+        horizon=int(horizon),
+    )
+    state["bnb_c_matrix"] = c_matrix
+    state["bnb_c_matrix_contract"] = c_matrix_contract
+    return state
+
+
 def summarize_bsr_runtime_state(runtime_state: Mapping[str, Any]) -> Dict[str, Any]:
     mechanism = str(runtime_state.get("_noise_mechanism", "bsr"))
     state = canonicalize_bsr_family_runtime_state(
@@ -499,7 +649,18 @@ class BSRFamily:
         mechanism_state: Mapping[str, Any],
         context: Mapping[str, Any],
     ) -> dict[str, Any]:
-        return self.canonicalize(mechanism_state)
+        optimizer = context.get("optimizer")
+        sampling_semantics = context.get("sampling_semantics")
+        if optimizer is None or sampling_semantics is None:
+            return self.canonicalize(mechanism_state)
+        return augment_bsr_family_balls_in_bins_query_state(
+            mechanism=self.name,
+            runtime_state=mechanism_state,
+            sampling_semantics=sampling_semantics,
+            optimizer=optimizer,
+            total_steps=int(context.get("total_steps", 0)),
+            kwargs=context.get("kwargs", {}),
+        )
 
     def resolve_target_epsilon_terms(
         self,
@@ -510,6 +671,7 @@ class BSRFamily:
         sample_rate: float,
         kwargs: Mapping[str, Any],
         phase: str,
+        query_runtime_context: Optional[Mapping[str, Any]] = None,
     ) -> tuple[dict[str, Any], Optional[float]]:
         mechanism = mechanism_config.mechanism
         nm_kwargs: Dict[str, Any] = {}
@@ -528,13 +690,42 @@ class BSRFamily:
             )
 
         if sampling_semantics is not None and sampling_semantics.sampling_mode == "torch_sampler":
+            effective_kwargs = dict(kwargs)
+            context = dict(query_runtime_context or {})
+            effective_kwargs.setdefault("bsr_iterations_number", int(steps))
+            dataset_size = _resolve_optional_int(context.get("dataset_size"), default=0)
+            logical_batch_size = _resolve_optional_int(
+                context.get("logical_batch_size"),
+                default=0,
+            )
+            global_steps_per_epoch = (
+                math.ceil(dataset_size / logical_batch_size)
+                if dataset_size > 0 and logical_batch_size > 0
+                else 0
+            )
+            if global_steps_per_epoch < 1:
+                global_steps_per_epoch = _resolve_optional_int(
+                    context.get("dataloader_len"),
+                    default=0,
+                )
+            if global_steps_per_epoch < 1:
+                global_steps_per_epoch = 1
+
+            effective_kwargs.setdefault("bsr_min_separation", global_steps_per_epoch)
+            effective_kwargs.setdefault(
+                "bsr_max_participations",
+                math.ceil(
+                    int(effective_kwargs["bsr_iterations_number"])
+                    / int(effective_kwargs["bsr_min_separation"])
+                ),
+            )
             bsr_mf_sensitivity = self.resolve_fixed_batch(
                 mechanism_state=mechanism_config.mechanism_state,
                 context={
                     "sampling_semantics": sampling_semantics,
                     "steps": int(steps),
                     "sample_rate": float(sample_rate),
-                    "kwargs": kwargs,
+                    "kwargs": effective_kwargs,
                 },
             )
 
@@ -551,18 +742,29 @@ class BSRFamily:
         data_loader,
         kwargs: Mapping[str, Any],
         resolve_total_steps_sample_rate,
+        optimizer=None,
+        query_runtime_context: Optional[Mapping[str, Any]] = None,
     ):
         from opacus.mechanism_contracts import NoiseMechanismConfig
 
         mechanism = mechanism_config.mechanism
+        context = dict(query_runtime_context or {})
         if (
             local_sampling_semantics is not None
             and local_sampling_semantics.sampling_mode == "cyclic_poisson"
         ):
+            if total_steps is None and epochs is None:
+                return mechanism_config
             if total_steps is not None:
                 scale_steps = int(total_steps)
             else:
-                sample_rate = 1.0 / len(data_loader)
+                dataloader_len = _resolve_optional_int(
+                    context.get("dataloader_len"),
+                    default=0,
+                )
+                if dataloader_len < 1:
+                    dataloader_len = int(len(data_loader)) if data_loader is not None else 0
+                sample_rate = 1.0 / float(dataloader_len)
                 scale_steps = int(epochs / sample_rate)
 
             nm_kwargs, _ = self.resolve_target_epsilon_terms(
@@ -583,19 +785,69 @@ class BSRFamily:
                 steps=int(scale_steps),
                 kwargs=kwargs,
             )
+
             return NoiseMechanismConfig(
                 mechanism=mechanism,
                 accounting_mode=mechanism_config.accounting_mode,
                 mechanism_state=state,
             )
 
+        if (
+            local_sampling_semantics is not None
+            and local_sampling_semantics.sampling_mode == "balls_in_bins"
+            and mechanism_config.accounting_mode == "bnb_accountant"
+            and optimizer is not None
+        ):
+            resolved_total_steps = _resolve_optional_int(
+                total_steps,
+                context.get("total_steps"),
+                default=0,
+            )
+
+            return NoiseMechanismConfig(
+                mechanism=mechanism,
+                accounting_mode=mechanism_config.accounting_mode,
+                mechanism_state=self.resolve_balls_in_bins(
+                    mechanism_state=mechanism_config.mechanism_state,
+                    context={
+                        "sampling_semantics": local_sampling_semantics,
+                        "kwargs": kwargs,
+                        "optimizer": optimizer,
+                        "total_steps": resolved_total_steps,
+                    },
+                ),
+            )
+
         if local_sampling_semantics is None or local_sampling_semantics.sampling_mode == "torch_sampler":
+            if total_steps is None and epochs is None:
+                return mechanism_config
+
+            loader_dataset_size = (
+                len(data_loader.dataset)
+                if data_loader is not None and getattr(data_loader, "dataset", None) is not None
+                else None
+            )
+            dataset_size = _resolve_optional_int(
+                context.get("dataset_size"),
+                loader_dataset_size,
+                default=0,
+            )
+            loader_batch_size = (
+                getattr(data_loader, "batch_size", None)
+                if data_loader is not None
+                else None
+            )
+            logical_batch_size = _resolve_optional_int(
+                context.get("logical_batch_size"),
+                loader_batch_size,
+                default=0,
+            )
             sample_rate = resolve_total_steps_sample_rate(
                 poisson_sampling=poisson_sampling,
                 sampling_semantics=local_sampling_semantics,
                 mechanism=mechanism,
-                batch_size=data_loader.batch_size,
-                dataset_size=len(data_loader.dataset),
+                batch_size=logical_batch_size,
+                dataset_size=dataset_size,
             )
             if total_steps is not None:
                 mf_steps = int(total_steps)
@@ -620,6 +872,47 @@ class BSRFamily:
                 steps=int(mf_steps),
                 sample_rate=float(sample_rate),
                 kwargs=kwargs,
+            )
+            metadata = (
+                local_sampling_semantics.privacy_metadata
+                if local_sampling_semantics is not None
+                else {}
+            )
+            global_steps_per_epoch = math.ceil(dataset_size / logical_batch_size)
+            if global_steps_per_epoch < 1:
+                global_steps_per_epoch = _resolve_optional_int(
+                    context.get("dataloader_len"),
+                    default=0,
+                )
+            if global_steps_per_epoch < 1:
+                global_steps_per_epoch = 1
+            state.setdefault(
+                "bsr_iterations_number",
+                int(kwargs.get("bsr_iterations_number", mf_steps)),
+            )
+            state.setdefault(
+                "bsr_min_separation",
+                int(
+                    metadata.get(
+                        "bsr_min_separation",
+                        kwargs.get("bsr_min_separation", global_steps_per_epoch),
+                    )
+                ),
+            )
+            state.setdefault(
+                "bsr_max_participations",
+                int(
+                    metadata.get(
+                        "bsr_max_participations",
+                        kwargs.get(
+                            "bsr_max_participations",
+                            math.ceil(
+                                int(state["bsr_iterations_number"])
+                                / int(state["bsr_min_separation"])
+                            ),
+                        ),
+                    )
+                ),
             )
             return NoiseMechanismConfig(
                 mechanism=mechanism,

@@ -172,9 +172,9 @@ class NoiseMechanismConfig:
                 "for authoritative accounting"
             )
 
-        if mechanism == "bifr" and accounting_mode != "bsr_accountant":
+        if mechanism == "bifr" and accounting_mode not in ("bsr_accountant", "bnb_accountant"):
             raise ValueError(
-                "bifr mechanism requires bsr_accountant"
+                "bifr mechanism requires bsr_accountant or bnb_accountant"
             )
 
         if (
