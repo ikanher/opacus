@@ -172,7 +172,7 @@ def test_bifr_family_exposes_bnb_accountant_state() -> None:
     assert resolved["bnb_bands"] == 2
     assert resolved["bnb_cycle_length"] == 8
     assert resolved["bnb_horizon"] == 12
-    assert resolved["bnb_accountant_coeffs_source"] == "abs_factor_c_col"
+    assert resolved["bnb_accountant_coeffs_source"] == "abs_exact_factor_c_col"
     assert resolved["bifr_frac"] == pytest.approx(1.0)
 
 

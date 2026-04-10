@@ -3,12 +3,13 @@ from __future__ import annotations
 import pytest
 
 from opacus.accountants.analysis.bifr import (
+    build_bifr_exact_factor_family_from_sgd_workload,
     build_bifr_amplified_bnb_inputs_from_factor_coeffs,
-    build_bifr_analytic_factor_family,
     compute_bifr_fixed_batch_sensitivity_from_sgd_workload,
     derive_bifr_amplified_accountant_coeffs_from_factor_coeffs,
-    generate_bifr_factor_coeffs_from_sgd_workload,
-    resolve_bifr_factor_coeffs_for_accounting,
+    derive_bifr_factor_coeffs_from_inverse_coeffs,
+    generate_bifr_inverse_coeffs_from_sgd_workload,
+    resolve_bifr_exact_factor_coeffs_for_accounting,
 )
 from opacus.accountants.analysis.bsr import generate_bsr_coeffs_from_sgd_workload
 
@@ -21,21 +22,27 @@ def _unscaled_workload_coeff(alpha: float, beta: float, j: int) -> float:
 
 
 def test_bifr_frac_zero_is_identity_factor_side() -> None:
-    coeffs = generate_bifr_factor_coeffs_from_sgd_workload(
-        bands=5,
-        momentum=0.3,
-        weight_decay=0.9,
-        frac=0.0,
+    coeffs = derive_bifr_factor_coeffs_from_inverse_coeffs(
+        coeffs=generate_bifr_inverse_coeffs_from_sgd_workload(
+            bands=5,
+            momentum=0.3,
+            weight_decay=0.9,
+            frac=0.0,
+        ),
+        steps=5,
     )
     assert coeffs == pytest.approx([1.0, 0.0, 0.0, 0.0, 0.0], abs=1e-12)
 
 
 def test_bifr_frac_half_matches_bsr_square_root_slice() -> None:
-    got = generate_bifr_factor_coeffs_from_sgd_workload(
-        bands=6,
-        momentum=0.3,
-        weight_decay=0.9,
-        frac=0.5,
+    got = derive_bifr_factor_coeffs_from_inverse_coeffs(
+        coeffs=generate_bifr_inverse_coeffs_from_sgd_workload(
+            bands=6,
+            momentum=0.3,
+            weight_decay=0.9,
+            frac=0.5,
+        ),
+        steps=6,
     )
     expected = generate_bsr_coeffs_from_sgd_workload(
         bands=6,
@@ -48,11 +55,14 @@ def test_bifr_frac_half_matches_bsr_square_root_slice() -> None:
 def test_bifr_frac_one_matches_full_workload_endpoint() -> None:
     alpha = 0.9
     beta = 0.3
-    got = generate_bifr_factor_coeffs_from_sgd_workload(
-        bands=6,
-        momentum=beta,
-        weight_decay=alpha,
-        frac=1.0,
+    got = derive_bifr_factor_coeffs_from_inverse_coeffs(
+        coeffs=generate_bifr_inverse_coeffs_from_sgd_workload(
+            bands=6,
+            momentum=beta,
+            weight_decay=alpha,
+            frac=1.0,
+        ),
+        steps=6,
     )
     expected = [_unscaled_workload_coeff(alpha, beta, j) for j in range(6)]
     assert got == pytest.approx(expected, abs=1e-12)
@@ -61,7 +71,7 @@ def test_bifr_frac_one_matches_full_workload_endpoint() -> None:
 def test_bifr_fixed_batch_sensitivity_supports_endpoint_with_disjoint_fallback() -> None:
     got = compute_bifr_fixed_batch_sensitivity_from_sgd_workload(
         bands=4,
-        steps=980,
+        steps=4,
         max_participations=10,
         min_separation=98,
         momentum=0.9,
@@ -72,8 +82,8 @@ def test_bifr_fixed_batch_sensitivity_supports_endpoint_with_disjoint_fallback()
     assert got > 0.0
 
 
-def test_bifr_family_keeps_analysis_only_boundary_explicit() -> None:
-    family = build_bifr_analytic_factor_family(
+def test_bifr_family_keeps_exact_finite_horizon_boundary_explicit() -> None:
+    family = build_bifr_exact_factor_family_from_sgd_workload(
         bands=4,
         steps=980,
         momentum=0.9,
@@ -83,10 +93,10 @@ def test_bifr_family_keeps_analysis_only_boundary_explicit() -> None:
     assert family.source == "bifr"
 
 
-def test_resolve_bifr_factor_coeffs_for_accounting_accepts_explicit_factor_state() -> None:
-    coeffs, source = resolve_bifr_factor_coeffs_for_accounting(coeffs=[1.0, 0.2, 0.1])
+def test_resolve_bifr_exact_factor_coeffs_for_accounting_accepts_explicit_factor_state() -> None:
+    coeffs, source = resolve_bifr_exact_factor_coeffs_for_accounting(coeffs=[1.0, 0.2, 0.1])
     assert coeffs == pytest.approx([1.0, 0.2, 0.1])
-    assert source == "explicit_factor_c_col"
+    assert source == "explicit_exact_factor_c_col"
 
 
 def test_derive_bifr_amplified_accountant_coeffs_returns_abs_factor_column() -> None:
@@ -102,7 +112,7 @@ def test_build_bifr_amplified_bnb_inputs_returns_matrix_and_contract() -> None:
         bands=2,
         horizon=6,
     )
-    assert resolved["bnb_accountant_coeffs_source"] == "abs_factor_c_col"
+    assert resolved["bnb_accountant_coeffs_source"] == "abs_exact_factor_c_col"
     assert resolved["bnb_bands"] == 2
     assert resolved["bnb_horizon"] == 6
     assert tuple(resolved["bnb_c_matrix"].shape) == (6, 6)

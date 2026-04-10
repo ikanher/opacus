@@ -131,8 +131,9 @@ def test_build_amplified_bnb_p_rmse_figure_data_uses_roles_and_baselines() -> No
     figure_data = _PLOT.build_amplified_bnb_p_rmse_figure_data(report)
     assert figure_data["figure_contract"] == _PLOT.AMPLIFIED_BNB_P_RMSE_FIGURE_CONTRACT
     panel = figure_data["panels"][0]
+    assert panel["x_scale"] == "log"
     roles = [series["role"] for series in panel["series"]]
-    assert roles == ["p_curve", "p_curve", "baseline", "baseline"]
+    assert roles == ["p_curve", "p_curve", "baseline", "comparison"]
     assert panel["series"][0]["family"] == "BIFR"
     assert panel["series"][1]["family"] == "BSR"
     assert panel["series"][2]["family"] == "DP-SGD"
@@ -230,6 +231,7 @@ def test_render_only_path_accepts_amplified_bnb_p_figure_contract(tmp_path: Path
                 "title": "Balls-in-Bins",
                 "x_label": "p",
                 "y_label": "Paper RMSE",
+                "x_scale": "log",
                 "series": [
                     {
                         "family": "BSR",

@@ -66,7 +66,7 @@ from opacus.accountants.bsr import (
     ensure_bsr_family_fixed_analytical_coeffs as ensure_bsr_family_fixed_analytical_coeffs_helper,
 )
 from opacus.accountants.bifr import (
-    ensure_bifr_fixed_analytical_coeffs as ensure_bifr_fixed_analytical_coeffs_helper,
+    ensure_bifr_exact_runtime_coeffs as ensure_bifr_exact_runtime_coeffs_helper,
 )
 from opacus.mf.optimizer_utils import resolve_uniform_sgd_workload_from_optimizer
 from opacus.accountants.bandinvmf import (
@@ -368,13 +368,18 @@ class PrivacyEngine:
         kwargs: Dict[str, Any],
         include_random_allocation_state: bool = False,
     ) -> NoiseMechanismConfig:
+        inferred_mf_total_steps = int(total_steps_for_contract)
+        if inferred_mf_total_steps <= 0:
+            inferred_mf_total_steps = int(max(band_steps_hint, data_loader_len, 0))
+
+        coeff_resolution_kwargs.setdefault("total_steps", inferred_mf_total_steps)
         mechanism_config = ensure_bsr_family_fixed_analytical_coeffs_helper(
             mechanism_config=mechanism_config,
             optimizer=optimizer,
             sampling_semantics=sampling_semantics,
             kwargs=coeff_resolution_kwargs,
         )
-        mechanism_config = ensure_bifr_fixed_analytical_coeffs_helper(
+        mechanism_config = ensure_bifr_exact_runtime_coeffs_helper(
             mechanism_config=mechanism_config,
             optimizer=optimizer,
             sampling_semantics=sampling_semantics,

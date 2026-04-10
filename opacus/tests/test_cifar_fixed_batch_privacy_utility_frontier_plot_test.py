@@ -164,6 +164,7 @@ def test_build_fixed_batch_frontier_figure_data_uses_envelope_role() -> None:
     figure_data = _PLOT.build_fixed_batch_frontier_figure_data(report)
     assert figure_data["figure_contract"] == _PLOT.FIXED_BATCH_FRONTIER_FIGURE_CONTRACT
     panel = figure_data["panels"][0]
+    assert panel["x_scale"] == "log"
     roles = [series["role"] for series in panel["series"]]
     assert roles == ["envelope", "baseline"]
 
@@ -182,6 +183,7 @@ def test_render_only_path_accepts_fixed_batch_frontier_contract(tmp_path: Path) 
                 "title": "PRV",
                 "x_label": "epsilon",
                 "y_label": "Paper RMSE",
+                "x_scale": "log",
                 "series": [
                     {
                         "family": "BSR",

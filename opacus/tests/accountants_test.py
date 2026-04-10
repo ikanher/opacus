@@ -50,7 +50,7 @@ from opacus.accountants.analysis.bandinvmf import (
 )
 from opacus.accountants.analysis.bifr import (
     derive_bifr_amplified_accountant_coeffs_from_factor_coeffs,
-    generate_bifr_factor_coeffs_from_sgd_workload,
+    resolve_bifr_exact_factor_coeffs_for_accounting,
 )
 from opacus.accountants.analysis.bisr import (
     derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs,
@@ -1324,7 +1324,7 @@ class AccountingTest(unittest.TestCase):
                 coeffs=state["bisr_inv_coeffs"],
             ),
         )
-        self.assertEqual(state["bnb_accountant_coeffs_source"], "abs_factor_c_col")
+        self.assertEqual(state["bnb_accountant_coeffs_source"], "abs_exact_factor_c_col")
         self.assertTrue(len(state["bnb_accountant_coeffs"]) > 0)
         self.assertIn("bnb_c_matrix", state)
         self.assertIn("bnb_c_matrix_contract", state)
@@ -1458,7 +1458,7 @@ class AccountingTest(unittest.TestCase):
             mechanism_state={"bandinvmf_inv_coeffs": [1.0, -0.1], "bsr_bands": 2},
         )
 
-        self.assertEqual(state["bnb_accountant_coeffs_source"], "abs_factor_c_col")
+        self.assertEqual(state["bnb_accountant_coeffs_source"], "abs_exact_factor_c_col")
         self.assertEqual(
             state["bnb_accountant_coeffs"],
             derive_bandinvmf_amplified_accountant_coeffs_from_inv_coeffs(
@@ -1481,7 +1481,7 @@ class AccountingTest(unittest.TestCase):
         )
 
         self.assertEqual(state["coeff_source"], "optimized_auto")
-        self.assertEqual(state["bnb_accountant_coeffs_source"], "abs_factor_c_col")
+        self.assertEqual(state["bnb_accountant_coeffs_source"], "abs_exact_factor_c_col")
         self.assertTrue(len(state["bnb_accountant_coeffs"]) > 0)
         self.assertIn("bnb_c_matrix", state)
         self.assertIn("bnb_c_matrix_contract", state)
@@ -1492,7 +1492,7 @@ class AccountingTest(unittest.TestCase):
             mechanism_state={"coeffs": [1.0, 0.3], "bsr_bands": 2, "bifr_frac": 1.0},
         )
 
-        self.assertEqual(state["bnb_accountant_coeffs_source"], "abs_factor_c_col")
+        self.assertEqual(state["bnb_accountant_coeffs_source"], "abs_exact_factor_c_col")
         self.assertEqual(
             state["bnb_accountant_coeffs"],
             derive_bifr_amplified_accountant_coeffs_from_factor_coeffs(
@@ -1509,17 +1509,19 @@ class AccountingTest(unittest.TestCase):
             mechanism_state={"bsr_bands": 2, "bifr_frac": 0.25},
         )
 
-        self.assertEqual(state["coeff_source"], "analytical_auto")
-        self.assertEqual(state["bnb_accountant_coeffs_source"], "abs_factor_c_col")
+        self.assertEqual(state["coeff_source"], "exact_finite_horizon_auto")
+        self.assertEqual(state["bnb_accountant_coeffs_source"], "abs_exact_factor_c_col")
         self.assertEqual(state["bifr_frac"], 0.25)
+        expected_coeffs, _source = resolve_bifr_exact_factor_coeffs_for_accounting(
+            bands=2,
+            steps=16,
+            momentum=0.9,
+            weight_decay=0.9999,
+            frac=0.25,
+        )
         self.assertEqual(
             state["coeffs"],
-            generate_bifr_factor_coeffs_from_sgd_workload(
-                bands=2,
-                momentum=0.9,
-                weight_decay=0.9999,
-                frac=0.25,
-            ),
+            expected_coeffs,
         )
         self.assertIn("bnb_c_matrix", state)
         self.assertIn("bnb_c_matrix_contract", state)

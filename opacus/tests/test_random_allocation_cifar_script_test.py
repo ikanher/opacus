@@ -508,8 +508,8 @@ def test_non_amplified_bifr_rows_use_nonpaper_fixed_batch_contract(
         assert row.reference_source == "bsr_half_slice_fixed_batch_contract"
         assert row.comparison_noise_multiplier == pytest.approx(base_sigma * (_MODULE.FIXED_BATCH_K ** 0.5))
         assert row.comparison_source == f"fixed_batch_identity_gaussian_{row.backend}"
-        assert row.reason_code == "computed_bifr_fixed_batch_analytic_contract"
-        assert "analytic factor-side BIFR coefficient family" in row.notes
+        assert row.reason_code == "computed_bifr_fixed_batch_exact_contract"
+        assert "exact finite-horizon BIFR factor-side family" in row.notes
         assert "BSR half-slice" in row.notes
 
 
@@ -567,7 +567,7 @@ def test_bifr_fixed_batch_sensitivity_uses_disjoint_fallback_when_bsr_guard_reje
 
     monkeypatch.setattr(
         _MODULE,
-        "build_bifr_analytic_factor_family",
+        "build_bifr_exact_factor_family_from_sgd_workload",
         lambda **kwargs: _FakeFamily(),
     )
     _MODULE._resolve_bifr_fixed_batch_sensitivity.cache_clear()
@@ -593,7 +593,7 @@ def test_non_amplified_bifr_full_endpoint_rows_compute_under_disjoint_contract(
 
     monkeypatch.setattr(
         _MODULE,
-        "build_bifr_analytic_factor_family",
+        "build_bifr_exact_factor_family_from_sgd_workload",
         lambda **kwargs: _FakeFamily(),
     )
     monkeypatch.setattr(
@@ -619,7 +619,7 @@ def test_non_amplified_bifr_full_endpoint_rows_compute_under_disjoint_contract(
     for row, base_sigma in ((prv_row, 1.0), (rdp_row, 1.5)):
         assert row.status == "computed"
         assert row.bifr_frac == pytest.approx(1.0)
-        assert row.reason_code == "computed_bifr_fixed_batch_analytic_contract"
+        assert row.reason_code == "computed_bifr_fixed_batch_exact_contract"
         assert row.computed_noise_multiplier == pytest.approx(base_sigma * expected_sensitivity)
         assert row.reference_noise_multiplier == pytest.approx(base_sigma * 2.0)
         assert row.comparison_noise_multiplier == pytest.approx(base_sigma * (_MODULE.FIXED_BATCH_K ** 0.5))
@@ -1102,8 +1102,8 @@ def test_direct_amplified_bandmf_verification_rows_preserve_family_boundary(
     bnb_rows = [row for row in rows if row.regime == "amplified" and row.backend == "balls_in_bins"]
     assert len(bnb_rows) == 1
     row = bnb_rows[0]
-    assert row.reason_code == "family_mismatch_bandmf_paper_row_direct_verification"
-    assert row.parity_status == "family_mismatch"
+    assert row.reason_code == "computed_direct_paper_sigma_verification"
+    assert row.parity_status == "computed_close"
     assert row.bandmf_family == "normalized_equal_column_norm"
     assert row.verification_budget == 200000
 
@@ -2116,7 +2116,7 @@ def test_build_report_records_bifr_nonpaper_metadata(
     assert bifr_meta["default_bandwidth"] == 4
     assert bifr_meta["reference_source"] == "bsr_half_slice_fixed_batch_contract"
     assert "--methods BIFR" in bifr_meta["notes"]
-    assert "analytic factor-side BIFR" in bifr_meta["notes"]
+    assert "exact finite-horizon BIFR" in bifr_meta["notes"]
     rows = report["rows"]
     assert all(row["bifr_frac"] == pytest.approx(0.3) for row in rows)
 

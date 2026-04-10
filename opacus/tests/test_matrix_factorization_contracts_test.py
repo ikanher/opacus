@@ -27,7 +27,7 @@ import opacus.privacy_engine as privacy_engine_mod
 from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
 from opacus.accountants.analysis.bandmf import generate_bandmf_coeffs_from_sgd_workload
 from opacus.accountants.analysis.bsr import generate_bsr_coeffs_from_sgd_workload
-from opacus.accountants.analysis.bifr import generate_bifr_factor_coeffs_from_sgd_workload
+from opacus.accountants.analysis.bifr import resolve_bifr_exact_factor_coeffs_for_accounting
 from opacus.optimizers import CorrelatedNoiseMechanism, GaussianNoiseMechanism
 from opacus.utils.uniform_sampler import (
     BMinSepSampler,
@@ -1970,7 +1970,7 @@ def test_bifr_config_builds_noise_mechanism() -> None:
     assert state["bifr_frac"] == pytest.approx(0.3)
 
 
-def test_make_private_bifr_autoresolves_analytical_coeffs_from_bands_optimizer_and_frac() -> None:
+def test_make_private_bifr_autoresolves_exact_finite_horizon_coeffs_from_bands_optimizer_and_frac() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(
         model.parameters(),
@@ -2000,15 +2000,15 @@ def test_make_private_bifr_autoresolves_analytical_coeffs_from_bands_optimizer_a
 
     state = getattr(dp_optimizer, "noise_mechanism_config").mechanism_state
     assert state["bifr_frac"] == pytest.approx(0.25)
-    assert state["coeff_source"] == "analytical_auto"
-    assert state["coeffs"] == pytest.approx(
-        generate_bifr_factor_coeffs_from_sgd_workload(
-            bands=4,
-            momentum=0.3,
-            weight_decay=0.9,
-            frac=0.25,
-        )
+    assert state["coeff_source"] == "exact_finite_horizon_auto"
+    expected_coeffs, _source = resolve_bifr_exact_factor_coeffs_for_accounting(
+        bands=4,
+        steps=int(state["bifr_horizon"]),
+        momentum=0.3,
+        weight_decay=0.9,
+        frac=0.25,
     )
+    assert state["coeffs"] == pytest.approx(expected_coeffs)
     assert int(state["bsr_bands"]) == 4
 
 
@@ -2062,7 +2062,7 @@ def test_make_private_with_epsilon_bifr_autoresolves_fixed_batch_terms() -> None
 
     state = getattr(dp_optimizer, "noise_mechanism_config").mechanism_state
     assert state["bifr_frac"] == pytest.approx(0.25)
-    assert state["coeff_source"] == "analytical_auto"
+    assert state["coeff_source"] == "exact_finite_horizon_auto"
     assert float(state["bsr_mf_sensitivity"]) > 0.0
     assert float(state["z_std"]) > 0.0
 

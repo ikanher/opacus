@@ -23,6 +23,10 @@ def canonicalize_bifr_runtime_state(*, runtime_state: Mapping[str, Any]) -> Dict
     if isinstance(coeffs, (list, tuple)) and len(coeffs) > 0:
         state["coeffs"] = [float(c) for c in coeffs]
 
+    inv_coeffs = state.get("bifr_inv_coeffs")
+    if isinstance(inv_coeffs, (list, tuple)) and len(inv_coeffs) > 0:
+        state["bifr_inv_coeffs"] = [float(c) for c in inv_coeffs]
+
     if state.get("bsr_bands") is not None:
         state["bsr_bands"] = int(state["bsr_bands"])
 
@@ -37,7 +41,7 @@ def canonicalize_bifr_runtime_state(*, runtime_state: Mapping[str, Any]) -> Dict
         if state.get(name) is not None:
             state[name] = float(state[name])
 
-    for name in ("bsr_min_separation", "bsr_max_participations", "bsr_iterations_number"):
+    for name in ("bsr_min_separation", "bsr_max_participations", "bsr_iterations_number", "bifr_horizon"):
         if state.get(name) is not None:
             state[name] = int(state[name])
 
@@ -46,7 +50,7 @@ def canonicalize_bifr_runtime_state(*, runtime_state: Mapping[str, Any]) -> Dict
         and isinstance(state.get("coeffs"), list)
         and len(state["coeffs"]) > 0
     ):
-        state["coeff_source"] = "explicit_or_precomputed"
+        state["coeff_source"] = "explicit_exact_factor"
 
     return state
 
@@ -65,6 +69,12 @@ def summarize_bifr_runtime_state(runtime_state: Mapping[str, Any]) -> Dict[str, 
         "bsr_iterations_number": state.get("bsr_iterations_number"),
         "bsr_bands": state.get("bsr_bands"),
         "bifr_frac": state.get("bifr_frac"),
+        "bifr_horizon": state.get("bifr_horizon"),
+        "bifr_inv_coeff_count": (
+            len(state["bifr_inv_coeffs"])
+            if isinstance(state.get("bifr_inv_coeffs"), list)
+            else None
+        ),
     }
 
 

@@ -10,8 +10,8 @@ from opacus.accountants.analysis.bifr import (
     build_bifr_amplified_bnb_inputs_from_factor_coeffs,
     compute_bifr_fixed_batch_sensitivity_from_sgd_workload,
     derive_bifr_amplified_accountant_coeffs_from_factor_coeffs,
-    generate_bifr_factor_coeffs_from_sgd_workload,
-    resolve_bifr_factor_coeffs_for_accounting,
+    generate_bifr_inverse_coeffs_from_sgd_workload,
+    resolve_bifr_exact_factor_coeffs_for_accounting,
     validate_bifr_frac,
 )
 from opacus.accountants.bifr_inputs import canonicalize_bifr_runtime_state
@@ -25,7 +25,7 @@ from opacus.mf.optimizer_utils import resolve_uniform_sgd_workload_from_optimize
 from opacus.mechanism_contracts import NoiseMechanismConfig
 
 
-def ensure_bifr_fixed_analytical_coeffs(
+def ensure_bifr_exact_runtime_coeffs(
     *,
     mechanism_config: NoiseMechanismConfig,
     optimizer: optim.Optimizer,
@@ -50,27 +50,37 @@ def ensure_bifr_fixed_analytical_coeffs(
         metadata=metadata,
         kwargs=kwargs,
         error_context=(
-            "bifr analytical auto-coeff generation requires bands via `mechanism_state['bsr_bands']`, "
+            "bifr exact finite-horizon coeff generation requires bands via `mechanism_state['bsr_bands']`, "
             "`sampling_semantics.privacy_metadata['bands']`, or `bsr_bands`"
         ),
     )
     steps_hint = kwargs.get("total_steps", metadata.get("total_steps"))
-    if steps_hint is not None and int(steps_hint) < int(bands):
+    if steps_hint is None:
+        raise ValueError("bifr exact finite-horizon coeff generation requires `total_steps`")
+    if int(steps_hint) < int(bands):
         raise ValueError(
-            f"bifr analytical auto-coeff generation requires steps >= bands; got steps={int(steps_hint)}, bands={int(bands)}"
+            f"bifr exact finite-horizon coeff generation requires steps >= bands; got steps={int(steps_hint)}, bands={int(bands)}"
         )
 
     momentum, weight_decay = resolve_uniform_sgd_workload_from_optimizer(optimizer=optimizer)
     frac = validate_bifr_frac(float(kwargs.get("bifr_frac", state.get("bifr_frac", metadata.get("bifr_frac", 0.5)))))
-    state["coeffs"] = generate_bifr_factor_coeffs_from_sgd_workload(
+    inv_coeffs = generate_bifr_inverse_coeffs_from_sgd_workload(
         bands=int(bands),
         momentum=momentum,
         weight_decay=weight_decay,
         frac=float(frac),
     )
+    factor_coeffs, factor_source = resolve_bifr_exact_factor_coeffs_for_accounting(
+        inverse_coeffs=inv_coeffs,
+        steps=int(steps_hint),
+    )
+    state["coeffs"] = factor_coeffs
+    state["bifr_inv_coeffs"] = [float(c) for c in inv_coeffs]
+    state["bifr_horizon"] = int(steps_hint)
     state["bsr_bands"] = int(bands)
     state["bifr_frac"] = float(frac)
-    state["coeff_source"] = "analytical_auto"
+    state["coeff_source"] = "exact_finite_horizon_auto"
+    state["factor_coeff_source"] = str(factor_source)
 
     return NoiseMechanismConfig(
         mechanism=mechanism_config.mechanism,
@@ -96,7 +106,6 @@ def resolve_bifr_mf_sensitivity_for_fixed_batch(
         value = float(explicit)
         if (not math.isfinite(value)) or value <= 0.0:
             raise ValueError("bsr_mf_sensitivity must be finite and > 0")
-
         return value
 
     bands = resolve_canonical_bsr_bands(
@@ -130,7 +139,7 @@ def resolve_bifr_mf_sensitivity_for_fixed_batch(
     if isinstance(coeffs, (list, tuple)) and len(coeffs) > 0:
         return float(
             ToeplitzMechanismFamily(
-                coeffs=coeffs,
+                coeffs=[float(c) for c in coeffs],
                 steps=int(sensitivity_steps),
                 source="bifr",
             ).fixed_batch_sensitivity(
@@ -144,11 +153,10 @@ def resolve_bifr_mf_sensitivity_for_fixed_batch(
     weight_decay = kwargs.get("weight_decay")
     if momentum is None or weight_decay is None:
         raise ValueError(
-            "fixed-batch bifr accounting requires either runtime coeffs or analytic workload parameters via auto-generated BIFR state"
+            "fixed-batch bifr accounting requires exact factor coefficients or exact workload parameters"
         )
 
     frac = validate_bifr_frac(float(kwargs.get("bifr_frac", mechanism_state.get("bifr_frac", metadata.get("bifr_frac", 0.5)))))
-
     return float(
         compute_bifr_fixed_batch_sensitivity_from_sgd_workload(
             bands=int(bands),
@@ -196,8 +204,10 @@ def resolve_bifr_amplified_accountant_coeffs(
             optimizer=optimizer
         )
 
-    factor_coeffs, factor_source = resolve_bifr_factor_coeffs_for_accounting(
+    factor_coeffs, factor_source = resolve_bifr_exact_factor_coeffs_for_accounting(
         coeffs=state.get("coeffs"),
+        inverse_coeffs=state.get("bifr_inv_coeffs"),
+        steps=int(total_steps),
         bands=int(bands),
         momentum=None if momentum is None else float(momentum),
         weight_decay=None if weight_decay is None else float(weight_decay),
@@ -211,10 +221,10 @@ def resolve_bifr_amplified_accountant_coeffs(
         bands=int(bands),
         horizon=int(total_steps),
     )
-    inputs["bnb_accountant_coeffs_source"] = str(inputs["bnb_accountant_coeffs_source"])
     state["coeffs"] = [float(c) for c in factor_coeffs]
     state["bsr_bands"] = int(bands)
     state["bifr_frac"] = float(frac)
+    state["bifr_horizon"] = int(total_steps)
     if state.get("coeff_source") is None:
         state["coeff_source"] = str(factor_source)
 
@@ -257,5 +267,4 @@ def resolve_bifr_bnb_accountant_state(
     state["bnb_horizon"] = int(total_steps)
     state["bnb_cycle_length"] = int(cycle_length)
     state["bnb_bins"] = int(cycle_length)
-
     return state

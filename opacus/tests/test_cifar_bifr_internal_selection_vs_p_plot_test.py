@@ -97,6 +97,7 @@ def test_build_bifr_internal_selection_figure_data_uses_two_panels() -> None:
     figure_data = _PLOT.build_bifr_internal_selection_figure_data(report)
     assert figure_data["figure_contract"] == _PLOT.BIFR_INTERNAL_SELECTION_FIGURE_CONTRACT
     assert len(figure_data["panels"]) == 2
+    assert all(panel["x_scale"] == "log" for panel in figure_data["panels"])
     assert [series["role"] for series in figure_data["panels"][0]["series"]] == ["p_curve", "endpoint_marker"]
     assert [series["role"] for series in figure_data["panels"][1]["series"]] == ["p_curve", "endpoint_marker"]
 
@@ -115,6 +116,7 @@ def test_render_only_path_accepts_bifr_internal_selection_contract(tmp_path: Pat
                 "title": "PRV Selected frac",
                 "x_label": "p",
                 "y_label": "Selected frac",
+                "x_scale": "log",
                 "series": [
                     {
                         "family": "BIFR",
@@ -131,6 +133,7 @@ def test_render_only_path_accepts_bifr_internal_selection_contract(tmp_path: Pat
                 "title": "PRV Paper RMSE",
                 "x_label": "p",
                 "y_label": "Paper RMSE",
+                "x_scale": "log",
                 "series": [
                     {
                         "family": "BIFR",

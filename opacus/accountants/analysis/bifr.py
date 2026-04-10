@@ -6,7 +6,10 @@ from typing import Any, Iterable, Sequence
 import torch
 
 from opacus.accountants.analysis.bnb import build_bnb_toeplitz_c_matrix_and_contract
-from opacus.accountants.analysis.toeplitz_family import ToeplitzMechanismFamily
+from opacus.accountants.analysis.toeplitz_family import (
+    InverseSideToeplitzFamily,
+    ToeplitzMechanismFamily,
+)
 
 
 def validate_bifr_frac(frac: float) -> float:
@@ -32,12 +35,20 @@ def _effective_sgd_alpha_beta(*, momentum: float, weight_decay: float) -> tuple[
         )
 
     if beta > alpha:
-        raise ValueError("BIFR analytic coefficient generation requires momentum <= effective weight decay")
+        raise ValueError("BIFR inverse-side generation requires momentum <= effective weight decay")
 
     return alpha, beta
 
 
 def generate_bifr_series_coeffs(*, bands: int, frac: float) -> list[float]:
+    """
+    Generate the inverse-side generalized-binomial BIFR series coefficients.
+
+    This matches the theorem-side inverse-series recurrence
+
+        a_0 = 1,
+        a_{k+1} = ((k - theta) / (k + 1)) a_k.
+    """
     resolved_frac = validate_bifr_frac(frac)
     if int(bands) < 1:
         raise ValueError("bands must be >= 1")
@@ -45,18 +56,23 @@ def generate_bifr_series_coeffs(*, bands: int, frac: float) -> list[float]:
     coeffs = [0.0] * int(bands)
     coeffs[0] = 1.0
     for idx in range(int(bands) - 1):
-        coeffs[idx + 1] = coeffs[idx] * ((float(idx) + resolved_frac) / float(idx + 1))
+        coeffs[idx + 1] = coeffs[idx] * ((float(idx) - resolved_frac) / float(idx + 1))
 
     return coeffs
 
 
-def generate_bifr_factor_coeffs_from_sgd_workload(
+def generate_bifr_inverse_coeffs_from_sgd_workload(
     *,
     bands: int,
     momentum: float,
     weight_decay: float,
     frac: float = 0.5,
 ) -> list[float]:
+    """
+    Generate BIFR inverse-side Toeplitz coefficients from the SGD workload.
+
+    The returned list is the band-truncated first column of `C^{-1}`.
+    """
     alpha, beta = _effective_sgd_alpha_beta(
         momentum=float(momentum),
         weight_decay=float(weight_decay),
@@ -77,10 +93,43 @@ def generate_bifr_factor_coeffs_from_sgd_workload(
             )
         coeffs[j] = total
 
+    if not all(math.isfinite(c) for c in coeffs):
+        raise ValueError("derived BIFR inverse coefficients must be finite")
+
     return coeffs
 
 
-def build_bifr_analytic_factor_family(
+def derive_bifr_factor_coeffs_from_inverse_coeffs(
+    *,
+    coeffs: Iterable[float],
+    steps: int,
+) -> list[float]:
+    """
+    Derive exact finite-horizon factor-side BIFR coefficients from inverse-side coefficients.
+    """
+    return InverseSideToeplitzFamily(
+        inv_coeffs=[float(c) for c in coeffs],
+        steps=int(steps),
+        source="bifr",
+    ).factor_coeffs()
+
+
+def build_bifr_exact_factor_family_from_inverse_coeffs(
+    *,
+    coeffs: Sequence[float],
+    steps: int,
+) -> ToeplitzMechanismFamily:
+    return ToeplitzMechanismFamily(
+        coeffs=derive_bifr_factor_coeffs_from_inverse_coeffs(
+            coeffs=coeffs,
+            steps=steps,
+        ),
+        steps=int(steps),
+        source="bifr",
+    )
+
+
+def build_bifr_exact_factor_family_from_sgd_workload(
     *,
     bands: int,
     steps: int,
@@ -88,15 +137,33 @@ def build_bifr_analytic_factor_family(
     weight_decay: float,
     frac: float = 0.5,
 ) -> ToeplitzMechanismFamily:
-    return ToeplitzMechanismFamily(
-        coeffs=generate_bifr_factor_coeffs_from_sgd_workload(
-            bands=bands,
-            momentum=momentum,
-            weight_decay=weight_decay,
-            frac=frac,
-        ),
+    inv_coeffs = generate_bifr_inverse_coeffs_from_sgd_workload(
+        bands=int(bands),
+        momentum=float(momentum),
+        weight_decay=float(weight_decay),
+        frac=float(frac),
+    )
+    return build_bifr_exact_factor_family_from_inverse_coeffs(
+        coeffs=inv_coeffs,
         steps=int(steps),
-        source="bifr",
+    )
+
+
+def compute_bifr_fixed_batch_sensitivity_from_inverse_coeffs(
+    *,
+    coeffs: Iterable[float],
+    steps: int,
+    max_participations: int,
+    min_separation: int,
+    allow_disjoint_fallback: bool = False,
+) -> float:
+    return build_bifr_exact_factor_family_from_inverse_coeffs(
+        coeffs=[float(c) for c in coeffs],
+        steps=int(steps),
+    ).fixed_batch_sensitivity(
+        max_participations=max_participations,
+        min_separation=min_separation,
+        allow_disjoint_fallback=allow_disjoint_fallback,
     )
 
 
@@ -111,7 +178,7 @@ def compute_bifr_fixed_batch_sensitivity_from_sgd_workload(
     frac: float = 0.5,
     allow_disjoint_fallback: bool = False,
 ) -> float:
-    return build_bifr_analytic_factor_family(
+    return build_bifr_exact_factor_family_from_sgd_workload(
         bands=bands,
         steps=steps,
         momentum=momentum,
@@ -124,43 +191,60 @@ def compute_bifr_fixed_batch_sensitivity_from_sgd_workload(
     )
 
 
-def resolve_bifr_factor_coeffs_for_accounting(
+def resolve_bifr_exact_factor_coeffs_for_accounting(
     *,
     coeffs: Sequence[float] | None = None,
+    inverse_coeffs: Sequence[float] | None = None,
+    steps: int | None = None,
     bands: int | None = None,
     momentum: float | None = None,
     weight_decay: float | None = None,
     frac: float = 0.5,
 ) -> tuple[list[float], str]:
     """
-    Resolve factor-side BIFR coefficients for accountant use.
+    Resolve exact finite-horizon factor-side BIFR coefficients for accountant use.
 
     Accepted sources:
-    - explicit factor coefficients already carried by runtime/public state
-    - analytic BIFR workload parameters `(bands, momentum, weight_decay, frac)`
-
-    The returned source string is machine-readable accountant metadata.
+    - explicit exact factor coefficients
+    - explicit inverse-side coefficients plus horizon
+    - exact workload parameters `(bands, steps, momentum, weight_decay, frac)`
     """
     if isinstance(coeffs, (list, tuple)) and len(coeffs) > 0:
         resolved = [float(c) for c in coeffs]
         if not all(math.isfinite(c) for c in resolved):
             raise ValueError("explicit BIFR factor coefficients must be finite")
-        return resolved, "explicit_factor_c_col"
+        return resolved, "explicit_exact_factor_c_col"
 
-    if bands is None or momentum is None or weight_decay is None:
-        raise ValueError(
-            "BIFR accountant coefficient resolution requires either explicit factor coefficients "
-            "or analytic workload parameters `(bands, momentum, weight_decay)`"
+    if isinstance(inverse_coeffs, (list, tuple)) and len(inverse_coeffs) > 0:
+        if steps is None:
+            raise ValueError("explicit BIFR inverse coefficients require an exact finite horizon")
+        return (
+            derive_bifr_factor_coeffs_from_inverse_coeffs(
+                coeffs=[float(c) for c in inverse_coeffs],
+                steps=int(steps),
+            ),
+            "exact_factor_c_col_from_explicit_inverse",
         )
 
+    if bands is None or steps is None or momentum is None or weight_decay is None:
+        raise ValueError(
+            "BIFR accountant coefficient resolution requires explicit exact factor coefficients, "
+            "explicit inverse coefficients with `steps`, or exact workload parameters "
+            "`(bands, steps, momentum, weight_decay)`"
+        )
+
+    inv_coeffs = generate_bifr_inverse_coeffs_from_sgd_workload(
+        bands=int(bands),
+        momentum=float(momentum),
+        weight_decay=float(weight_decay),
+        frac=float(validate_bifr_frac(frac)),
+    )
     return (
-        generate_bifr_factor_coeffs_from_sgd_workload(
-            bands=int(bands),
-            momentum=float(momentum),
-            weight_decay=float(weight_decay),
-            frac=float(validate_bifr_frac(frac)),
+        derive_bifr_factor_coeffs_from_inverse_coeffs(
+            coeffs=inv_coeffs,
+            steps=int(steps),
         ),
-        "analytic_factor_c_col",
+        "exact_factor_c_col_from_workload_inverse",
     )
 
 
@@ -170,9 +254,6 @@ def derive_bifr_amplified_accountant_coeffs_from_factor_coeffs(
 ) -> list[float]:
     """
     Derive the non-negative accountant-side first column for amplified BIFR.
-
-    BIFR is already parameterized by factor-side coefficients for `C`, so the
-    amplified accountant object is the finite-horizon first column of `|C|`.
     """
     accountant_coeffs = [abs(float(c)) for c in coeffs]
     if not accountant_coeffs:
@@ -196,14 +277,6 @@ def build_bifr_amplified_bnb_inputs_from_factor_coeffs(
     device: torch.device | None = None,
     atol: float = 1e-9,
 ) -> dict[str, Any]:
-    """
-    Build accountant-side BNB inputs from factor-side BIFR coefficients.
-
-    This packages:
-    - non-negative accountant coefficients
-    - Toeplitz `C` matrix materialization
-    - BNB matrix contract metadata
-    """
     accountant_coeffs = derive_bifr_amplified_accountant_coeffs_from_factor_coeffs(
         coeffs=coeffs,
     )
@@ -218,7 +291,7 @@ def build_bifr_amplified_bnb_inputs_from_factor_coeffs(
 
     return {
         "bnb_accountant_coeffs": [float(c) for c in accountant_coeffs],
-        "bnb_accountant_coeffs_source": "abs_factor_c_col",
+        "bnb_accountant_coeffs_source": "abs_exact_factor_c_col",
         "bnb_c_matrix": c_matrix,
         "bnb_c_matrix_contract": c_matrix_contract,
         "bnb_bands": int(bands),

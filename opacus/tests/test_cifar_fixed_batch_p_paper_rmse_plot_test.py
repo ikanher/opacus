@@ -223,6 +223,7 @@ def test_build_fixed_batch_p_rmse_figure_data_uses_roles_and_endpoint_markers() 
     assert figure_data["scenario_metadata"]["p_grid"] == [2, 4]
 
     panel = figure_data["panels"][0]
+    assert panel["x_scale"] == "log"
     roles = [series["role"] for series in panel["series"]]
     assert roles == ["p_curve", "endpoint_marker", "baseline"]
 
@@ -283,6 +284,7 @@ def test_render_only_path_accepts_fixed_batch_p_figure_contract(tmp_path: Path) 
                 "title": "PRV",
                 "x_label": "p",
                 "y_label": "Paper RMSE",
+                "x_scale": "log",
                 "series": [
                     {
                         "family": "BIFR",
