@@ -248,7 +248,56 @@ def test_blt_amplified_diagnostic_row_is_added_only_when_requested() -> None:
         _MODULE._resolve_blt_amplified_accountant_coeffs = original
         _MODULE._compute_bnb_noise_multiplier_for_coeffs = old_compute
 
-    assert any(row.method == "BLT" and row.regime == "amplified" for row in rows)
+    amplified_row = next(row for row in rows if row.method == "BLT" and row.regime == "amplified")
+    assert amplified_row.blt_rank == _MODULE.BLT_AMPLIFIED_DIAGNOSTIC_ROW.bandwidth
+    assert amplified_row.accounting_source == "opacus_blt_amplified_bnb_accountant_contract"
+
+
+def test_blt_amplified_row_uses_caller_supplied_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_resolve_blt_amplified_accountant_coeffs(*, rank, blt_lambda):
+        captured["rank"] = int(rank)
+        return (
+            [1.0] + [0.0] * (int(_MODULE.TOTAL_STEPS) - 1),
+            "normalized_forward_c_col",
+            {
+                "noise_multiplier_ref": 1.0,
+                "blt_horizon": int(_MODULE.TOTAL_STEPS),
+                "blt_min_separation": 4,
+                "blt_max_participations": 2,
+                "selected_candidate_index": 0,
+                "candidate_count": 1,
+                "selected_theta": [0.8] * int(rank),
+                "selected_theta_hat": [0.6] * int(rank),
+                "lambda_anchor": blt_lambda,
+            },
+        )
+
+    monkeypatch.setattr(
+        _MODULE,
+        "_resolve_blt_amplified_accountant_coeffs",
+        _fake_resolve_blt_amplified_accountant_coeffs,
+    )
+    monkeypatch.setattr(_MODULE, "_compute_bnb_noise_multiplier_for_coeffs", lambda **kwargs: 0.75)
+
+    rows = _MODULE.compute_comparison_rows(
+        include_amplified=True,
+        include_non_amplified=False,
+        methods=["BLT"],
+        paper_rows=[_MODULE.PaperRow("amplified", "BLT", float("nan"), 0.1, 8, 10.0)],
+        amplified_backends=["balls_in_bins"],
+        bnb_calibration_mode="optimistic",
+        bnb_num_samples=64,
+        bnb_num_workers=0,
+    )
+
+    amplified_row = next(row for row in rows if row.method == "BLT" and row.regime == "amplified")
+    assert captured["rank"] == 8
+    assert amplified_row.bandwidth == 8
+    assert amplified_row.blt_rank == 8
 
 
 def test_resolve_blt_amplified_accountant_coeffs_uses_forward_c_col(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -511,6 +560,44 @@ def test_non_amplified_bifr_rows_use_nonpaper_fixed_batch_contract(
         assert row.reason_code == "computed_bifr_fixed_batch_exact_contract"
         assert "exact finite-horizon BIFR factor-side family" in row.notes
         assert "BSR half-slice" in row.notes
+
+
+def test_non_amplified_bifr_unstable_exact_slice_is_known_skip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fake_method_fixed_batch_sensitivity(
+        method: str,
+        bands: int,
+        bifr_frac: float | None = None,
+    ) -> float:
+        assert bands == 4
+        if method == "BIFR":
+            raise ValueError("unstable_exact_bifr_slice: test fixture")
+        if method == "BSR":
+            return 2.0
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(_MODULE, "_method_fixed_batch_sensitivity", _fake_method_fixed_batch_sensitivity)
+    monkeypatch.setattr(
+        _MODULE,
+        "_fixed_batch_base_sigma",
+        lambda *, backend: 1.0 if backend == "prv" else 1.5,
+    )
+
+    rows = _MODULE.compute_comparison_rows(
+        include_amplified=False,
+        include_non_amplified=False,
+        methods=["BIFR"],
+        bifr_frac=0.625,
+    )
+
+    assert len(rows) == 2
+    for row in rows:
+        assert row.method == "BIFR"
+        assert row.status == "skipped"
+        assert row.parity_status == "known_skipped"
+        assert row.reason_code == "known_unstable_exact_bifr_slice"
+        assert row.computed_noise_multiplier is None
 
 
 def test_non_amplified_bifr_rows_default_to_canonical_sweep(
@@ -1291,7 +1378,46 @@ def test_amplified_cycle_endpoint_cyclic_rows_are_known_skips_not_unexpected(
     assert len(cyclic_rows) == 1
     assert all(row.status == "skipped" for row in cyclic_rows)
     assert all(row.reason_code == "known_unsupported_cyclic_endpoint_contract" for row in cyclic_rows)
-    assert all(row.parity_status == "known_skipped" for row in cyclic_rows)
+
+
+def test_amplified_bifr_unstable_exact_slice_is_known_skip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _fake_coeffs(method: str, bands: int, bifr_frac: float | None = None):
+        assert method == "BIFR"
+        assert bands == 2
+        assert bifr_frac == pytest.approx(0.625)
+        raise ValueError("unstable_exact_bifr_slice: test fixture")
+
+    monkeypatch.setattr(_MODULE, "_method_amplified_coeffs", _fake_coeffs)
+    monkeypatch.setattr(
+        _MODULE,
+        "_method_amplified_accountant_coeffs",
+        lambda method, bands, bifr_frac=None: (_fake_coeffs(method, bands, bifr_frac), "unused"),
+    )
+
+    rows = _MODULE.compute_comparison_rows(
+        include_amplified=True,
+        include_non_amplified=False,
+        methods=["BIFR"],
+        bifr_frac=0.625,
+        amplified_backends=["balls_in_bins"],
+        paper_rows=_MODULE.build_amplified_bnb_p_sweep_rows(bandwidth_grid=[2]),
+    )
+
+    amplified_rows = [row for row in rows if row.regime == "amplified"]
+    assert len(amplified_rows) == 1
+    row = amplified_rows[0]
+    assert row.method == "BIFR"
+    assert row.status == "skipped"
+    assert row.parity_status == "known_skipped"
+    assert row.reason_code == "known_unstable_exact_bifr_slice"
+    assert row.computed_noise_multiplier is None
+
+    audit = getattr(_MODULE.compute_comparison_rows, "last_amplified_bifr_candidate_audit")
+    candidate = audit["balls_in_bins:p2"]["candidates"][0]
+    assert candidate["status"] == "known_unstable_exact_slice"
+    assert candidate["paper_rmse_reason"] == "known_unstable_exact_bifr_slice"
 
 
 def test_build_report_records_amplified_bifr_candidate_audit(
@@ -1793,8 +1919,16 @@ def test_bandinvmf_cyclic_poisson_uses_bandinvmf_specific_scale(
         "get_noise_multiplier",
         lambda **kwargs: kwargs["bsr_sensitivity_scale"],
     )
-    monkeypatch.setattr(_MODULE, "_bandinvmf_inv_coeffs", lambda *, bands: (1.0, -0.9, 0.03, -0.08))
-    monkeypatch.setattr(_MODULE, "_bandinvmf_runtime_coeffs", lambda *, bands: (1.0, 0.9, 0.8, 0.8))
+    monkeypatch.setattr(
+        _MODULE,
+        "_bandinvmf_inv_coeffs",
+        lambda *, bands, optimizer_workload=_MODULE.DEFAULT_OPTIMIZER_WORKLOAD: (1.0, -0.9, 0.03, -0.08),
+    )
+    monkeypatch.setattr(
+        _MODULE,
+        "_bandinvmf_runtime_coeffs",
+        lambda *, bands, optimizer_workload=_MODULE.DEFAULT_OPTIMIZER_WORKLOAD: (1.0, 0.9, 0.8, 0.8),
+    )
 
     sigma, metadata = _MODULE._compute_cyclic_poisson_noise_multiplier(
         method="Band-Inv-MF",
@@ -2082,6 +2216,7 @@ def test_build_report_records_blt_nonpaper_metadata() -> None:
     blt_meta = report["metadata"]["non_paper_methods"]["BLT"]
     assert blt_meta["regime"] == "non-amplified"
     assert blt_meta["default_rank"] == 2
+    assert blt_meta["default_amplified_rank"] == 4
     assert blt_meta["reference_source"] == "fixed_batch_identity_gaussian_prv"
     assert "--methods BLT" in blt_meta["notes"]
 
@@ -2220,6 +2355,8 @@ def test_build_report_attaches_paper_rmse_and_missing_reasons(
 
 
 def test_resolve_row_paper_rmse_supports_amplified_blt_selected_pair() -> None:
+    theta = [0.8, 0.6, 0.4, 0.2]
+    theta_hat = [0.7, 0.5, 0.3, 0.1]
     row = _MODULE._comparison_row(
         row=_MODULE.BLT_AMPLIFIED_DIAGNOSTIC_ROW,
         backend="balls_in_bins",
@@ -2228,11 +2365,11 @@ def test_resolve_row_paper_rmse_supports_amplified_blt_selected_pair() -> None:
         sensitivity=1.0,
         reason_code="computed_bnb_accountant_blt_forward_c_col",
         blt_selection_mode="optimizer_selected",
-        blt_rank=2,
+        blt_rank=_MODULE.BLT_AMPLIFIED_DIAGNOSTIC_ROW.bandwidth,
         blt_selected_candidate_index=0,
         blt_candidate_count=1,
-        blt_selected_theta=[0.8, 0.3],
-        blt_selected_theta_hat=[0.6, 0.1],
+        blt_selected_theta=theta,
+        blt_selected_theta_hat=theta_hat,
         accounting_noise_multiplier=1.25,
         accounting_source="opacus_blt_amplified_bnb_accountant_contract",
         comparison_noise_multiplier=2.0,
@@ -2243,9 +2380,22 @@ def test_resolve_row_paper_rmse_supports_amplified_blt_selected_pair() -> None:
         notes="test amplified BLT row",
     )
 
+    pair = _MODULE.blt_pair_from_theta_pair(theta=theta, theta_hat=theta_hat)
+    expected_matrix = _MODULE.build_lower_toeplitz_matrix_from_coeffs(
+        coeffs=_MODULE.blt_forward_coeffs_for_amplified_accounting(
+            pair=pair,
+            horizon=int(_MODULE.TOTAL_STEPS),
+        ),
+        steps=int(_MODULE.TOTAL_STEPS),
+    )
+    expected_rmse = _MODULE.compute_prefix_workload_paper_rmse_from_matrix(
+        c_matrix=expected_matrix,
+        noise_multiplier=float(row.computed_noise_multiplier),
+    )
+
     paper_rmse, reason = _MODULE._resolve_row_paper_rmse(row)
-    assert paper_rmse is not None
-    assert reason == "toeplitz_strategy_from_blt_amplified_forward_c_col"
+    assert paper_rmse == pytest.approx(expected_rmse)
+    assert reason == "toeplitz_strategy_from_blt_amplified_raw_forward_c_col"
 
 
 def test_build_report_serializes_blt_row_as_nonpaper_reference(

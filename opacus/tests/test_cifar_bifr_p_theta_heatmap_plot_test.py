@@ -96,14 +96,33 @@ def test_build_bifr_p_theta_heatmap_figure_data_emits_plain_heatmap() -> None:
     assert panel["y_label"] == "theta"
     assert panel["heatmap"]["x_values"] == [1, 2, 4]
     assert panel["heatmap"]["y_values"] == [0.0, 0.5, 1.0]
-    assert panel["heatmap"]["colorbar_label"] == "log10(Paper RMSE), capped at 10^3"
+    assert (
+        panel["heatmap"]["colorbar_label"]
+        == "log10(Paper RMSE), values above 10^3 masked as bad"
+    )
     assert panel["heatmap"]["cmap"] == "viridis_r"
     assert panel["heatmap"]["vmin"] < panel["heatmap"]["vmax"]
     assert panel["heatmap"]["vmax"] == math.log10(9.0)
-    assert panel["heatmap"]["overflow_color"] == "#2b2b2b"
-    assert panel["heatmap"]["bad_color"] == "#d9d9d9"
-    assert panel["heatmap"]["colorbar_extend"] == "max"
+    assert panel["heatmap"]["bad_color"] == "#2b2b2b"
     assert panel["series"] == []
+
+
+def test_build_bifr_p_theta_heatmap_figure_data_masks_overflow_cells_as_bad() -> None:
+    report = {
+        "metadata": {
+            "canonical_p_grid": [2],
+            "canonical_theta_grid": [0.5, 1.0],
+        },
+        "cells": [
+            {"p": 2, "theta": 0.5, "paper_rmse": 9.0},
+            {"p": 2, "theta": 1.0, "paper_rmse": 1e5},
+        ],
+        "selected_path": [],
+    }
+    figure_data = _PLOT.build_bifr_p_theta_heatmap_figure_data(report)
+    z_matrix = figure_data["panels"][0]["heatmap"]["z_matrix"]
+    assert math.isfinite(z_matrix[0][0])
+    assert math.isnan(z_matrix[1][0])
 
 
 def test_build_bifr_p_theta_heatmap_report_marks_nonfinite_cells_noncomputed(monkeypatch) -> None:
@@ -159,13 +178,11 @@ def test_render_only_path_accepts_bifr_p_theta_heatmap_contract(tmp_path: Path) 
                     "x_values": [1, 2, 4],
                     "y_values": [0.0, 0.5, 1.0],
                     "z_matrix": [[9.0, 8.0, 7.0], [6.0, 5.0, 4.0], [7.5, 4.5, 4.2]],
-                    "colorbar_label": "log10(Paper RMSE), capped at 10^3",
+                    "colorbar_label": "log10(Paper RMSE), values above 10^3 masked as bad",
                     "cmap": "viridis_r",
                     "vmin": 4.0,
                     "vmax": 9.0,
-                    "overflow_color": "#2b2b2b",
-                    "bad_color": "#d9d9d9",
-                    "colorbar_extend": "max",
+                    "bad_color": "#2b2b2b",
                 },
                 "series": [],
             }

@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from opacus.accountants.analysis.bifr import (
+    bifr_exact_factor_recurrence_spectral_radius_from_inverse_coeffs,
     build_bifr_exact_factor_family_from_sgd_workload,
     build_bifr_amplified_bnb_inputs_from_factor_coeffs,
     compute_bifr_fixed_batch_sensitivity_from_sgd_workload,
@@ -124,7 +125,7 @@ def test_build_bifr_amplified_bnb_inputs_returns_matrix_and_contract() -> None:
 def test_bifr_exact_factor_recovery_matches_dense_inverse_reference_on_representative_grid() -> None:
     steps = 128
     for bands in (2, 4, 8, 16):
-        for frac in (0.5, 0.625, 0.75, 1.0):
+        for frac in (0.0, 0.25, 0.5):
             inv_coeffs = generate_bifr_inverse_coeffs_from_sgd_workload(
                 bands=bands,
                 momentum=0.9,
@@ -145,3 +146,30 @@ def test_bifr_exact_factor_recovery_matches_dense_inverse_reference_on_represent
                 rel=1e-10,
                 abs=1e-10,
             )
+
+
+def test_bifr_exact_factor_recurrence_radius_detects_unstable_p2_upper_half_slice() -> None:
+    inv_coeffs = generate_bifr_inverse_coeffs_from_sgd_workload(
+        bands=2,
+        momentum=0.9,
+        weight_decay=0.9999,
+        frac=0.625,
+    )
+    radius = bifr_exact_factor_recurrence_spectral_radius_from_inverse_coeffs(
+        coeffs=inv_coeffs,
+    )
+    assert radius > 1.0
+
+
+def test_bifr_exact_factor_recovery_rejects_structurally_unstable_long_horizon_slice() -> None:
+    inv_coeffs = generate_bifr_inverse_coeffs_from_sgd_workload(
+        bands=2,
+        momentum=0.9,
+        weight_decay=0.9999,
+        frac=0.625,
+    )
+    with pytest.raises(ValueError, match="unstable_exact_bifr_slice"):
+        derive_bifr_factor_coeffs_from_inverse_coeffs(
+            coeffs=inv_coeffs,
+            steps=980,
+        )

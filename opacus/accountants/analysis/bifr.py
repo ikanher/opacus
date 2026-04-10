@@ -11,6 +11,9 @@ from opacus.accountants.analysis.toeplitz_family import (
     ToeplitzMechanismFamily,
 )
 
+_BIFR_EXACT_FACTOR_STRUCTURAL_RADIUS_TOL = 1e-9
+_BIFR_EXACT_FACTOR_MAX_ABS_COEFF_CAP = 1e6
+
 
 def validate_bifr_frac(frac: float) -> float:
     resolved = float(frac)
@@ -99,6 +102,88 @@ def generate_bifr_inverse_coeffs_from_sgd_workload(
     return coeffs
 
 
+def bifr_exact_factor_recurrence_spectral_radius_from_inverse_coeffs(
+    *,
+    coeffs: Iterable[float],
+) -> float:
+    """
+    Spectral radius of the exact first-column recurrence induced by `C^{-1}`.
+
+    If `C^{-1}` has first column `[c_0, c_1, ..., c_m]`, then the factor-side
+    first column satisfies
+
+        c_0 x_t + c_1 x_{t-1} + ... + c_m x_{t-m} = 0.
+
+    The companion-matrix spectral radius controls asymptotic growth of the
+    exact finite-horizon factor column.
+    """
+    coeff_list = [float(c) for c in coeffs]
+    if len(coeff_list) == 0:
+        raise ValueError("coeffs must be non-empty")
+
+    if not all(math.isfinite(c) for c in coeff_list):
+        raise ValueError("coeffs must be finite")
+
+    leading = float(coeff_list[0])
+    if abs(leading) <= 0.0:
+        raise ValueError("leading inverse coefficient must be nonzero")
+
+    order = len(coeff_list) - 1
+    if order <= 0:
+        return 0.0
+
+    normalized_tail = [float(c) / leading for c in coeff_list[1:]]
+    companion = torch.zeros((order, order), dtype=torch.float64)
+    companion[0, :] = -torch.tensor(normalized_tail, dtype=torch.float64)
+    if order > 1:
+        companion[1:, :-1] = torch.eye(order - 1, dtype=torch.float64)
+
+    eigvals = torch.linalg.eigvals(companion)
+    radius = float(torch.max(torch.abs(eigvals)).item())
+    if not math.isfinite(radius):
+        raise ValueError("exact BIFR recurrence spectral radius must be finite")
+
+    return radius
+
+
+def validate_bifr_exact_factor_structural_stability(
+    *,
+    inverse_coeffs: Iterable[float],
+    factor_coeffs: Iterable[float],
+    steps: int,
+    radius_tol: float = _BIFR_EXACT_FACTOR_STRUCTURAL_RADIUS_TOL,
+    max_abs_coeff_cap: float = _BIFR_EXACT_FACTOR_MAX_ABS_COEFF_CAP,
+) -> float:
+    """
+    Reject exact finite-horizon BIFR slices that are structurally unstable for
+    the requested horizon.
+
+    We do not reject every unstable recurrence unconditionally: low-horizon
+    exact slices can still be useful and theorem-facing tests rely on that.
+    The maintained runtime/accountant concern is the long-horizon regime where
+    the exact factor-side first column explodes to enormous magnitude.
+    """
+    if int(steps) < 1:
+        raise ValueError("steps must be >= 1")
+    factor_list = [float(c) for c in factor_coeffs]
+    if len(factor_list) == 0:
+        raise ValueError("factor_coeffs must be non-empty")
+    if not all(math.isfinite(c) for c in factor_list):
+        raise ValueError("factor_coeffs must be finite")
+    radius = bifr_exact_factor_recurrence_spectral_radius_from_inverse_coeffs(
+        coeffs=inverse_coeffs
+    )
+    max_abs_coeff = max(abs(float(c)) for c in factor_list)
+    if radius > 1.0 + float(radius_tol) and max_abs_coeff > float(max_abs_coeff_cap):
+        raise ValueError(
+            "unstable_exact_bifr_slice: "
+            f"recurrence spectral radius {radius:.6g} exceeds 1 and "
+            f"max |C[:,0]| coefficient {max_abs_coeff:.6g} exceeds the "
+            f"maintained cap {float(max_abs_coeff_cap):.6g} at horizon {int(steps)}"
+        )
+    return radius
+
+
 def derive_bifr_factor_coeffs_from_inverse_coeffs(
     *,
     coeffs: Iterable[float],
@@ -107,11 +192,18 @@ def derive_bifr_factor_coeffs_from_inverse_coeffs(
     """
     Derive exact finite-horizon factor-side BIFR coefficients from inverse-side coefficients.
     """
-    return InverseSideToeplitzFamily(
-        inv_coeffs=[float(c) for c in coeffs],
+    inverse_coeffs = [float(c) for c in coeffs]
+    factor_coeffs = InverseSideToeplitzFamily(
+        inv_coeffs=inverse_coeffs,
         steps=int(steps),
         source="bifr",
     ).factor_coeffs()
+    validate_bifr_exact_factor_structural_stability(
+        inverse_coeffs=inverse_coeffs,
+        factor_coeffs=factor_coeffs,
+        steps=int(steps),
+    )
+    return factor_coeffs
 
 
 def build_bifr_exact_factor_family_from_inverse_coeffs(

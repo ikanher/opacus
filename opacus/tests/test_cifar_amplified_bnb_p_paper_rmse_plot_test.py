@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import importlib.util
 import json
 from pathlib import Path
@@ -27,6 +28,20 @@ assert _PLOT_SPEC is not None and _PLOT_SPEC.loader is not None
 _PLOT = importlib.util.module_from_spec(_PLOT_SPEC)
 sys.modules[_PLOT_SPEC.name] = _PLOT
 _PLOT_SPEC.loader.exec_module(_PLOT)
+
+
+def _fake_amplified_blt_plot_row(*, rank: int = 4, paper_rmse: float = 0.9) -> dict[str, object]:
+    return {
+        "regime": "amplified",
+        "backend": "balls_in_bins",
+        "method": "BLT",
+        "status": "computed",
+        "bandwidth": rank,
+        "blt_rank": rank,
+        "blt_selection_mode": "optimizer_selected",
+        "accounting_source": "opacus_blt_amplified_bnb_accountant_contract",
+        "paper_rmse": paper_rmse,
+    }
 
 
 def test_build_amplified_bnb_p_sweep_rows_includes_baselines_and_curve_grid() -> None:
@@ -68,13 +83,41 @@ def test_build_amplified_bnb_p_rmse_report_uses_plot_local_num_samples_default(
 
     def fake_build_report(**kwargs):
         captured.update(kwargs)
-        return {"metadata": {}, "rows": []}
+        return {"metadata": {}, "rows": [_fake_amplified_blt_plot_row()]}
 
     monkeypatch.setattr(_PLOT, "build_report", fake_build_report)
 
     _PLOT.build_amplified_bnb_p_rmse_report(bandwidth_grid=[2, 4])
 
     assert captured["bnb_num_samples"] == 200_000
+    assert captured["optimizer_momentum"] == _PLOT.DEFAULT_OPTIMIZER_MOMENTUM
+    assert captured["optimizer_weight_decay"] == _PLOT.DEFAULT_OPTIMIZER_WEIGHT_DECAY
+
+
+def test_build_amplified_bnb_p_rmse_report_propagates_optimizer_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(_PLOT, "build_amplified_bnb_p_sweep_rows", lambda bandwidth_grid: [])
+
+    def fake_build_report(**kwargs):
+        captured.update(kwargs)
+        return {"metadata": {}, "rows": [_fake_amplified_blt_plot_row()]}
+
+    monkeypatch.setattr(_PLOT, "build_report", fake_build_report)
+
+    report = _PLOT.build_amplified_bnb_p_rmse_report(
+        bandwidth_grid=[2, 4],
+        optimizer_momentum=0.0,
+        optimizer_weight_decay=0.0,
+    )
+
+    assert captured["optimizer_momentum"] == 0.0
+    assert captured["optimizer_weight_decay"] == 0.0
+    assert report["metadata"]["plot_optimizer_workload_override"] == {
+        "momentum": 0.0,
+        "weight_decay": 0.0,
+    }
 
 
 def test_build_amplified_bnb_p_rmse_figure_data_uses_roles_and_baselines() -> None:
@@ -113,7 +156,8 @@ def test_build_amplified_bnb_p_rmse_figure_data_uses_roles_and_baselines() -> No
                 "backend": "balls_in_bins",
                 "method": "BLT",
                 "status": "computed",
-                "bandwidth": 2,
+                "bandwidth": 4,
+                "blt_rank": 4,
                 "paper_rmse": 0.9,
             },
             {
@@ -138,6 +182,7 @@ def test_build_amplified_bnb_p_rmse_figure_data_uses_roles_and_baselines() -> No
     assert panel["series"][1]["family"] == "BSR"
     assert panel["series"][2]["family"] == "DP-SGD"
     assert panel["series"][3]["family"] == "BLT"
+    assert panel["series"][3]["label"] == "BLT (buffer=4)"
 
 
 def test_build_amplified_bnb_p_rmse_report_requests_blt_as_comparison_line(
@@ -147,7 +192,7 @@ def test_build_amplified_bnb_p_rmse_report_requests_blt_as_comparison_line(
 
     def fake_build_report(**kwargs):
         captured.update(kwargs)
-        return {"metadata": {}, "rows": []}
+        return {"metadata": {}, "rows": [_fake_amplified_blt_plot_row(rank=8)]}
 
     monkeypatch.setattr(_PLOT, "build_report", fake_build_report)
 
@@ -157,7 +202,146 @@ def test_build_amplified_bnb_p_rmse_report_requests_blt_as_comparison_line(
     assert report["metadata"]["plot_family_roles"]["comparison_methods"] == ["BLT"]
     assert report["metadata"]["plot_baseline_contract"]["plotted_baseline_backend"] == "balls_in_bins"
     assert report["metadata"]["plot_baseline_contract"]["report_reference_only_rows"][0]["backend"] == "poisson_prv"
+    assert report["metadata"]["plot_comparison_contract"]["BLT"] == {
+        "buffer_count": 8,
+        "selection_surface": "opacus_blt_amplified_bnb_accountant_contract",
+        "selection_mode": "optimizer_selected",
+    }
     assert captured["methods"] == ["DP-SGD", "BLT", "BIFR", "BISR", "Band-MF", "Band-Inv-MF", "BSR"]
+
+
+def test_build_amplified_bnb_p_rmse_report_does_not_import_jax_privacy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        _REPORT,
+        "compute_comparison_rows",
+        lambda **kwargs: [
+            _REPORT._comparison_row(
+                row=_REPORT.PaperRow("amplified", "BLT", float("nan"), 0.1, 4, 10.0),
+                backend="balls_in_bins",
+                status="computed",
+                computed=0.75,
+                sensitivity=1.0,
+                reason_code="computed_bnb_accountant_blt_forward_c_col",
+                reference_noise_multiplier=1.0,
+                reference_source="poisson_prv",
+                accounting_noise_multiplier=0.75,
+                accounting_source="opacus_blt_amplified_bnb_accountant_contract",
+                blt_selection_mode="optimizer_selected",
+                blt_rank=4,
+                blt_selected_candidate_index=0,
+                blt_candidate_count=1,
+                blt_selected_theta=[0.8, 0.6, 0.4, 0.2],
+                blt_selected_theta_hat=[0.7, 0.5, 0.3, 0.1],
+                comparison_noise_multiplier=1.0,
+                comparison_source="poisson_prv",
+                notes="test fixture amplified BLT row",
+                paper_rmse=0.9,
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        _REPORT,
+        "_attach_paper_rmse",
+        lambda rows, *, optimizer_workload=_REPORT.DEFAULT_OPTIMIZER_WORKLOAD: {
+            "computed_rows": len(rows),
+            "missing_rows": 0,
+        },
+    )
+
+    real_import = builtins.__import__
+
+    def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "jax_privacy" or name.startswith("jax_privacy."):
+            raise AssertionError("plot path must not import jax_privacy")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+    _PLOT.build_amplified_bnb_p_rmse_report(bandwidth_grid=[2, 4])
+
+
+def test_build_amplified_bnb_p_rmse_report_refreshes_only_requested_methods(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    existing_report = {
+        "metadata": {
+            "canonical_p_grid": [2, 4],
+            "paper_rows": [
+                {
+                    "regime": "amplified",
+                    "method": "BLT",
+                    "paper_noise_multiplier": float("nan"),
+                    "learning_rate": 0.1,
+                    "bandwidth": 8,
+                    "clip_norm": 10.0,
+                },
+                {
+                    "regime": "amplified",
+                    "method": "BSR",
+                    "paper_noise_multiplier": float("nan"),
+                    "learning_rate": 0.3,
+                    "bandwidth": 4,
+                    "clip_norm": 10.0,
+                },
+            ],
+            "paper_rows_source": "caller_supplied_override",
+            "non_plot_field": "keep-me",
+        },
+        "rows": [
+            {
+                "regime": "amplified",
+                "backend": "balls_in_bins",
+                "method": "BSR",
+                "status": "computed",
+                "bandwidth": 4,
+                "paper_rmse": 1.25,
+            },
+            {
+                "regime": "amplified",
+                "backend": "balls_in_bins",
+                "method": "BLT",
+                "status": "computed",
+                "bandwidth": 4,
+                "blt_rank": 4,
+                "blt_selection_mode": "optimizer_selected",
+                "accounting_source": "opacus_blt_amplified_bnb_accountant_contract",
+                "paper_rmse": 0.9,
+            },
+        ],
+    }
+
+    def fake_build_report(**kwargs):
+        captured.update(kwargs)
+        return {
+            "metadata": {
+                "paper_rows": kwargs["paper_rows"],
+                "paper_rows_source": "caller_supplied_override",
+                "optimizer_momentum": kwargs["optimizer_momentum"],
+                "optimizer_weight_decay": kwargs["optimizer_weight_decay"],
+            },
+            "rows": [_fake_amplified_blt_plot_row(rank=8, paper_rmse=0.7)],
+        }
+
+    monkeypatch.setattr(_PLOT, "build_report", fake_build_report)
+
+    report = _PLOT.build_amplified_bnb_p_rmse_report(
+        bandwidth_grid=[2, 4],
+        existing_report=existing_report,
+        refresh_methods=["BLT"],
+    )
+
+    assert captured["methods"] == ["BLT"]
+    assert [(row.method, row.bandwidth) for row in captured["paper_rows"]] == [("BLT", 8)]
+    assert report["metadata"]["non_plot_field"] == "keep-me"
+    assert any(row["method"] == "BSR" and row["paper_rmse"] == 1.25 for row in report["rows"])
+    blt_rows = [row for row in report["rows"] if row["method"] == "BLT"]
+    assert len(blt_rows) == 1
+    assert blt_rows[0]["blt_rank"] == 8
+    assert blt_rows[0]["paper_rmse"] == 0.7
+    assert report["metadata"]["plot_comparison_contract"]["BLT"]["buffer_count"] == 8
 
 
 def test_build_amplified_bnb_p_rmse_figure_data_only_marks_true_lambda_cgd_endpoint() -> None:
