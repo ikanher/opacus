@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pytest
+import torch
 
 from opacus.accountants.analysis.bifr import (
     build_bifr_exact_factor_family_from_sgd_workload,
@@ -12,6 +13,7 @@ from opacus.accountants.analysis.bifr import (
     resolve_bifr_exact_factor_coeffs_for_accounting,
 )
 from opacus.accountants.analysis.bsr import generate_bsr_coeffs_from_sgd_workload
+from opacus.accountants.analysis.toeplitz_family import build_lower_toeplitz_matrix_from_coeffs
 
 
 def _unscaled_workload_coeff(alpha: float, beta: float, j: int) -> float:
@@ -117,3 +119,29 @@ def test_build_bifr_amplified_bnb_inputs_returns_matrix_and_contract() -> None:
     assert resolved["bnb_horizon"] == 6
     assert tuple(resolved["bnb_c_matrix"].shape) == (6, 6)
     assert resolved["bnb_c_matrix_contract"]["bands"] == 2
+
+
+def test_bifr_exact_factor_recovery_matches_dense_inverse_reference_on_representative_grid() -> None:
+    steps = 128
+    for bands in (2, 4, 8, 16):
+        for frac in (0.5, 0.625, 0.75, 1.0):
+            inv_coeffs = generate_bifr_inverse_coeffs_from_sgd_workload(
+                bands=bands,
+                momentum=0.9,
+                weight_decay=0.9999,
+                frac=frac,
+            )
+            inverse_matrix = build_lower_toeplitz_matrix_from_coeffs(
+                coeffs=inv_coeffs,
+                steps=steps,
+            )
+            dense_inverse_first_col = torch.linalg.inv(inverse_matrix)[:, 0].tolist()
+            solve_first_col = derive_bifr_factor_coeffs_from_inverse_coeffs(
+                coeffs=inv_coeffs,
+                steps=steps,
+            )
+            assert solve_first_col == pytest.approx(
+                dense_inverse_first_col,
+                rel=1e-10,
+                abs=1e-10,
+            )

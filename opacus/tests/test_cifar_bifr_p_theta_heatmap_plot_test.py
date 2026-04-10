@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 from pathlib import Path
 import sys
 
@@ -57,12 +58,15 @@ def test_build_bifr_p_theta_heatmap_report_preserves_explicit_grids(monkeypatch)
 
     assert captured["bifr_fracs"] == [0.0, 0.5, 1.0]
     assert [row.bandwidth for row in captured["paper_rows"]] == [1, 2]
+    assert report["p_grid"] == [1, 2]
+    assert report["theta_grid"] == [0.0, 0.5, 1.0]
     assert report["metadata"]["canonical_p_grid"] == [1, 2]
     assert report["metadata"]["canonical_theta_grid"] == [0.0, 0.5, 1.0]
+    assert report["selected_theta_path"] == report["selected_path"]
     assert report["selected_path"][0]["is_lambda_cgd_endpoint"] is True
 
 
-def test_build_bifr_p_theta_heatmap_figure_data_emits_heatmap_and_overlay() -> None:
+def test_build_bifr_p_theta_heatmap_figure_data_emits_plain_heatmap() -> None:
     report = {
         "metadata": {
             "canonical_p_grid": [1, 2, 4],
@@ -92,7 +96,14 @@ def test_build_bifr_p_theta_heatmap_figure_data_emits_heatmap_and_overlay() -> N
     assert panel["y_label"] == "theta"
     assert panel["heatmap"]["x_values"] == [1, 2, 4]
     assert panel["heatmap"]["y_values"] == [0.0, 0.5, 1.0]
-    assert [series["role"] for series in panel["series"]] == ["p_curve", "endpoint_marker", "endpoint_marker"]
+    assert panel["heatmap"]["colorbar_label"] == "log10(Paper RMSE), capped at 10^3"
+    assert panel["heatmap"]["cmap"] == "viridis_r"
+    assert panel["heatmap"]["vmin"] < panel["heatmap"]["vmax"]
+    assert panel["heatmap"]["vmax"] == math.log10(9.0)
+    assert panel["heatmap"]["overflow_color"] == "#2b2b2b"
+    assert panel["heatmap"]["bad_color"] == "#d9d9d9"
+    assert panel["heatmap"]["colorbar_extend"] == "max"
+    assert panel["series"] == []
 
 
 def test_build_bifr_p_theta_heatmap_report_marks_nonfinite_cells_noncomputed(monkeypatch) -> None:
@@ -148,19 +159,15 @@ def test_render_only_path_accepts_bifr_p_theta_heatmap_contract(tmp_path: Path) 
                     "x_values": [1, 2, 4],
                     "y_values": [0.0, 0.5, 1.0],
                     "z_matrix": [[9.0, 8.0, 7.0], [6.0, 5.0, 4.0], [7.5, 4.5, 4.2]],
-                    "colorbar_label": "Paper RMSE",
-                    "cmap": "viridis",
+                    "colorbar_label": "log10(Paper RMSE), capped at 10^3",
+                    "cmap": "viridis_r",
+                    "vmin": 4.0,
+                    "vmax": 9.0,
+                    "overflow_color": "#2b2b2b",
+                    "bad_color": "#d9d9d9",
+                    "colorbar_extend": "max",
                 },
-                "series": [
-                    {
-                        "family": "BIFR",
-                        "backend": "balls_in_bins",
-                        "role": "p_curve",
-                        "label": "Selected theta*(p)",
-                        "color": "#e45756",
-                        "data": [{"x": 1, "y": 0.5}, {"x": 2, "y": 1.0}, {"x": 4, "y": 0.5}],
-                    }
-                ],
+                "series": [],
             }
         ],
     }

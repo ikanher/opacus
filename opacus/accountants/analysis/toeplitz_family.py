@@ -520,11 +520,12 @@ def recover_factor_coeffs_numerical(
     steps: int,
 ) -> list[float]:
     """
-    Recover factor-side Toeplitz coefficients by numerically inverting
-    the inverse-side lower-triangular Toeplitz matrix.
+    Recover factor-side Toeplitz coefficients by solving for the first column
+    of the inverse-side lower-triangular Toeplitz matrix.
 
-    This is the O(n^3) fallback for inverse-side families without an analytic
-    factor-side route.
+    We only need ``L^{-1} e_0``, not the full dense inverse ``L^{-1}``. A
+    triangular solve is both cheaper and numerically better behaved than
+    materializing the entire inverse.
     """
     coeff_list = [float(c) for c in inv_coeffs]
     if len(coeff_list) == 0:
@@ -540,8 +541,15 @@ def recover_factor_coeffs_numerical(
         coeffs=coeff_list,
         steps=int(steps),
     )
-    factor_matrix = torch.linalg.inv(inverse_matrix)
-    factor_coeffs = [float(factor_matrix[row, 0]) for row in range(int(steps))]
+    rhs = torch.zeros((int(steps), 1), dtype=torch.float64)
+    rhs[0, 0] = 1.0
+    factor_column = torch.linalg.solve_triangular(
+        inverse_matrix,
+        rhs,
+        upper=False,
+        unitriangular=False,
+    )
+    factor_coeffs = [float(factor_column[row, 0]) for row in range(int(steps))]
 
     if not all(math.isfinite(c) for c in factor_coeffs):
         raise ValueError("derived factor coefficients must be finite")
