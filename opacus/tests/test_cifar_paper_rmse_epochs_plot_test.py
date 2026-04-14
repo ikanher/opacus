@@ -136,7 +136,47 @@ def test_library_evaluates_normalized_paper_rmse_point(
     assert point.status == "computed"
     assert point.noise_multiplier == pytest.approx(6.0)
     assert point.paper_rmse == pytest.approx(6.0)
-    assert point.rmse_contract == "paper_normalized_prefix_workload_v1"
+    assert point.rmse_contract == "normalized_prefix_workload_v1"
+
+
+def test_library_uses_direct_inverse_family_rmse_path_for_bisr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        _LIB,
+        "_fixed_batch_base_sigma",
+        lambda *, target_epsilon, target_delta, backend: 2.0,
+    )
+    monkeypatch.setattr(
+        _LIB,
+        "_fixed_batch_sensitivity_for_family",
+        lambda *, scenario, family, epochs, bandwidth, bifr_frac: 3.0,
+    )
+    monkeypatch.setattr(
+        _LIB,
+        "_inverse_family_rmse_and_source",
+        lambda *, scenario, family, epochs, bandwidth, bifr_frac, noise_multiplier: (
+            7.0,
+            "direct_inverse_family_rmse_from_bisr_inv_coeffs",
+        ),
+    )
+
+    def _unexpected_strategy_matrix(**kwargs):
+        raise AssertionError("inverse-family RMSE should not reconstruct a strategy matrix")
+
+    monkeypatch.setattr(_LIB, "_strategy_matrix_and_source", _unexpected_strategy_matrix)
+    scenario = _LIB.CIFARFixedBatchScenario(dataset_size=1, batch_size=1)
+    point = _LIB.evaluate_fixed_batch_paper_rmse_point(
+        scenario=scenario,
+        family="BISR",
+        epochs=1,
+        backend="prv",
+        bandwidth=4,
+    )
+    assert point.status == "computed"
+    assert point.noise_multiplier == pytest.approx(6.0)
+    assert point.paper_rmse == pytest.approx(7.0)
+    assert point.matrix_source == "direct_inverse_family_rmse_from_bisr_inv_coeffs"
 
 
 def test_build_epoch_rmse_report_records_bifr_policy_and_omissions(
@@ -451,7 +491,7 @@ def test_write_plot_bundle_writes_manifest_and_outputs(tmp_path: Path) -> None:
             _PLOTTING.PlotSourceArtifact(
                 path="report.json",
                 kind="epoch_sweep_report",
-                contract="paper_normalized_prefix_workload_v1",
+                contract="normalized_prefix_workload_v1",
             )
         ],
         generator_entrypoint="plot.py",

@@ -19,6 +19,7 @@ from unittest import mock
 import torch
 
 from opacus.accountants.analysis.bnb import (
+    _build_balls_in_bins_modes_matrix,
     _assign_bnb_chunk_specs_to_shard,
     _make_bnb_broadcast_result_tensor,
     _reduce_bnb_llr_chunks_to_coordinator,
@@ -61,6 +62,33 @@ from opacus.accountants.analysis.bnb import (
 
 
 class BNBAnalysisTest(unittest.TestCase):
+    def test_build_balls_in_bins_modes_matrix_matches_explicit_periodic_shifts(self) -> None:
+        coeffs = [1.0, 0.375, 0.140625, 0.052734375]
+        cycle_length = 3
+        horizon = 10
+
+        actual = _build_balls_in_bins_modes_matrix(
+            coeffs=coeffs,
+            cycle_length=cycle_length,
+            horizon=horizon,
+        )
+
+        first_mode = torch.zeros(horizon, dtype=torch.float64)
+        coeff_t = torch.tensor(coeffs, dtype=torch.float64)
+        for offset in range(0, horizon, cycle_length):
+            take = min(len(coeffs), horizon - offset)
+            first_mode[offset : offset + take] += coeff_t[:take]
+
+        expected = torch.zeros((cycle_length, horizon), dtype=torch.float64)
+        for row in range(cycle_length):
+            expected[row, row:] = first_mode[: horizon - row]
+
+        self.assertTrue(torch.allclose(actual, expected))
+        self.assertAlmostEqual(float(actual[0, 0]), 1.0, places=12)
+        self.assertAlmostEqual(float(actual[0, 3]), float(expected[0, 3]), places=12)
+        self.assertAlmostEqual(float(actual[0, 6]), float(expected[0, 6]), places=12)
+        self.assertAlmostEqual(float(actual[0, 9]), float(expected[0, 9]), places=12)
+
     def test_resolve_bnb_distributed_mode_auto_selects_chunk_shard_for_dp_runtime(self) -> None:
         mode, auto_selected = _resolve_bnb_distributed_mode(
             distributed_mode=None,

@@ -7,6 +7,9 @@ import pytest
 from opacus.accountants.analysis.toeplitz_family import (
     InverseSideToeplitzFamily,
     ToeplitzMechanismFamily,
+    build_lower_toeplitz_matrix_from_coeffs,
+    compute_prefix_workload_normalized_rmse_from_inverse_coeffs,
+    compute_prefix_workload_normalized_rmse_from_matrix,
     compute_disjoint_toeplitz_mf_sensitivity,
 )
 
@@ -61,3 +64,25 @@ def test_inverse_side_family_numeric_fallback_recovers_lower_toeplitz_inverse() 
         source="bisr",
     )
     assert family.factor_coeffs() == pytest.approx([1.0, 0.25, 0.0625, 0.015625], abs=1e-12)
+
+
+def test_direct_inverse_family_rmse_matches_matrix_route_for_prefix_workload() -> None:
+    family = InverseSideToeplitzFamily(
+        inv_coeffs=[1.0, -0.25],
+        steps=4,
+        source="bisr",
+    )
+    matrix = build_lower_toeplitz_matrix_from_coeffs(
+        coeffs=family.factor_coeffs(),
+        steps=4,
+    )
+    direct_rmse = compute_prefix_workload_normalized_rmse_from_inverse_coeffs(
+        inv_coeffs=[1.0, -0.25],
+        steps=4,
+        noise_multiplier=2.0,
+    )
+    matrix_rmse = compute_prefix_workload_normalized_rmse_from_matrix(
+        c_matrix=matrix,
+        noise_multiplier=2.0,
+    )
+    assert direct_rmse == pytest.approx(matrix_rmse, abs=1e-12)

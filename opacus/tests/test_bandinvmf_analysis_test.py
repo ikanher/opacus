@@ -5,6 +5,7 @@ import math
 import pytest
 import torch
 
+import opacus.accountants.analysis.bandinvmf as _bandinvmf_module
 from opacus.accountants.analysis.bandinvmf import (
     derive_bandinvmf_amplified_accountant_coeffs_from_inv_coeffs,
     derive_bandinvmf_factor_coeffs_from_inv_coeffs,
@@ -125,6 +126,41 @@ def test_bandinvmf_optimization_handles_cifar_like_search_instability() -> None:
     assert all(math.isfinite(c) for c in runtime_coeffs)
     assert all(math.isfinite(c) for c in factor_coeffs)
     assert math.isfinite(obj)
+
+
+def test_bandinvmf_optimization_improves_no_momentum_no_decay_cifar_like_row() -> None:
+    init = generate_bandinvmf_init_inv_coeffs_from_sgd_workload(
+        bands=4,
+        momentum=0.0,
+        weight_decay=0.0,
+    )
+    init_obj = compute_bandinvmf_objective_from_inv_coeffs(
+        inv_coeffs=init,
+        steps=980,
+        max_participations=10,
+        min_separation=98,
+        momentum=0.0,
+        weight_decay=0.0,
+    )
+    coeffs = optimize_bandinvmf_inv_coeffs_for_sgd_workload(
+        bands=4,
+        steps=980,
+        max_participations=10,
+        min_separation=98,
+        momentum=0.0,
+        weight_decay=0.0,
+        optimizer_steps=20,
+    )
+    obj = compute_bandinvmf_objective_from_inv_coeffs(
+        inv_coeffs=coeffs,
+        steps=980,
+        max_participations=10,
+        min_separation=98,
+        momentum=0.0,
+        weight_decay=0.0,
+    )
+    assert obj < init_obj - 1e-6
+    assert coeffs != pytest.approx(init, rel=0.0, abs=1e-9)
 
 
 def test_bandinvmf_optimization_handles_pretrained_cifar100_amplified_row() -> None:
@@ -363,6 +399,26 @@ def test_bandinvmf_optimization_recovers_best_finite_candidate_when_final_candid
             weight_decay=0.9,
         )
     )
+
+
+def test_bandinvmf_runtime_coeff_derivation_converts_floating_point_failures_to_value_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_dot = _bandinvmf_module.np.dot
+
+    def _boom(*args, **kwargs):
+        del args, kwargs
+        raise FloatingPointError("synthetic overflow")
+
+    monkeypatch.setattr(_bandinvmf_module.np, "dot", _boom)
+
+    with pytest.raises(
+        ValueError,
+        match="BandInvMF Toeplitz inversion produced non-finite runtime coefficients",
+    ):
+        derive_bandinvmf_runtime_coeffs_from_inv_coeffs(inv_coeffs=[1.0, -0.5, 0.1])
+
+    monkeypatch.setattr(_bandinvmf_module.np, "dot", original_dot)
 
 
 @pytest.mark.parametrize(

@@ -1300,12 +1300,12 @@ def test_amplified_bifr_rows_use_real_bnb_path_and_preserve_selected_frac(
 ) -> None:
     original_resolve_row_paper_rmse = _MODULE._resolve_row_paper_rmse
 
-    def _fake_coeffs(method: str, bands: int, bifr_frac: float | None = None):
+    def _fake_coeffs(method: str, bands: int, bifr_frac: float | None = None, **kwargs):
         assert method == "BIFR"
         assert bifr_frac is not None
         return [1.0, float(bifr_frac)]
 
-    def _fake_accountant_coeffs(method: str, bands: int, bifr_frac: float | None = None):
+    def _fake_accountant_coeffs(method: str, bands: int, bifr_frac: float | None = None, **kwargs):
         assert method == "BIFR"
         assert bifr_frac is not None
         return ([1.0, float(bifr_frac)], "abs_factor_c_col")
@@ -1314,10 +1314,14 @@ def test_amplified_bifr_rows_use_real_bnb_path_and_preserve_selected_frac(
         coeffs = list(kwargs["coeffs"])
         return 10.0 - float(coeffs[1])
 
-    def _fake_paper_rmse(row):
+    def _fake_paper_rmse(row, **kwargs):
         frac = 0.0 if row.bifr_frac is None else float(row.bifr_frac)
         if row.method == "BIFR" and row.regime == "amplified":
-            return 20.0 - (10.0 * frac), None
+            return (
+                20.0 - (10.0 * frac),
+                "direct_inverse_family_rmse_from_bifr_inv_coeffs",
+                None,
+            )
         return original_resolve_row_paper_rmse(row)
 
     monkeypatch.setattr(_MODULE, "_method_amplified_coeffs", _fake_coeffs)
@@ -1347,6 +1351,26 @@ def test_amplified_bifr_rows_use_real_bnb_path_and_preserve_selected_frac(
     assert audit["balls_in_bins:p2"]["selected_paper_rmse"] == pytest.approx(10.0)
     assert [candidate["frac"] for candidate in audit["balls_in_bins:p2"]["candidates"]] == [0.0, 0.25, 0.5, 1.0]
 
+
+def test_bisr_amplified_accountant_coeffs_use_exact_factor_column() -> None:
+    workload = _MODULE._resolve_optimizer_workload(momentum=0.0, weight_decay=0.0)
+    accountant_coeffs, accountant_source = _MODULE._resolve_bisr_amplified_accountant_coeffs(
+        4,
+        optimizer_workload=workload,
+    )
+    inverse_coeffs = _MODULE.generate_bisr_coeffs_from_sgd_workload(
+        bands=4,
+        momentum=0.0,
+        weight_decay=0.0,
+    )
+    exact_factor_coeffs = _MODULE.derive_bisr_factor_coeffs_from_inverse_coeffs(
+        coeffs=inverse_coeffs,
+        steps=int(_MODULE.TOTAL_STEPS),
+    )
+
+    assert accountant_source == "abs_factor_c_col"
+    assert accountant_coeffs == pytest.approx([abs(float(c)) for c in exact_factor_coeffs])
+    assert len(accountant_coeffs) == len(exact_factor_coeffs)
 
 def test_amplified_cycle_endpoint_cyclic_rows_are_known_skips_not_unexpected(
     monkeypatch: pytest.MonkeyPatch,
@@ -2294,12 +2318,17 @@ def test_build_report_attaches_paper_rmse_and_missing_reasons(
 ) -> None:
     monkeypatch.setattr(
         _MODULE,
-        "_paper_rmse_matrix_for_method",
+        "_paper_rmse_direct_inverse_for_method",
         lambda method, bandwidth, bifr_frac: (
-            (_MODULE.torch.eye(4, dtype=_MODULE.torch.float64), "identity_prefix_workload")
+            ([1.0], "direct_inverse_family_rmse_from_bifr_inv_coeffs")
             if method == "BIFR"
-            else (None, "unsupported_blt_rmse_surface")
+            else (None, None)
         ),
+    )
+    monkeypatch.setattr(
+        _MODULE,
+        "compute_prefix_workload_normalized_rmse_from_inverse_coeffs",
+        lambda *, inv_coeffs, steps, noise_multiplier: float(noise_multiplier),
     )
     monkeypatch.setattr(
         _MODULE,
@@ -2336,6 +2365,10 @@ def test_build_report_attaches_paper_rmse_and_missing_reasons(
     assert len(blt_rows) == 1
     assert blt_rows[0]["blt_lambda"] == pytest.approx(0.6)
     assert all(row["paper_rmse"] is not None for row in bifr_rows)
+    assert all(
+        row["paper_rmse_source"] == "direct_inverse_family_rmse_from_bifr_inv_coeffs"
+        for row in bifr_rows
+    )
     assert all(row["paper_rmse_reason"] is None for row in bifr_rows)
     assert blt_rows[0]["paper_rmse"] is None
     assert blt_rows[0]["paper_rmse_reason"] == "unsupported_blt_rmse_surface"
@@ -2352,6 +2385,35 @@ def test_build_report_attaches_paper_rmse_and_missing_reasons(
     assert bifr_rmse["best_by_backend"]["prv"]["frac"] == pytest.approx(0.3)
     assert bifr_rmse["best_by_backend"]["rdp"]["frac"] == pytest.approx(0.3)
     assert report["summary"]["blt"].get("paper_rmse") is None
+
+
+def test_bandinvmf_direct_inverse_rmse_uses_requested_optimizer_workload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    workload = _MODULE.OptimizerWorkloadConfig(momentum=0.0, weight_decay=0.0)
+
+    def _fake_bandinvmf_inv_coeffs(*, bands, optimizer_workload):
+        captured["bands"] = bands
+        captured["optimizer_workload"] = optimizer_workload
+        return (1.0, -0.5)
+
+    monkeypatch.setattr(_MODULE, "_bandinvmf_inv_coeffs", _fake_bandinvmf_inv_coeffs)
+    _MODULE._paper_rmse_direct_inverse_for_method.cache_clear()
+    try:
+        coeffs, source = _MODULE._paper_rmse_direct_inverse_for_method(
+            "Band-Inv-MF",
+            4,
+            None,
+            optimizer_workload=workload,
+        )
+    finally:
+        _MODULE._paper_rmse_direct_inverse_for_method.cache_clear()
+
+    assert coeffs == [1.0, -0.5]
+    assert source == "direct_inverse_family_rmse_from_bandinvmf_inv_coeffs"
+    assert captured["bands"] == 4
+    assert captured["optimizer_workload"] == workload
 
 
 def test_resolve_row_paper_rmse_supports_amplified_blt_selected_pair() -> None:
@@ -2388,14 +2450,15 @@ def test_resolve_row_paper_rmse_supports_amplified_blt_selected_pair() -> None:
         ),
         steps=int(_MODULE.TOTAL_STEPS),
     )
-    expected_rmse = _MODULE.compute_prefix_workload_paper_rmse_from_matrix(
+    expected_rmse = _MODULE.compute_prefix_workload_normalized_rmse_from_matrix(
         c_matrix=expected_matrix,
         noise_multiplier=float(row.computed_noise_multiplier),
     )
 
-    paper_rmse, reason = _MODULE._resolve_row_paper_rmse(row)
+    paper_rmse, source, reason = _MODULE._resolve_row_paper_rmse(row)
     assert paper_rmse == pytest.approx(expected_rmse)
-    assert reason == "toeplitz_strategy_from_blt_amplified_raw_forward_c_col"
+    assert source == "toeplitz_strategy_from_blt_amplified_raw_forward_c_col"
+    assert reason is None
 
 
 def test_build_report_serializes_blt_row_as_nonpaper_reference(

@@ -207,7 +207,40 @@ def compute_prefix_workload_frobenius_sq_from_matrix(
     return float(torch.sum(ac_inv * ac_inv).item())
 
 
-def compute_prefix_workload_paper_mse_from_matrix(
+def compute_prefix_workload_frobenius_sq_from_inverse_coeffs(
+    *,
+    inv_coeffs: Iterable[float],
+    steps: int,
+) -> float:
+    """
+    Compute ``||A C^{-1}||_F^2`` for the prefix workload directly from the
+    Toeplitz coefficients of ``C^{-1}``.
+
+    For the prefix workload, the Toeplitz coefficients of ``A C^{-1}`` are the
+    prefix sums of the noising / inverse coefficients.
+    """
+    coeff_list = [float(c) for c in inv_coeffs]
+    if len(coeff_list) == 0:
+        raise ValueError("inv_coeffs must be non-empty")
+
+    if not all(math.isfinite(c) for c in coeff_list):
+        raise ValueError("inv_coeffs must be finite")
+
+    if steps < 1:
+        raise ValueError("steps must be >= 1")
+
+    running = 0.0
+    fro_sq = 0.0
+    visible = min(len(coeff_list), int(steps))
+    for idx in range(int(steps)):
+        if idx < visible:
+            running += coeff_list[idx]
+        fro_sq += float(int(steps) - idx) * running * running
+
+    return float(fro_sq)
+
+
+def compute_prefix_workload_normalized_mse_from_matrix(
     *,
     c_matrix: torch.Tensor,
     noise_multiplier: float,
@@ -227,17 +260,59 @@ def compute_prefix_workload_paper_mse_from_matrix(
     return float((sigma * sigma) * fro_sq / float(steps))
 
 
-def compute_prefix_workload_paper_rmse_from_matrix(
+def compute_prefix_workload_normalized_mse_from_inverse_coeffs(
+    *,
+    inv_coeffs: Iterable[float],
+    steps: int,
+    noise_multiplier: float,
+) -> float:
+    """
+    Compute the normalized paper MSE for the prefix workload directly from the
+    Toeplitz coefficients of ``C^{-1}``.
+    """
+    sigma = float(noise_multiplier)
+    if not math.isfinite(sigma) or sigma < 0.0:
+        raise ValueError("noise_multiplier must be finite and >= 0")
+
+    fro_sq = compute_prefix_workload_frobenius_sq_from_inverse_coeffs(
+        inv_coeffs=inv_coeffs,
+        steps=int(steps),
+    )
+    return float((sigma * sigma) * fro_sq / float(int(steps)))
+
+
+def compute_prefix_workload_normalized_rmse_from_matrix(
     *,
     c_matrix: torch.Tensor,
     noise_multiplier: float,
 ) -> float:
     """Compute the normalized paper RMSE for the prefix workload."""
-    mse = compute_prefix_workload_paper_mse_from_matrix(
+    mse = compute_prefix_workload_normalized_mse_from_matrix(
         c_matrix=c_matrix,
         noise_multiplier=noise_multiplier,
     )
     return float(math.sqrt(max(mse, 0.0)))
+
+
+def compute_prefix_workload_normalized_rmse_from_inverse_coeffs(
+    *,
+    inv_coeffs: Iterable[float],
+    steps: int,
+    noise_multiplier: float,
+) -> float:
+    """Compute the normalized paper RMSE from inverse / noising coefficients."""
+    mse = compute_prefix_workload_normalized_mse_from_inverse_coeffs(
+        inv_coeffs=inv_coeffs,
+        steps=int(steps),
+        noise_multiplier=noise_multiplier,
+    )
+    return float(math.sqrt(max(mse, 0.0)))
+
+
+compute_prefix_workload_paper_mse_from_matrix = compute_prefix_workload_normalized_mse_from_matrix
+compute_prefix_workload_paper_mse_from_inverse_coeffs = compute_prefix_workload_normalized_mse_from_inverse_coeffs
+compute_prefix_workload_paper_rmse_from_matrix = compute_prefix_workload_normalized_rmse_from_matrix
+compute_prefix_workload_paper_rmse_from_inverse_coeffs = compute_prefix_workload_normalized_rmse_from_inverse_coeffs
 
 
 # ---------------------------------------------------------------------------

@@ -1241,26 +1241,6 @@ def _build_balls_in_bins_modes_matrix(
     horizon: int,
     device: torch.device | str | None = None,
 ) -> torch.Tensor:
-
-    def _convolve_full_1d(lhs: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
-        out = torch.zeros(
-            lhs.numel() + rhs.numel() - 1, dtype=torch.float64, device=lhs.device
-        )
-        for idx in range(lhs.numel()):
-            out[idx : idx + rhs.numel()] += lhs[idx] * rhs
-
-        return out
-
-    def _toeplitz(c: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
-        rows = int(c.numel())
-        cols = int(r.numel())
-        out = torch.empty((rows, cols), dtype=torch.float64, device=c.device)
-        for i in range(rows):
-            for j in range(cols):
-                out[i, j] = r[j - i] if j >= i else c[i - j]
-
-        return out
-
     coeff_list = [float(c) for c in coeffs]
     if len(coeff_list) == 0:
         raise ValueError("coeffs must be a non-empty 1-D sequence")
@@ -1279,24 +1259,23 @@ def _build_balls_in_bins_modes_matrix(
 
     resolved_device = torch.device(device) if device is not None else torch.device("cpu")
     coeff_t = torch.tensor(coeff_list, dtype=torch.float64, device=resolved_device)
-    x_t = (torch.arange(horizon, device=resolved_device) % int(cycle_length) == 0).to(dtype=torch.float64)
-    first_mode = _convolve_full_1d(
-        coeff_t,
-        x_t[: horizon - coeff_t.numel() + 1],
+    first_mode = torch.zeros(int(horizon), dtype=torch.float64, device=resolved_device)
+    for offset in range(0, int(horizon), int(cycle_length)):
+        remaining = int(horizon) - int(offset)
+        take = min(int(coeff_t.numel()), remaining)
+        first_mode[offset : offset + take] += coeff_t[:take]
+
+    modes = torch.zeros(
+        (int(cycle_length), int(horizon)),
+        dtype=torch.float64,
+        device=resolved_device,
     )
+    for row in range(int(cycle_length)):
+        if row >= int(horizon):
+            break
+        modes[row, row:] = first_mode[: int(horizon) - row]
 
-    if len(coeff_list) > 1:
-        bot_block = _toeplitz(
-            coeff_t[:-1],
-            torch.zeros(coeff_t.numel() - 1, dtype=torch.float64, device=resolved_device),
-        )
-        bot_prod = torch.mv(bot_block, x_t[-coeff_t.numel() + 1 :])
-        first_mode[-coeff_t.numel() + 1 :] += bot_prod
-
-    elementary_vector = torch.zeros(int(cycle_length), dtype=torch.float64, device=resolved_device)
-    elementary_vector[0] = coeff_t[0]
-
-    return _toeplitz(elementary_vector, first_mode)
+    return modes
 
 
 def _generate_balls_in_bins_samples_chunk(

@@ -30,6 +30,7 @@ import warnings
 from typing import Iterable
 
 import numpy as np
+from scipy import optimize as scipy_optimize
 import torch
 
 from opacus.accountants.analysis.bisr import generate_bisr_coeffs_from_sgd_workload
@@ -101,8 +102,19 @@ def _toeplitz_inverse_coeffs(inv_coeffs: np.ndarray) -> np.ndarray:
     n = int(inv_coeffs.size)
     coef = np.zeros(n, dtype=np.float64)
     coef[0] = 1.0 / inv_coeffs[0]
-    for i in range(1, n):
-        coef[i] = -np.dot(coef[:i], inv_coeffs[i:0:-1]) / inv_coeffs[0]
+    try:
+        with np.errstate(over="raise", invalid="raise"):
+            for i in range(1, n):
+                coef[i] = -np.dot(coef[:i], inv_coeffs[i:0:-1]) / inv_coeffs[0]
+    except FloatingPointError as exc:
+        raise ValueError(
+            "BandInvMF Toeplitz inversion produced non-finite runtime coefficients"
+        ) from exc
+
+    if not np.all(np.isfinite(coef)):
+        raise ValueError(
+            "BandInvMF Toeplitz inversion produced non-finite runtime coefficients"
+        )
 
     return coef
 
@@ -348,6 +360,99 @@ def compute_bandinvmf_objective_from_inv_coeffs(
     return float(mean_error * (sensitivity**2))
 
 
+def _objective_value_or_inf(
+    *,
+    candidate: np.ndarray,
+    steps: int,
+    max_participations: int,
+    min_separation: int,
+    momentum: float,
+    weight_decay: float,
+) -> float:
+    try:
+        obj = compute_bandinvmf_objective_from_inv_coeffs(
+            inv_coeffs=candidate.tolist(),
+            steps=steps,
+            max_participations=max_participations,
+            min_separation=min_separation,
+            momentum=momentum,
+            weight_decay=weight_decay,
+        )
+    except (FloatingPointError, OverflowError, ValueError):
+        return math.inf
+
+    if not math.isfinite(obj):
+        return math.inf
+
+    return float(obj)
+
+
+def _powell_refine_candidate(
+    *,
+    candidate: np.ndarray,
+    steps: int,
+    max_participations: int,
+    min_separation: int,
+    momentum: float,
+    weight_decay: float,
+    max_iter: int,
+) -> tuple[np.ndarray, float] | None:
+    if candidate.size <= 1:
+        obj = _objective_value_or_inf(
+            candidate=candidate,
+            steps=steps,
+            max_participations=max_participations,
+            min_separation=min_separation,
+            momentum=momentum,
+            weight_decay=weight_decay,
+        )
+        if math.isfinite(obj):
+            return candidate.copy(), float(obj)
+        return None
+
+    x0 = np.asarray(candidate[1:], dtype=np.float64)
+
+    def _wrapped(v: np.ndarray) -> float:
+        full = np.concatenate(([1.0], np.asarray(v, dtype=np.float64)))
+        obj = _objective_value_or_inf(
+            candidate=full,
+            steps=steps,
+            max_participations=max_participations,
+            min_separation=min_separation,
+            momentum=momentum,
+            weight_decay=weight_decay,
+        )
+        return 1e300 if not math.isfinite(obj) else float(obj)
+
+    try:
+        result = scipy_optimize.minimize(
+            _wrapped,
+            x0,
+            method="Powell",
+            options={
+                "maxiter": int(max_iter),
+                "xtol": 1e-8,
+                "ftol": 1e-12,
+            },
+        )
+    except Exception:
+        return None
+
+    refined = np.concatenate(([1.0], np.asarray(result.x, dtype=np.float64)))
+    refined_obj = _objective_value_or_inf(
+        candidate=refined,
+        steps=steps,
+        max_participations=max_participations,
+        min_separation=min_separation,
+        momentum=momentum,
+        weight_decay=weight_decay,
+    )
+    if not np.all(np.isfinite(refined)) or not math.isfinite(refined_obj):
+        return None
+
+    return refined, float(refined_obj)
+
+
 def optimize_bandinvmf_inv_coeffs_for_sgd_workload(
     *,
     bands: int,
@@ -517,43 +622,53 @@ def optimize_bandinvmf_inv_coeffs_for_sgd_workload(
     except (FloatingPointError, OverflowError, ValueError):
         opt_obj = math.inf
 
+    current_opt = best_opt.copy()
+    current_obj = float(best_obj)
+    if np.all(np.isfinite(opt)) and math.isfinite(opt_obj) and opt_obj < current_obj - 1e-12:
+        current_opt = opt
+        current_obj = float(opt_obj)
+
+    refined = _powell_refine_candidate(
+        candidate=current_opt,
+        steps=steps,
+        max_participations=max_participations,
+        min_separation=min_separation,
+        momentum=beta,
+        weight_decay=alpha,
+        max_iter=max(200, 50 * (bands - 1)),
+    )
+    if refined is not None:
+        refined_opt, refined_obj = refined
+        if refined_obj < current_obj - 1e-12:
+            current_opt = refined_opt
+            current_obj = float(refined_obj)
+
+    if current_obj >= init_obj - 1e-12:
+        if not np.all(np.isfinite(opt)) or not math.isfinite(opt_obj):
+            warnings.warn(
+                "BandInvMF optimization produced a non-finite final candidate; "
+                "returning the finite initialization because no improving finite candidate was found",
+                UserWarning,
+            )
+        else:
+            warnings.warn(
+                "BandInvMF optimization did not improve over initialization; "
+                "returning the finite initialization",
+                UserWarning,
+            )
+        return [float(x) for x in init]
+
     if not np.all(np.isfinite(opt)) or not math.isfinite(opt_obj):
-        if np.all(np.isfinite(best_opt)) and math.isfinite(best_obj):
-            if best_obj < init_obj - 1e-12:
-                warnings.warn(
-                    "BandInvMF optimization produced a non-finite final candidate; "
-                    "returning the best earlier finite improving candidate",
-                    UserWarning,
-                )
-            else:
-                warnings.warn(
-                    "BandInvMF optimization produced a non-finite final candidate; "
-                    "returning the finite initialization because no improving finite candidate was found",
-                    UserWarning,
-                )
-            return [float(x) for x in best_opt]
-        raise RuntimeError(
+        warnings.warn(
             "BandInvMF optimization produced a non-finite final candidate; "
-            "and no finite candidate was found"
+            "returning the best finite refined candidate",
+            UserWarning,
         )
-    if opt_obj >= init_obj - 1e-12:
-        if np.all(np.isfinite(best_opt)) and math.isfinite(best_obj):
-            if best_obj < init_obj - 1e-12:
-                warnings.warn(
-                    "BandInvMF optimization did not finish with an improved final candidate; "
-                    "returning the best earlier finite improving candidate",
-                    UserWarning,
-                )
-            else:
-                warnings.warn(
-                    "BandInvMF optimization did not improve over initialization; "
-                    "returning the finite initialization",
-                    UserWarning,
-                )
-            return [float(x) for x in best_opt]
-        raise RuntimeError(
-            "BandInvMF optimization did not improve over initialization; "
-            "and no finite candidate was found"
+    elif current_obj < opt_obj - 1e-12:
+        warnings.warn(
+            "BandInvMF optimization improved after deterministic Powell refinement; "
+            "returning the refined finite candidate",
+            UserWarning,
         )
 
-    return [float(x) for x in opt]
+    return [float(x) for x in current_opt]
