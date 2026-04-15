@@ -30,14 +30,14 @@ sys.modules[_PLOT_SPEC.name] = _PLOT
 _PLOT_SPEC.loader.exec_module(_PLOT)
 
 
-def _fake_amplified_blt_plot_row(*, rank: int = 4, paper_rmse: float = 0.9) -> dict[str, object]:
+def _fake_amplified_blt_plot_row(*, buffers: int = 4, paper_rmse: float = 0.9) -> dict[str, object]:
     return {
         "regime": "amplified",
         "backend": "balls_in_bins",
         "method": "BLT",
         "status": "computed",
-        "bandwidth": rank,
-        "blt_rank": rank,
+        "bandwidth": buffers,
+        "blt_buffers": buffers,
         "blt_selection_mode": "optimizer_selected",
         "accounting_source": "opacus_blt_amplified_bnb_accountant_contract",
         "paper_rmse": paper_rmse,
@@ -157,7 +157,7 @@ def test_build_amplified_bnb_p_rmse_figure_data_uses_roles_and_baselines() -> No
                 "method": "BLT",
                 "status": "computed",
                 "bandwidth": 4,
-                "blt_rank": 4,
+                "blt_buffers": 4,
                 "paper_rmse": 0.9,
             },
             {
@@ -192,7 +192,7 @@ def test_build_amplified_bnb_p_rmse_report_requests_blt_as_comparison_line(
 
     def fake_build_report(**kwargs):
         captured.update(kwargs)
-        return {"metadata": {}, "rows": [_fake_amplified_blt_plot_row(rank=8)]}
+        return {"metadata": {}, "rows": [_fake_amplified_blt_plot_row(buffers=8)]}
 
     monkeypatch.setattr(_PLOT, "build_report", fake_build_report)
 
@@ -229,7 +229,7 @@ def test_build_amplified_bnb_p_rmse_report_does_not_import_jax_privacy(
                 accounting_noise_multiplier=0.75,
                 accounting_source="opacus_blt_amplified_bnb_accountant_contract",
                 blt_selection_mode="optimizer_selected",
-                blt_rank=4,
+                blt_buffers=4,
                 blt_selected_candidate_index=0,
                 blt_candidate_count=1,
                 blt_selected_theta=[0.8, 0.6, 0.4, 0.2],
@@ -305,7 +305,7 @@ def test_build_amplified_bnb_p_rmse_report_refreshes_only_requested_methods(
                 "method": "BLT",
                 "status": "computed",
                 "bandwidth": 4,
-                "blt_rank": 4,
+                "blt_buffers": 4,
                 "blt_selection_mode": "optimizer_selected",
                 "accounting_source": "opacus_blt_amplified_bnb_accountant_contract",
                 "paper_rmse": 0.9,
@@ -322,7 +322,7 @@ def test_build_amplified_bnb_p_rmse_report_refreshes_only_requested_methods(
                 "optimizer_momentum": kwargs["optimizer_momentum"],
                 "optimizer_weight_decay": kwargs["optimizer_weight_decay"],
             },
-            "rows": [_fake_amplified_blt_plot_row(rank=8, paper_rmse=0.7)],
+                "rows": [_fake_amplified_blt_plot_row(buffers=8, paper_rmse=0.7)],
         }
 
     monkeypatch.setattr(_PLOT, "build_report", fake_build_report)
@@ -339,7 +339,7 @@ def test_build_amplified_bnb_p_rmse_report_refreshes_only_requested_methods(
     assert any(row["method"] == "BSR" and row["paper_rmse"] == 1.25 for row in report["rows"])
     blt_rows = [row for row in report["rows"] if row["method"] == "BLT"]
     assert len(blt_rows) == 1
-    assert blt_rows[0]["blt_rank"] == 8
+    assert blt_rows[0]["blt_buffers"] == 8
     assert blt_rows[0]["paper_rmse"] == 0.7
     assert report["metadata"]["plot_comparison_contract"]["BLT"]["buffer_count"] == 8
 

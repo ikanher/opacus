@@ -47,15 +47,7 @@ __all__ = [
     "GaussianNoiseMechanism",
     "CorrelatedNoiseMechanism",
     "InverseBandNoiseMechanism",
-    "optimize_blt_fixed_batch",
 ]
-
-
-def optimize_blt_fixed_batch(*args, **kwargs):
-    # BLT search belongs in optimizers, but we keep package import time light.
-    from .blt_optimization import optimize_blt_fixed_batch as _impl
-
-    return _impl(*args, **kwargs)
 
 
 def get_optimizer_class(clipping: str, distributed: bool, grad_sample_mode: str = None):

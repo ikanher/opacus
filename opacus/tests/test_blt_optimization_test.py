@@ -4,7 +4,7 @@ import pytest
 
 from opacus.accountants.blt import BLTAccountant
 from opacus.mechanism_contracts import SamplingSemantics
-from opacus.optimizers.blt_optimization import optimize_blt_fixed_batch
+from opacus.accountants.blt_fixed_batch import optimize_blt_fixed_batch
 
 
 def test_optimize_blt_fixed_batch_returns_canonical_paired_runtime_state() -> None:
@@ -15,7 +15,7 @@ def test_optimize_blt_fixed_batch_returns_canonical_paired_runtime_state() -> No
         dataset_size=32,
         logical_batch_size=8,
         max_grad_norm=1.0,
-        rank=2,
+        buffers=2,
     )
 
     state = result.mechanism_state
@@ -59,7 +59,7 @@ def test_optimize_blt_fixed_batch_rejects_unsupported_sampling_contract() -> Non
             dataset_size=32,
             logical_batch_size=8,
             max_grad_norm=1.0,
-            rank=2,
+            buffers=2,
             sampling_semantics=SamplingSemantics(
                 sampling_mode="poisson",
                 privacy_metadata={},
@@ -75,7 +75,7 @@ def test_optimize_blt_fixed_batch_is_reproducible() -> None:
         dataset_size=32,
         logical_batch_size=8,
         max_grad_norm=1.0,
-        rank=2,
+        buffers=2,
     )
     result_a = optimize_blt_fixed_batch(**kwargs)
     result_b = optimize_blt_fixed_batch(**kwargs)

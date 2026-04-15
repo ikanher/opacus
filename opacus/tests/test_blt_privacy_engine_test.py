@@ -16,7 +16,7 @@ from opacus.accountants.analysis.blt import (
 from opacus.mechanism_contracts import SamplingSemantics
 from opacus.noise_mechanisms import BufferedToeplitzNoiseMechanism
 from opacus.optimizers import DistributedDPOptimizer
-from opacus.optimizers.blt_optimization import optimize_blt_fixed_batch
+from opacus.accountants.blt_fixed_batch import optimize_blt_fixed_batch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -74,7 +74,7 @@ def test_blt_canonical_exports_are_available() -> None:
         dataset_size=32,
         logical_batch_size=8,
         max_grad_norm=1.0,
-        rank=2,
+        buffers=2,
     )
     assert result.mechanism_state["noise_multiplier_ref"] > 0.0
 

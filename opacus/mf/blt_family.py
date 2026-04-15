@@ -20,7 +20,7 @@ from opacus.accountants.blt_inputs import (
     summarize_blt_report_surface as _summarize_blt_report_surface,
 )
 from opacus.mf.state import BLTFamilyState
-from opacus.optimizers.blt_optimization import optimize_blt_fixed_batch
+from opacus.accountants.blt_fixed_batch import optimize_blt_fixed_batch
 
 
 def _first_non_none(*values: Any) -> Any:

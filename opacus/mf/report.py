@@ -19,7 +19,7 @@ from opacus.accountants.blt_inputs import summarize_blt_report_surface
 from opacus.accountants.utils import get_noise_multiplier
 from opacus.mf.registry import get_mf_family_entry
 from opacus.mf.interfaces import SupportsCyclic
-from opacus.optimizers.blt_optimization import optimize_blt_fixed_batch
+from opacus.accountants.blt_fixed_batch import optimize_blt_fixed_batch
 
 
 BSRReportMethod = Literal["BSR", "BISR"]

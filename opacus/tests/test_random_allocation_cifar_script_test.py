@@ -216,7 +216,7 @@ def test_blt_amplified_diagnostic_row_is_added_only_when_requested() -> None:
 
     original = _MODULE._resolve_blt_amplified_accountant_coeffs
     _MODULE._resolve_blt_amplified_accountant_coeffs = (
-        lambda *, rank, blt_lambda: (
+        lambda *, buffers, blt_lambda: (
             [1.0] + [0.0] * (int(_MODULE.TOTAL_STEPS) - 1),
             "normalized_forward_c_col",
             {
@@ -249,17 +249,17 @@ def test_blt_amplified_diagnostic_row_is_added_only_when_requested() -> None:
         _MODULE._compute_bnb_noise_multiplier_for_coeffs = old_compute
 
     amplified_row = next(row for row in rows if row.method == "BLT" and row.regime == "amplified")
-    assert amplified_row.blt_rank == _MODULE.BLT_AMPLIFIED_DIAGNOSTIC_ROW.bandwidth
+    assert amplified_row.blt_buffers == _MODULE.BLT_AMPLIFIED_DIAGNOSTIC_ROW.bandwidth
     assert amplified_row.accounting_source == "opacus_blt_amplified_bnb_accountant_contract"
 
 
-def test_blt_amplified_row_uses_caller_supplied_rank(
+def test_blt_amplified_row_uses_caller_supplied_buffers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
 
-    def _fake_resolve_blt_amplified_accountant_coeffs(*, rank, blt_lambda):
-        captured["rank"] = int(rank)
+    def _fake_resolve_blt_amplified_accountant_coeffs(*, buffers, blt_lambda):
+        captured["buffers"] = int(buffers)
         return (
             [1.0] + [0.0] * (int(_MODULE.TOTAL_STEPS) - 1),
             "normalized_forward_c_col",
@@ -270,8 +270,8 @@ def test_blt_amplified_row_uses_caller_supplied_rank(
                 "blt_max_participations": 2,
                 "selected_candidate_index": 0,
                 "candidate_count": 1,
-                "selected_theta": [0.8] * int(rank),
-                "selected_theta_hat": [0.6] * int(rank),
+                "selected_theta": [0.8] * int(buffers),
+                "selected_theta_hat": [0.6] * int(buffers),
                 "lambda_anchor": blt_lambda,
             },
         )
@@ -295,16 +295,16 @@ def test_blt_amplified_row_uses_caller_supplied_rank(
     )
 
     amplified_row = next(row for row in rows if row.method == "BLT" and row.regime == "amplified")
-    assert captured["rank"] == 8
+    assert captured["buffers"] == 8
     assert amplified_row.bandwidth == 8
-    assert amplified_row.blt_rank == 8
+    assert amplified_row.blt_buffers == 8
 
 
 def test_resolve_blt_amplified_accountant_coeffs_uses_forward_c_col(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         _MODULE,
         "_compute_blt_fixed_batch_runtime_z_std",
-        lambda *, rank, blt_lambda=None: (
+        lambda *, buffers, blt_lambda=None: (
             0.5,
             {
                 "noise_multiplier_ref": 1.0,
@@ -320,7 +320,7 @@ def test_resolve_blt_amplified_accountant_coeffs_uses_forward_c_col(monkeypatch:
         ),
     )
     coeffs, source, meta = _MODULE._resolve_blt_amplified_accountant_coeffs(
-        rank=2,
+        buffers=2,
         blt_lambda=0.4,
     )
 
@@ -430,7 +430,7 @@ def test_non_amplified_blt_row_uses_nonpaper_fixed_batch_contract(
     monkeypatch.setattr(
         _MODULE,
         "_compute_blt_fixed_batch_runtime_z_std",
-        lambda *, rank, blt_lambda=None: (
+        lambda *, buffers, blt_lambda=None: (
             0.314 if blt_lambda is None else 0.3 + float(blt_lambda),
             {
                 "noise_multiplier_ref": 1.27,
@@ -460,7 +460,7 @@ def test_non_amplified_blt_row_uses_nonpaper_fixed_batch_contract(
     assert row.status == "computed"
     assert row.blt_lambda is None
     assert row.blt_selection_mode == "optimizer_selected"
-    assert row.blt_rank == 2
+    assert row.blt_buffers == 2
     assert row.blt_selected_candidate_index == 0
     assert row.blt_candidate_count == 3
     assert row.blt_selected_theta == [0.8, 0.3]
@@ -482,7 +482,7 @@ def test_non_amplified_blt_rows_honor_explicit_lambda_override(
     monkeypatch.setattr(
         _MODULE,
         "_compute_blt_fixed_batch_runtime_z_std",
-        lambda *, rank, blt_lambda=None: (
+        lambda *, buffers, blt_lambda=None: (
             0.3 + float(blt_lambda),
             {
                 "noise_multiplier_ref": 1.27 + float(blt_lambda),
@@ -756,7 +756,7 @@ def test_print_summary_calls_out_blt_diagnostic(capsys: pytest.CaptureFixture[st
             },
             "blt": {
                 "selection_modes": ["optimizer_selected"],
-                "ranks": [2],
+                "buffers": [2],
                 "rows": [],
                 "paper_rmse": {
                     "best_by_backend": {
@@ -775,7 +775,7 @@ def test_print_summary_calls_out_blt_diagnostic(capsys: pytest.CaptureFixture[st
                     "method": "BLT",
                     "backend": "blt",
                     "blt_selection_mode": "optimizer_selected",
-                    "blt_rank": 2,
+                    "blt_buffers": 2,
                     "status": "computed",
                 "parity_status": "computed_close",
                 "paper_noise_multiplier": None,
@@ -793,7 +793,7 @@ def test_print_summary_calls_out_blt_diagnostic(capsys: pytest.CaptureFixture[st
 
     out = capsys.readouterr().out
     assert "Methods in report: BLT" in out
-    assert "BLT selection: policy=optimizer_selected_default_v1 modes=optimizer_selected ranks=2" in out
+    assert "BLT selection: policy=optimizer_selected_default_v1 modes=optimizer_selected buffers=2" in out
     assert "Paper RMSE family decisions: BLT" in out
     assert "BLT paper RMSE best: blt:lambda=0.4@rmse=0.8125" in out
     assert "Baseline semantics: cyclic_poisson = reduced sampled-Gaussian baseline" in out
@@ -825,7 +825,7 @@ def test_print_summary_surfaces_param_column_and_amplified_first(
             "row_count": 2,
             "paper_rmse": {"computed_rows": 0, "missing_rows": 2, "row_count": 2},
             "best_paper_rmse_by_family": {},
-            "blt": {"selection_modes": ["optimizer_selected"], "ranks": [2]},
+            "blt": {"selection_modes": ["optimizer_selected"], "buffers": [2]},
         },
         "rows": [
             {
@@ -833,7 +833,7 @@ def test_print_summary_surfaces_param_column_and_amplified_first(
                 "method": "BLT",
                 "backend": "blt",
                 "blt_selection_mode": "optimizer_selected",
-                "blt_rank": 2,
+                "blt_buffers": 2,
                 "bifr_frac": None,
                 "status": "computed",
                 "parity_status": "non_paper_diagnostic",
@@ -850,7 +850,7 @@ def test_print_summary_surfaces_param_column_and_amplified_first(
                 "method": "BLT",
                 "backend": "balls_in_bins",
                 "blt_selection_mode": "optimizer_selected",
-                "blt_rank": 2,
+                "blt_buffers": 2,
                 "bifr_frac": None,
                 "status": "computed",
                 "parity_status": "non_paper_diagnostic",
@@ -869,7 +869,7 @@ def test_print_summary_surfaces_param_column_and_amplified_first(
 
     out = capsys.readouterr().out
     assert "param" in out
-    assert "rank=2" in out
+    assert "buffers=2" in out
     amplified_idx = out.index("amplified       BLT")
     non_amplified_idx = out.index("non-amplified   BLT")
     assert amplified_idx < non_amplified_idx
@@ -1550,7 +1550,7 @@ def test_blt_runtime_helper_delegates_to_mf_report_service(
         ),
     )
 
-    sigma, meta = _MODULE._compute_blt_fixed_batch_runtime_z_std(rank=2)
+    sigma, meta = _MODULE._compute_blt_fixed_batch_runtime_z_std(buffers=2)
 
     assert sigma == pytest.approx(0.314)
     assert meta["noise_multiplier_ref"] == pytest.approx(1.27)
@@ -2339,7 +2339,7 @@ def test_build_report_attaches_paper_rmse_and_missing_reasons(
     monkeypatch.setattr(
         _MODULE,
         "_compute_blt_fixed_batch_runtime_z_std",
-        lambda *, rank, blt_lambda=None: (
+        lambda *, buffers, blt_lambda=None: (
             0.314 if blt_lambda is None else 0.3 + float(blt_lambda),
             {"noise_multiplier_ref": 1.27, "blt_horizon": 8, "blt_min_separation": 4,
              "blt_max_participations": 2, "selected_candidate_index": 0, "candidate_count": 1,
@@ -2427,7 +2427,7 @@ def test_resolve_row_paper_rmse_supports_amplified_blt_selected_pair() -> None:
         sensitivity=1.0,
         reason_code="computed_bnb_accountant_blt_forward_c_col",
         blt_selection_mode="optimizer_selected",
-        blt_rank=_MODULE.BLT_AMPLIFIED_DIAGNOSTIC_ROW.bandwidth,
+        blt_buffers=_MODULE.BLT_AMPLIFIED_DIAGNOSTIC_ROW.bandwidth,
         blt_selected_candidate_index=0,
         blt_candidate_count=1,
         blt_selected_theta=theta,
@@ -2467,7 +2467,7 @@ def test_build_report_serializes_blt_row_as_nonpaper_reference(
     monkeypatch.setattr(
         _MODULE,
         "_compute_blt_fixed_batch_runtime_z_std",
-        lambda *, rank, blt_lambda=None: (
+        lambda *, buffers, blt_lambda=None: (
             0.314 if blt_lambda is None else 0.3 + float(blt_lambda),
             {
                 "noise_multiplier_ref": 1.27,
@@ -2495,7 +2495,7 @@ def test_build_report_serializes_blt_row_as_nonpaper_reference(
     assert row["method"] == "BLT"
     assert row["blt_lambda"] is None
     assert row["blt_selection_mode"] == "optimizer_selected"
-    assert row["blt_rank"] == 2
+    assert row["blt_buffers"] == 2
     assert row["blt_selected_candidate_index"] == 0
     assert row["blt_candidate_count"] == 3
     assert row["blt_selected_theta"] == [0.8, 0.3]

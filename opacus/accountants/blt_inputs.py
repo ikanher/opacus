@@ -31,7 +31,7 @@ from opacus.accountants.bnb_inputs import (
     resolve_canonical_bnb_cycle_length,
 )
 from opacus.mechanism_contracts import SamplingSemantics
-from opacus.optimizers.blt_optimization import (
+from opacus.accountants.blt_fixed_batch import (
     generate_blt_theta_pair_candidates,
     optimize_blt_fixed_batch,
 )

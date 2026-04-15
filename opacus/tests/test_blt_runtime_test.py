@@ -134,11 +134,11 @@ def test_resolve_blt_workload_mechanism_state_fixed_batch_avoids_lambda_surface(
             sampling_mode="torch_sampler",
             privacy_metadata={},
         ),
-        rank=2,
+        buffers=2,
         noise_multiplier_ref=1.5,
     )
 
-    assert state["blt_rank"] == 2
+    assert state["blt_buffers"] == 2
     assert state["blt_selection_mode"] == "implicit_workload_default"
     assert state["blt_horizon"] == 8
     assert state["blt_min_separation"] == 4
@@ -158,11 +158,11 @@ def test_resolve_blt_workload_mechanism_state_bnb_contract_uses_sampling_semanti
             sampling_mode="balls_in_bins",
             privacy_metadata={"bins": 4},
         ),
-        rank=2,
+        buffers=2,
         noise_multiplier_ref=1.25,
     )
 
-    assert state["blt_rank"] == 2
+    assert state["blt_buffers"] == 2
     assert state["blt_horizon"] == 8
     assert state["blt_selection_mode"] == "implicit_workload_default"
     assert state["noise_multiplier_ref"] == pytest.approx(1.25)
