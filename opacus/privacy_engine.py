@@ -3096,6 +3096,27 @@ class PrivacyEngine:
                 correlated_denominator=float(correlated_denominator),
             )
 
+        query_runtime_context = {
+            "dataset_size": len(data_loader.dataset),
+            "logical_batch_size": (
+                int(data_loader.batch_size) if data_loader.batch_size is not None else 0
+            ),
+            "loss_reduction": loss_reduction,
+            "max_grad_norm": max_grad_norm,
+            "total_steps": int(total_steps) if total_steps is not None else None,
+        }
+        mechanism_config = self._augment_mf_query_mechanism_config(
+            mechanism_config=mechanism_config,
+            local_sampling_semantics=local_sampling_semantics,
+            total_steps=total_steps,
+            epochs=epochs,
+            poisson_sampling=poisson_sampling,
+            data_loader=data_loader,
+            kwargs=kwargs,
+            optimizer=optimizer,
+            query_runtime_context=query_runtime_context,
+        )
+
         bnb_c_matrix, bnb_bands, bnb_cycle_length, _ = self._resolve_bnb_runtime_inputs_for_epsilon(
             mechanism_config=mechanism_config,
             sampling_semantics=local_sampling_semantics,
@@ -3181,15 +3202,7 @@ class PrivacyEngine:
             data_loader=data_loader,
             kwargs=kwargs,
             optimizer=optimizer,
-            query_runtime_context={
-                "dataset_size": len(data_loader.dataset),
-                "logical_batch_size": (
-                    int(data_loader.batch_size) if data_loader.batch_size is not None else 0
-                ),
-                "loss_reduction": loss_reduction,
-                "max_grad_norm": max_grad_norm,
-                "total_steps": int(total_steps) if total_steps is not None else None,
-            },
+            query_runtime_context=query_runtime_context,
         )
 
         bnb_calibration_report = self._build_bnb_calibration_report(

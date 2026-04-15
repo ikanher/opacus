@@ -264,6 +264,61 @@ def test_make_private_with_epsilon_supports_fixed_batch_blt() -> None:
     assert torch.isfinite(torch.tensor(eps))
 
 
+def test_make_private_with_epsilon_supports_blt_balls_in_bins_bnb_accountant(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_get_noise_multiplier(**kwargs):
+        captured.update(kwargs)
+        return 1.25
+
+    monkeypatch.setattr(pe_mod, "get_noise_multiplier", _fake_get_noise_multiplier)
+
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    pe = PrivacyEngine()
+
+    private_model, dp_optimizer, private_loader = pe.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        target_epsilon=4.0,
+        target_delta=1e-5,
+        total_steps=8,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 8},
+        ),
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="blt",
+            accounting_mode="bnb_accountant",
+            mechanism_state={
+                "theta": [0.8],
+                "theta_hat": [0.6],
+                "z_std": 0.03,
+                "blt_min_separation": 4,
+                "blt_horizon": 12,
+            },
+        ),
+        bnb_num_samples=32,
+    )
+
+    assert isinstance(dp_optimizer.noise_mechanism, BufferedToeplitzNoiseMechanism)
+    assert pe.accountant.mechanism() == "bnb"
+    assert captured["accountant"] == "bnb"
+    mechanism_state = captured["mechanism_state"]
+    assert mechanism_state["blt_min_separation"] == 4
+    assert mechanism_state["blt_horizon"] == 12
+    assert captured["sampling_semantics"].sampling_mode == "balls_in_bins"
+    final_state = pe.noise_mechanism_config.mechanism_state
+    assert final_state["bnb_c_matrix"] is not None
+    assert final_state["bnb_c_matrix_contract"] is not None
+    assert final_state["bnb_bands"] == 4
+
+    _run_pre_step(private_model, dp_optimizer, next(iter(private_loader)))
+
+
 def test_make_private_with_epsilon_rejects_unsupported_blt_coefficient_regime() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
