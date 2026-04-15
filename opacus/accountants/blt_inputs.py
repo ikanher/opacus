@@ -82,7 +82,7 @@ def _canonical_state_from_pair(
             "omega": [float(x) for x in inverse.omega_array()],
         },
         "z_std": float(z_std),
-        "_blt_distributed_policy": "single_process_only",
+        "_blt_distributed_policy": "ddp_flat_only",
         "_blt_distributed_runtime": False,
     }
 

@@ -69,9 +69,7 @@ def summarize_blt_runtime_state(runtime_state: Mapping[str, Any]) -> dict[str, A
         "forward_theta_len": len(state.get("forward", {}).get("theta", [])),
         "inverse_theta_len": len(state.get("inverse", {}).get("theta", [])),
         "has_noise_multiplier_ref": state.get("noise_multiplier_ref") is not None,
-        "distributed_policy": state.get(
-            "_blt_distributed_policy", "single_process_only"
-        ),
+        "distributed_policy": state.get("_blt_distributed_policy", "ddp_flat_only"),
         "distributed_runtime": bool(
             state.get("_blt_distributed_runtime", False)
         ),

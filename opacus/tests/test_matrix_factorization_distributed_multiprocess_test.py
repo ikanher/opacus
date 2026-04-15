@@ -27,7 +27,7 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 from opacus import NoiseMechanismConfig, PrivacyEngine
 from opacus.mechanism_contracts import SamplingSemantics
-from opacus.optimizers import CorrelatedNoiseMechanism
+from opacus.optimizers import CorrelatedNoiseMechanism, InverseBandNoiseMechanism
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, TensorDataset
@@ -120,12 +120,165 @@ def _worker_one_step_smoke(
             clipping="flat",
             grad_sample_mode="hooks",
             noise_generator=noise_gen,
-            noise_mechanism=CorrelatedNoiseMechanism(coeffs=[1.0, 0.25], z_std=0.05),
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bsr",
+                accounting_mode="bsr_accountant",
+                mechanism_state={"coeffs": [1.0, 0.25], "z_std": 0.05},
+            ),
         )
 
         grad = _run_step(private_model, dp_optimizer, next(iter(private_loader)))
         finite = bool(torch.isfinite(grad).all())
         torch.save({"rank": rank, "ok": finite}, Path(results_dir) / f"result_{rank}.pt")
+    finally:
+        dist.destroy_process_group()
+
+
+def _worker_one_step_blt_smoke(
+    rank: int,
+    world_size: int,
+    init_method: str,
+    results_dir: str,
+) -> None:
+    _set_rank_env(rank, world_size)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        model = DDP(nn.Linear(4, 3))
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+        pe = PrivacyEngine()
+        noise_gen = torch.Generator().manual_seed(123)
+        loader = _loader()
+
+        private_model, dp_optimizer, private_loader = pe.make_private(
+            module=model,
+            optimizer=optimizer,
+            data_loader=loader,
+            noise_multiplier=0.0,
+            max_grad_norm=1.0,
+            poisson_sampling=False,
+            clipping="flat",
+            grad_sample_mode="hooks",
+            noise_generator=noise_gen,
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="torch_sampler",
+                privacy_metadata={},
+            ),
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="blt",
+                accounting_mode="standard_step_accountant",
+                mechanism_state={
+                    "theta": [0.8, 0.3],
+                    "theta_hat": [0.6, 0.1],
+                    "z_std": 0.03,
+                    "blt_max_participations": 2,
+                    "blt_min_separation": 4,
+                    "blt_horizon": 8,
+                },
+            ),
+        )
+
+        grad = _run_step(private_model, dp_optimizer, next(iter(private_loader)))
+        finite = bool(torch.isfinite(grad).all())
+        torch.save({"rank": rank, "ok": finite}, Path(results_dir) / f"result_{rank}.pt")
+    finally:
+        dist.destroy_process_group()
+
+
+def _worker_one_step_blt_matches_single_process_reference(
+    rank: int,
+    world_size: int,
+    init_method: str,
+    results_dir: str,
+) -> None:
+    _set_rank_env(rank, world_size)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        torch.manual_seed(20260415)
+        base = nn.Linear(4, 3)
+        ref_model = copy.deepcopy(base)
+        ddp_model = DDP(copy.deepcopy(base))
+
+        ref_opt = torch.optim.SGD(ref_model.parameters(), lr=0.05)
+        ddp_opt = torch.optim.SGD(ddp_model.parameters(), lr=0.05)
+
+        pe_ref = PrivacyEngine()
+        pe_ddp = PrivacyEngine()
+
+        loader_ref = _loader()
+        loader_ddp = _loader()
+
+        gen_ref = torch.Generator().manual_seed(4242)
+        gen_ddp = torch.Generator().manual_seed(4242)
+
+        common_state = {
+            "theta": [0.8, 0.3],
+            "theta_hat": [0.6, 0.1],
+            "z_std": 0.03,
+            "blt_max_participations": 2,
+            "blt_min_separation": 4,
+            "blt_horizon": 8,
+        }
+
+        ref_model, ref_dp_opt, ref_loader = pe_ref.make_private(
+            module=ref_model,
+            optimizer=ref_opt,
+            data_loader=loader_ref,
+            noise_multiplier=0.0,
+            max_grad_norm=1.0,
+            poisson_sampling=False,
+            clipping="flat",
+            grad_sample_mode="hooks",
+            noise_generator=gen_ref,
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="torch_sampler",
+                privacy_metadata={},
+            ),
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="blt",
+                accounting_mode="standard_step_accountant",
+                mechanism_state=copy.deepcopy(common_state),
+            ),
+        )
+        ddp_model, ddp_dp_opt, ddp_loader = pe_ddp.make_private(
+            module=ddp_model,
+            optimizer=ddp_opt,
+            data_loader=loader_ddp,
+            noise_multiplier=0.0,
+            max_grad_norm=1.0,
+            poisson_sampling=False,
+            clipping="flat",
+            grad_sample_mode="hooks",
+            noise_generator=gen_ddp,
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="torch_sampler",
+                privacy_metadata={},
+            ),
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="blt",
+                accounting_mode="standard_step_accountant",
+                mechanism_state=copy.deepcopy(common_state),
+            ),
+        )
+
+        ref_grad = _run_step(ref_model, ref_dp_opt, next(iter(ref_loader)))
+        ddp_grad = _run_step(ddp_model, ddp_dp_opt, next(iter(ddp_loader)))
+        torch.save(
+            {
+                "rank": rank,
+                "ok": bool(torch.allclose(ref_grad, ddp_grad, atol=1e-7, rtol=1e-6)),
+            },
+            Path(results_dir) / f"result_{rank}.pt",
+        )
     finally:
         dist.destroy_process_group()
 
@@ -179,8 +332,10 @@ def _worker_resume_parity(
             clipping="flat",
             grad_sample_mode="hooks",
             noise_generator=ref_gen,
-            noise_mechanism=CorrelatedNoiseMechanism(
-                coeffs=[1.1, 0.3, -0.2], z_std=0.03
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bsr",
+                accounting_mode="bsr_accountant",
+                mechanism_state={"coeffs": [1.1, 0.3, -0.2], "z_std": 0.03},
             ),
         )
         resume_model, resume_dp_opt, _ = pe_resume.make_private(
@@ -193,8 +348,10 @@ def _worker_resume_parity(
             clipping="flat",
             grad_sample_mode="hooks",
             noise_generator=resume_gen,
-            noise_mechanism=CorrelatedNoiseMechanism(
-                coeffs=[1.1, 0.3, -0.2], z_std=0.03
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bsr",
+                accounting_mode="bsr_accountant",
+                mechanism_state={"coeffs": [1.1, 0.3, -0.2], "z_std": 0.03},
             ),
         )
         load_model, load_dp_opt, _ = pe_load.make_private(
@@ -207,9 +364,125 @@ def _worker_resume_parity(
             clipping="flat",
             grad_sample_mode="hooks",
             noise_generator=load_gen,
-            noise_mechanism=CorrelatedNoiseMechanism(
-                coeffs=[1.1, 0.3, -0.2], z_std=0.03
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bsr",
+                accounting_mode="bsr_accountant",
+                mechanism_state={"coeffs": [1.1, 0.3, -0.2], "z_std": 0.03},
             ),
+        )
+
+        for i in (0, 1):
+            _run_step(ref_model, ref_dp_opt, batches_ref[i])
+            _run_step(resume_model, resume_dp_opt, batches_resume[i])
+
+        if rank == 0:
+            pe_resume.save_checkpoint(
+                path=checkpoint_path,
+                module=resume_model,
+                optimizer=resume_dp_opt,
+            )
+        dist.barrier()
+        pe_load.load_checkpoint(
+            path=checkpoint_path, module=load_model, optimizer=load_dp_opt
+        )
+
+        ref_grad = _run_step(ref_model, ref_dp_opt, batches_ref[2])
+        load_grad = _run_step(load_model, load_dp_opt, batches_load[2])
+        torch.save(
+            {
+                "rank": rank,
+                "ok": bool(torch.allclose(ref_grad, load_grad, atol=1e-7, rtol=1e-6)),
+            },
+            Path(results_dir) / f"result_{rank}.pt",
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def _worker_resume_parity_blt(
+    rank: int,
+    world_size: int,
+    init_method: str,
+    checkpoint_path: str,
+    results_dir: str,
+) -> None:
+    _set_rank_env(rank, world_size)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        base = nn.Linear(4, 3)
+        ref_model = DDP(copy.deepcopy(base))
+        resume_model = DDP(copy.deepcopy(base))
+        load_model = DDP(copy.deepcopy(base))
+
+        ref_opt = torch.optim.SGD(ref_model.parameters(), lr=0.05)
+        resume_opt = torch.optim.SGD(resume_model.parameters(), lr=0.05)
+        load_opt = torch.optim.SGD(load_model.parameters(), lr=0.05)
+
+        pe_ref = PrivacyEngine()
+        pe_resume = PrivacyEngine()
+        pe_load = PrivacyEngine()
+
+        loader_ref = _loader()
+        loader_resume = _loader()
+        loader_load = _loader()
+        batches_ref = list(loader_ref)
+        batches_resume = list(loader_resume)
+        batches_load = list(loader_load)
+
+        ref_gen = torch.Generator().manual_seed(321)
+        resume_gen = torch.Generator().manual_seed(321)
+        load_gen = torch.Generator().manual_seed(999)
+
+        common_kwargs = dict(
+            noise_multiplier=0.0,
+            max_grad_norm=1.0,
+            poisson_sampling=False,
+            clipping="flat",
+            grad_sample_mode="hooks",
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="blt",
+                accounting_mode="standard_step_accountant",
+                mechanism_state={
+                    "theta": [0.8, 0.3],
+                    "theta_hat": [0.6, 0.1],
+                    "z_std": 0.03,
+                    "blt_max_participations": 2,
+                    "blt_min_separation": 4,
+                    "blt_horizon": 8,
+                },
+            ),
+            sampling_semantics=SamplingSemantics(
+                sampling_mode="torch_sampler",
+                privacy_metadata={},
+            ),
+            total_steps=8,
+        )
+
+        ref_model, ref_dp_opt, _ = pe_ref.make_private(
+            module=ref_model,
+            optimizer=ref_opt,
+            data_loader=loader_ref,
+            noise_generator=ref_gen,
+            **common_kwargs,
+        )
+        resume_model, resume_dp_opt, _ = pe_resume.make_private(
+            module=resume_model,
+            optimizer=resume_opt,
+            data_loader=loader_resume,
+            noise_generator=resume_gen,
+            **common_kwargs,
+        )
+        load_model, load_dp_opt, _ = pe_load.make_private(
+            module=load_model,
+            optimizer=load_opt,
+            data_loader=loader_load,
+            noise_generator=load_gen,
+            **common_kwargs,
         )
 
         for i in (0, 1):
@@ -287,7 +560,7 @@ def _worker_resume_parity_bnb(
             grad_sample_mode="hooks",
             sampling_semantics=SamplingSemantics(
                 sampling_mode="b_min_sep",
-                privacy_metadata={"bands": 2},
+                privacy_metadata={"b": 2, "p": 0.25},
             ),
             noise_mechanism_config=NoiseMechanismConfig(
                 mechanism="gaussian",
@@ -377,7 +650,7 @@ def _worker_one_step_bnb_smoke(
             noise_generator=noise_gen,
             sampling_semantics=SamplingSemantics(
                 sampling_mode="b_min_sep",
-                privacy_metadata={"bands": 2},
+                privacy_metadata={"b": 2, "p": 0.25},
             ),
             noise_mechanism_config=NoiseMechanismConfig(
                 mechanism="gaussian",
@@ -388,6 +661,156 @@ def _worker_one_step_bnb_smoke(
         grad = _run_step(private_model, dp_optimizer, next(iter(private_loader)))
         finite = bool(torch.isfinite(grad).all())
         torch.save({"rank": rank, "ok": finite}, Path(results_dir) / f"result_{rank}.pt")
+    finally:
+        dist.destroy_process_group()
+
+
+def _worker_one_step_explicit_correlated_matches_single_process_reference(
+    rank: int,
+    world_size: int,
+    init_method: str,
+    results_dir: str,
+) -> None:
+    _set_rank_env(rank, world_size)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        torch.manual_seed(20260416)
+        base = nn.Linear(4, 3)
+        ref_model = copy.deepcopy(base)
+        ddp_model = DDP(copy.deepcopy(base))
+
+        ref_opt = torch.optim.SGD(ref_model.parameters(), lr=0.05)
+        ddp_opt = torch.optim.SGD(ddp_model.parameters(), lr=0.05)
+
+        pe_ref = PrivacyEngine()
+        pe_ddp = PrivacyEngine()
+
+        loader_ref = _loader()
+        loader_ddp = _loader()
+
+        gen_ref = torch.Generator().manual_seed(5151)
+        gen_ddp = torch.Generator().manual_seed(5151)
+
+        ref_model, ref_dp_opt, ref_loader = pe_ref.make_private(
+            module=ref_model,
+            optimizer=ref_opt,
+            data_loader=loader_ref,
+            noise_multiplier=0.0,
+            max_grad_norm=1.0,
+            poisson_sampling=False,
+            clipping="flat",
+            grad_sample_mode="hooks",
+            noise_generator=gen_ref,
+            noise_mechanism=CorrelatedNoiseMechanism(
+                coeffs=[1.0, 0.25],
+                z_std=0.05,
+            ),
+        )
+        ddp_model, ddp_dp_opt, ddp_loader = pe_ddp.make_private(
+            module=ddp_model,
+            optimizer=ddp_opt,
+            data_loader=loader_ddp,
+            noise_multiplier=0.0,
+            max_grad_norm=1.0,
+            poisson_sampling=False,
+            clipping="flat",
+            grad_sample_mode="hooks",
+            noise_generator=gen_ddp,
+            noise_mechanism=CorrelatedNoiseMechanism(
+                coeffs=[1.0, 0.25],
+                z_std=0.05,
+            ),
+        )
+
+        ref_grad = _run_step(ref_model, ref_dp_opt, next(iter(ref_loader)))
+        ddp_grad = _run_step(ddp_model, ddp_dp_opt, next(iter(ddp_loader)))
+        torch.save(
+            {
+                "rank": rank,
+                "ok": bool(torch.allclose(ref_grad, ddp_grad, atol=1e-7, rtol=1e-6)),
+            },
+            Path(results_dir) / f"result_{rank}.pt",
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+def _worker_one_step_explicit_inverse_band_matches_single_process_reference(
+    rank: int,
+    world_size: int,
+    init_method: str,
+    results_dir: str,
+) -> None:
+    _set_rank_env(rank, world_size)
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        torch.manual_seed(20260417)
+        base = nn.Linear(4, 3)
+        ref_model = copy.deepcopy(base)
+        ddp_model = DDP(copy.deepcopy(base))
+
+        ref_opt = torch.optim.SGD(ref_model.parameters(), lr=0.05)
+        ddp_opt = torch.optim.SGD(ddp_model.parameters(), lr=0.05)
+
+        pe_ref = PrivacyEngine()
+        pe_ddp = PrivacyEngine()
+
+        loader_ref = _loader()
+        loader_ddp = _loader()
+
+        gen_ref = torch.Generator().manual_seed(5252)
+        gen_ddp = torch.Generator().manual_seed(5252)
+
+        ref_model, ref_dp_opt, ref_loader = pe_ref.make_private(
+            module=ref_model,
+            optimizer=ref_opt,
+            data_loader=loader_ref,
+            noise_multiplier=0.0,
+            max_grad_norm=1.0,
+            poisson_sampling=False,
+            clipping="flat",
+            grad_sample_mode="hooks",
+            noise_generator=gen_ref,
+            noise_mechanism=InverseBandNoiseMechanism(
+                inverse_coeffs=[1.0, 0.25],
+                z_std=0.05,
+            ),
+        )
+        ddp_model, ddp_dp_opt, ddp_loader = pe_ddp.make_private(
+            module=ddp_model,
+            optimizer=ddp_opt,
+            data_loader=loader_ddp,
+            noise_multiplier=0.0,
+            max_grad_norm=1.0,
+            poisson_sampling=False,
+            clipping="flat",
+            grad_sample_mode="hooks",
+            noise_generator=gen_ddp,
+            noise_mechanism=InverseBandNoiseMechanism(
+                inverse_coeffs=[1.0, 0.25],
+                z_std=0.05,
+            ),
+        )
+
+        ref_grad = _run_step(ref_model, ref_dp_opt, next(iter(ref_loader)))
+        ddp_grad = _run_step(ddp_model, ddp_dp_opt, next(iter(ddp_loader)))
+        torch.save(
+            {
+                "rank": rank,
+                "ok": bool(torch.allclose(ref_grad, ddp_grad, atol=1e-7, rtol=1e-6)),
+            },
+            Path(results_dir) / f"result_{rank}.pt",
+        )
     finally:
         dist.destroy_process_group()
 
@@ -439,6 +862,54 @@ def test_distributed_bsr_two_rank_smoke() -> None:
         "requires OPACUS_RUN_DISTRIBUTED_TESTS=1 and local gloo process-group support"
     ),
 )
+def test_distributed_blt_two_rank_smoke() -> None:
+    results = _run_two_rank_workers(_worker_one_step_blt_smoke)
+    assert results == [(0, True), (1, True)]
+
+
+@pytest.mark.skipif(
+    not RUN_DISTRIBUTED or not HAS_LOCAL_GLOO,
+    reason=(
+        "requires OPACUS_RUN_DISTRIBUTED_TESTS=1 and local gloo process-group support"
+    ),
+)
+def test_distributed_blt_matches_single_process_reference() -> None:
+    results = _run_two_rank_workers(_worker_one_step_blt_matches_single_process_reference)
+    assert results == [(0, True), (1, True)]
+
+
+@pytest.mark.skipif(
+    not RUN_DISTRIBUTED or not HAS_LOCAL_GLOO,
+    reason=(
+        "requires OPACUS_RUN_DISTRIBUTED_TESTS=1 and local gloo process-group support"
+    ),
+)
+def test_distributed_explicit_correlated_matches_single_process_reference() -> None:
+    results = _run_two_rank_workers(
+        _worker_one_step_explicit_correlated_matches_single_process_reference
+    )
+    assert results == [(0, True), (1, True)]
+
+
+@pytest.mark.skipif(
+    not RUN_DISTRIBUTED or not HAS_LOCAL_GLOO,
+    reason=(
+        "requires OPACUS_RUN_DISTRIBUTED_TESTS=1 and local gloo process-group support"
+    ),
+)
+def test_distributed_explicit_inverse_band_matches_single_process_reference() -> None:
+    results = _run_two_rank_workers(
+        _worker_one_step_explicit_inverse_band_matches_single_process_reference
+    )
+    assert results == [(0, True), (1, True)]
+
+
+@pytest.mark.skipif(
+    not RUN_DISTRIBUTED or not HAS_LOCAL_GLOO,
+    reason=(
+        "requires OPACUS_RUN_DISTRIBUTED_TESTS=1 and local gloo process-group support"
+    ),
+)
 def test_distributed_bnb_two_rank_smoke() -> None:
     results = _run_two_rank_workers(_worker_one_step_bnb_smoke)
     assert results == [(0, True), (1, True)]
@@ -456,6 +927,23 @@ def test_distributed_bsr_two_rank_rank0_resume_parity() -> None:
 
     results = _run_two_rank_workers(
         _worker_resume_parity,
+        checkpoint_path=checkpoint_path,
+    )
+    assert results == [(0, True), (1, True)]
+
+
+@pytest.mark.skipif(
+    not RUN_DISTRIBUTED or not HAS_LOCAL_GLOO,
+    reason=(
+        "requires OPACUS_RUN_DISTRIBUTED_TESTS=1 and local gloo process-group support"
+    ),
+)
+def test_distributed_blt_two_rank_rank0_resume_parity() -> None:
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as ckpt:
+        checkpoint_path = ckpt.name
+
+    results = _run_two_rank_workers(
+        _worker_resume_parity_blt,
         checkpoint_path=checkpoint_path,
     )
     assert results == [(0, True), (1, True)]

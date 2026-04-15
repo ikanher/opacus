@@ -30,7 +30,7 @@ def test_blt_family_state_canonicalizes_decay_pair_and_preserves_metadata() -> N
     canonical = state.to_state_dict()
     assert {"forward", "inverse", "z_std"}.issubset(canonical.keys())
     assert canonical["blt_horizon"] == 8
-    assert canonical["_blt_distributed_policy"] == "single_process_only"
+    assert canonical["_blt_distributed_policy"] == "ddp_flat_only"
     assert canonical["_blt_distributed_runtime"] is False
 
 

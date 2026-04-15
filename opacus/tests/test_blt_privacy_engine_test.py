@@ -15,6 +15,7 @@ from opacus.accountants.analysis.blt import (
 )
 from opacus.mechanism_contracts import SamplingSemantics
 from opacus.noise_mechanisms import BufferedToeplitzNoiseMechanism
+from opacus.optimizers import DistributedDPOptimizer
 from opacus.optimizers.blt_optimization import optimize_blt_fixed_batch
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -107,7 +108,7 @@ def test_make_private_builds_blt_from_decay_pair() -> None:
     state = pe.noise_mechanism_config.mechanism_state
     assert pe.noise_mechanism_config.accounting_mode == "blt_accountant"
     assert {"forward", "inverse", "z_std"}.issubset(state.keys())
-    assert state["_blt_distributed_policy"] == "single_process_only"
+    assert state["_blt_distributed_policy"] == "ddp_flat_only"
     assert state["_blt_distributed_runtime"] is False
     assert set(state["forward"].keys()) == {"theta", "omega"}
     assert set(state["inverse"].keys()) == {"theta", "omega"}
@@ -139,7 +140,7 @@ def test_make_private_builds_blt_from_explicit_paired_params() -> None:
     assert isinstance(dp_optimizer.noise_mechanism, BufferedToeplitzNoiseMechanism)
     state = pe.noise_mechanism_config.mechanism_state
     assert {"forward", "inverse", "z_std"}.issubset(state.keys())
-    assert state["_blt_distributed_policy"] == "single_process_only"
+    assert state["_blt_distributed_policy"] == "ddp_flat_only"
     assert state["_blt_distributed_runtime"] is False
 
 
@@ -481,7 +482,7 @@ def test_blt_accounting_telemetry_reports_runtime_only_boundary() -> None:
     assert telemetry["accountant"] == "blt_runtime_only"
     assert telemetry["events_recorded"] == 0
     assert telemetry["accounting_supported"] is False
-    assert telemetry["distributed_support"] == "single_process_only"
+    assert telemetry["distributed_support"] == "ddp_flat_only"
     assert telemetry["distributed_runtime"] is False
     assert "BLT accountant support is unavailable for the current BLT contract" in telemetry["epsilon_at_target_delta_error"]
 
@@ -765,11 +766,47 @@ def test_fixed_batch_blt_accounting_telemetry_reports_accountant_backed_status()
     assert telemetry["accountant"] == "blt"
     assert telemetry["accounting_supported"] is True
     assert telemetry["epsilon_at_target_delta"] > 0.0
-    assert telemetry["distributed_support"] == "single_process_only"
+    assert telemetry["distributed_support"] == "ddp_flat_only"
     assert telemetry["distributed_runtime"] is False
 
 
-def test_distributed_blt_rejects_ddp_early(monkeypatch) -> None:
+def test_distributed_blt_supports_ddp_flat_hooks(monkeypatch) -> None:
+    monkeypatch.setattr(pe_mod, "DDP", nn.Linear)
+    _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
+
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    pe = PrivacyEngine()
+
+    _private_model, dp_optimizer, private_loader = pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        noise_multiplier=0.0,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping="flat",
+        grad_sample_mode="hooks",
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="blt",
+            accounting_mode="standard_step_accountant",
+            mechanism_state=_supported_fixed_batch_blt_state(),
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="torch_sampler",
+            privacy_metadata={},
+        ),
+    )
+
+    assert isinstance(dp_optimizer, DistributedDPOptimizer)
+    assert isinstance(dp_optimizer.noise_mechanism, BufferedToeplitzNoiseMechanism)
+    assert private_loader.batch_size == 4
+    state = pe.noise_mechanism_config.mechanism_state
+    assert state["_blt_distributed_policy"] == "ddp_flat_only"
+    assert state["_blt_distributed_runtime"] is True
+
+
+def test_distributed_blt_rejects_explicit_runtime_mechanism(monkeypatch) -> None:
     monkeypatch.setattr(pe_mod, "DDP", nn.Linear)
     _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
 
@@ -779,7 +816,7 @@ def test_distributed_blt_rejects_ddp_early(monkeypatch) -> None:
 
     with pytest.raises(
         ValueError,
-        match="blt noise mechanism is not yet supported in distributed mode",
+        match="distributed BLT requires noise_mechanism_config with mechanism='blt'",
     ):
         pe.make_private(
             module=model,
@@ -788,14 +825,11 @@ def test_distributed_blt_rejects_ddp_early(monkeypatch) -> None:
             noise_multiplier=0.0,
             max_grad_norm=1.0,
             poisson_sampling=False,
-            noise_mechanism_config=NoiseMechanismConfig(
-                mechanism="blt",
-                accounting_mode="standard_step_accountant",
-                mechanism_state=_supported_fixed_batch_blt_state(),
-            ),
-            sampling_semantics=SamplingSemantics(
-                sampling_mode="torch_sampler",
-                privacy_metadata={},
+            clipping="flat",
+            grad_sample_mode="hooks",
+            noise_mechanism=BufferedToeplitzNoiseMechanism(
+                pair=blt_pair_from_theta_pair(theta=[0.8, 0.3], theta_hat=[0.6, 0.1]),
+                z_std=0.03,
             ),
         )
 
@@ -831,7 +865,9 @@ def test_distributed_blt_rejects_fsdp_early(monkeypatch) -> None:
         )
 
 
-def test_distributed_blt_make_private_with_epsilon_rejects_early(monkeypatch) -> None:
+def test_distributed_blt_make_private_with_epsilon_supports_ddp_and_uses_global_logical_batch(
+    monkeypatch,
+) -> None:
     monkeypatch.setattr(pe_mod, "DDP", nn.Linear)
     _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
 
@@ -839,26 +875,115 @@ def test_distributed_blt_make_private_with_epsilon_rejects_early(monkeypatch) ->
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     pe = PrivacyEngine()
 
-    with pytest.raises(
-        ValueError,
-        match="blt noise mechanism is not yet supported in distributed mode",
-    ):
-        pe.make_private_with_epsilon(
-            module=model,
-            optimizer=optimizer,
-            data_loader=_loader(),
-            target_epsilon=4.0,
-            target_delta=1e-5,
-            total_steps=8,
-            max_grad_norm=1.0,
-            poisson_sampling=False,
-            noise_mechanism_config=NoiseMechanismConfig(
-                mechanism="blt",
-                accounting_mode="standard_step_accountant",
-                mechanism_state=_supported_fixed_batch_blt_state(),
-            ),
-            sampling_semantics=SamplingSemantics(
-                sampling_mode="torch_sampler",
-                privacy_metadata={},
-            ),
-        )
+    _private_model, dp_optimizer, private_loader = pe.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        target_epsilon=4.0,
+        target_delta=1e-5,
+        total_steps=8,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping="flat",
+        grad_sample_mode="hooks",
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="blt",
+            accounting_mode="standard_step_accountant",
+            mechanism_state=_supported_fixed_batch_blt_state(),
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="torch_sampler",
+            privacy_metadata={},
+        ),
+    )
+
+    assert isinstance(dp_optimizer, DistributedDPOptimizer)
+    assert private_loader.batch_size == 4
+    state = pe.noise_mechanism_config.mechanism_state
+    assert state["_blt_distributed_runtime"] is True
+    assert state["blt_min_separation"] == 4
+    assert state["blt_max_participations"] == 2
+    assert state["blt_horizon"] == 8
+    assert state["noise_multiplier_ref"] > 0.0
+
+
+def test_blt_checkpoint_load_rejects_missing_mechanism_state() -> None:
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    pe = PrivacyEngine()
+    _private_model, dp_optimizer, _ = pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        noise_multiplier=0.0,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_generator=torch.Generator().manual_seed(20260403),
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="blt",
+            accounting_mode="standard_step_accountant",
+            mechanism_state=_supported_fixed_batch_blt_state(),
+        ),
+    )
+
+    state = dp_optimizer.state_dict()
+    del state["_dp_noise_mechanism_state"]
+
+    with pytest.raises(ValueError, match="missing blt noise mechanism state"):
+        dp_optimizer.load_state_dict(state)
+
+
+def test_distributed_blt_balls_in_bins_bnb_reports_distributed_runtime(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_estimator(**kwargs):
+        captured.update(kwargs)
+        return 1.25
+
+    monkeypatch.setattr(pe_mod, "DDP", nn.Linear)
+    _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
+    monkeypatch.setattr(
+        bnb_accountant_mod,
+        "estimate_balls_in_bins_epsilon_monte_carlo_optimistic",
+        _fake_estimator,
+    )
+
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    pe = PrivacyEngine()
+    private_model, dp_optimizer, private_loader = pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        noise_multiplier=0.0,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping="flat",
+        grad_sample_mode="hooks",
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 8},
+        ),
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="blt",
+            accounting_mode="bnb_accountant",
+            mechanism_state={
+                "theta": [0.8],
+                "theta_hat": [0.6],
+                "z_std": 0.03,
+                "blt_min_separation": 4,
+                "blt_horizon": 12,
+            },
+        ),
+    )
+
+    assert isinstance(dp_optimizer, DistributedDPOptimizer)
+    state = pe.noise_mechanism_config.mechanism_state
+    assert state["_blt_distributed_policy"] == "ddp_flat_only"
+    assert state["_blt_distributed_runtime"] is True
+
+    _run_pre_step(private_model, dp_optimizer, next(iter(private_loader)))
+    eps = pe.get_epsilon(1e-5, bnb_calibration_mode="optimistic", bnb_num_samples=32)
+    assert eps == pytest.approx(1.25)
+    assert captured["distributed_dp_runtime"] is True
+    assert captured["distributed_mode"] == "chunk_shard"

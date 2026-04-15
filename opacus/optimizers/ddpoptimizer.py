@@ -20,6 +20,7 @@ import torch
 from torch.optim import Optimizer
 
 from .optimizer import CorrelatedNoiseMechanism, DPOptimizer
+from opacus.noise_mechanisms.blt import BufferedToeplitzNoiseMechanism
 
 
 class DistributedDPOptimizer(DPOptimizer):
@@ -58,7 +59,18 @@ class DistributedDPOptimizer(DPOptimizer):
     def add_noise(self):
         # Noise only gets added to the first worker
         if self.rank == 0:
-            super().add_noise()
+            if isinstance(
+                self.noise_mechanism,
+                (BufferedToeplitzNoiseMechanism, CorrelatedNoiseMechanism),
+            ):
+                original_z_std = self.noise_mechanism.z_std
+                self.noise_mechanism.z_std = original_z_std * float(self.world_size)
+                try:
+                    super().add_noise()
+                finally:
+                    self.noise_mechanism.z_std = original_z_std
+            else:
+                super().add_noise()
         else:
             for p in self.params:
                 p.grad = p.summed_grad.view_as(p)
@@ -71,10 +83,14 @@ class DistributedDPOptimizer(DPOptimizer):
         return state
 
     def load_state_dict(self, state_dict) -> None:
-        if isinstance(self.noise_mechanism, CorrelatedNoiseMechanism):
-            saved_rank = state_dict.get("_dp_distributed_saved_rank")
+        saved_rank = state_dict.get("_dp_distributed_saved_rank")
 
-            if saved_rank is not None and int(saved_rank) != 0:
+        if saved_rank is not None and int(saved_rank) != 0:
+            if isinstance(self.noise_mechanism, BufferedToeplitzNoiseMechanism):
+                raise ValueError(
+                    "distributed BLT checkpoint must be saved on rank 0"
+                )
+            if isinstance(self.noise_mechanism, CorrelatedNoiseMechanism):
                 raise ValueError(
                     "distributed correlated-noise checkpoint must be saved on rank 0"
                 )

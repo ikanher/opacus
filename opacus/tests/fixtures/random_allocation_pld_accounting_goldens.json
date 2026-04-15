@@ -25,30 +25,6 @@
     },
     {
       "accountant_coeffs": [
-        3.0,
-        4.0
-      ],
-      "author_source": "PLD_accounting.general_allocation_epsilon",
-      "cycle_length": 10,
-      "num_selected": 3,
-      "effective_sigma": 2.0,
-      "expected_epsilon_lower": 2.821304935451721,
-      "expected_epsilon_upper": 3.797686529941495,
-      "horizon": 20,
-      "mechanism": "gaussian",
-      "name": "general_k_gaussian_case",
-      "noise_multiplier": 10.0,
-      "runtime_config": {
-        "convolution_method": "geometric",
-        "loss_discretization": 0.05,
-        "max_grid_fft": 1000000,
-        "max_grid_mult": 30000,
-        "tail_truncation": 1e-06
-      },
-      "target_delta": 1e-05
-    },
-    {
-      "accountant_coeffs": [
         1.0
       ],
       "author_source": "PLD_accounting.general_allocation_epsilon",
@@ -66,6 +42,30 @@
         "max_grid_fft": 1000000,
         "max_grid_mult": 30000,
         "tail_truncation": 1e-10
+      },
+      "target_delta": 1e-05
+    },
+    {
+      "accountant_coeffs": [
+        3.0,
+        4.0
+      ],
+      "author_source": "PLD_accounting.general_allocation_epsilon",
+      "cycle_length": 10,
+      "effective_sigma": 2.0,
+      "expected_epsilon_lower": 2.8205079790107566,
+      "expected_epsilon_upper": 3.7437448175723826,
+      "horizon": 20,
+      "mechanism": "gaussian",
+      "name": "general_k_gaussian_case",
+      "noise_multiplier": 10.0,
+      "num_selected": 3,
+      "runtime_config": {
+        "convolution_method": "geometric",
+        "loss_discretization": 0.05,
+        "max_grid_fft": 1000000,
+        "max_grid_mult": 30000,
+        "tail_truncation": 1e-06
       },
       "target_delta": 1e-05
     }

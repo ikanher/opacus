@@ -20,7 +20,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 from opacus import NoiseMechanismConfig, PrivacyEngine
-from opacus.optimizers import CorrelatedNoiseMechanism, DistributedDPOptimizer
+from opacus.optimizers import (
+    CorrelatedNoiseMechanism,
+    DPOptimizer,
+    DistributedDPOptimizer,
+    InverseBandNoiseMechanism,
+)
 from opacus.mechanism_contracts import SamplingSemantics
 from opacus.utils.uniform_sampler import (
     DistributedBMinSepSampler,
@@ -628,7 +633,11 @@ def test_distributed_bsr_supported_for_flat_ew(monkeypatch) -> None:
         poisson_sampling=False,
         clipping="flat",
         grad_sample_mode="ew",
-        noise_mechanism=CorrelatedNoiseMechanism(coeffs=[1.0], z_std=0.01),
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+        ),
     )
 
     assert isinstance(dp_optimizer, DistributedDPOptimizer)
@@ -653,7 +662,11 @@ def test_distributed_bsr_rejects_unsupported_grad_sample_mode(monkeypatch) -> No
             poisson_sampling=False,
             clipping="flat",
             grad_sample_mode="ghost",
-            noise_mechanism=CorrelatedNoiseMechanism(coeffs=[1.0], z_std=0.01),
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bsr",
+                accounting_mode="bsr_accountant",
+                mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+            ),
         )
 
     with pytest.raises(ValueError, match=r"got grad_sample_mode='ghost'"):
@@ -666,7 +679,11 @@ def test_distributed_bsr_rejects_unsupported_grad_sample_mode(monkeypatch) -> No
             poisson_sampling=False,
             clipping="flat",
             grad_sample_mode="ghost",
-            noise_mechanism=CorrelatedNoiseMechanism(coeffs=[1.0], z_std=0.01),
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bsr",
+                accounting_mode="bsr_accountant",
+                mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+            ),
         )
 
 
@@ -688,11 +705,91 @@ def test_distributed_bsr_rejects_fsdp(monkeypatch) -> None:
             poisson_sampling=False,
             clipping="flat",
             grad_sample_mode="hooks",
-            noise_mechanism=CorrelatedNoiseMechanism(coeffs=[1.0], z_std=0.01),
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bsr",
+                accounting_mode="bsr_accountant",
+                mechanism_state={"coeffs": [1.0], "z_std": 0.01},
+            ),
         )
 
 
-def test_distributed_bsr_one_step_rank0_smoke(monkeypatch) -> None:
+def test_explicit_distributed_correlated_runtime_matches_single_process(monkeypatch) -> None:
+    _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
+
+    base_a = nn.Linear(4, 3)
+    base_b = copy.deepcopy(base_a)
+
+    single = DPOptimizer(
+        optimizer=torch.optim.SGD(base_a.parameters(), lr=0.05),
+        noise_multiplier=0.0,
+        max_grad_norm=1.0,
+        expected_batch_size=8,
+        loss_reduction="mean",
+        generator=torch.Generator().manual_seed(1729),
+        noise_mechanism=CorrelatedNoiseMechanism(coeffs=[1.0], z_std=0.4),
+    )
+    distributed = DistributedDPOptimizer(
+        optimizer=torch.optim.SGD(base_b.parameters(), lr=0.05),
+        noise_multiplier=0.0,
+        max_grad_norm=1.0,
+        expected_batch_size=8,
+        loss_reduction="mean",
+        generator=torch.Generator().manual_seed(1729),
+        noise_mechanism=CorrelatedNoiseMechanism(coeffs=[1.0], z_std=0.4),
+    )
+
+    single.zero_grad()
+    distributed.zero_grad()
+    _set_zero_grad_samples(single, batch_size=8)
+    _set_zero_grad_samples(distributed, batch_size=8)
+    single.step()
+    distributed.step()
+
+    single_grad = torch.cat([p.grad.reshape(-1) for p in single.params])
+    distributed_grad = torch.cat([p.grad.reshape(-1) for p in distributed.params])
+    assert torch.allclose(single_grad, distributed_grad, atol=1e-7, rtol=1e-6)
+
+
+def test_explicit_distributed_inverse_band_runtime_matches_single_process(
+    monkeypatch,
+) -> None:
+    _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
+
+    base_a = nn.Linear(4, 3)
+    base_b = copy.deepcopy(base_a)
+
+    single = DPOptimizer(
+        optimizer=torch.optim.SGD(base_a.parameters(), lr=0.05),
+        noise_multiplier=0.0,
+        max_grad_norm=1.0,
+        expected_batch_size=8,
+        loss_reduction="mean",
+        generator=torch.Generator().manual_seed(1730),
+        noise_mechanism=InverseBandNoiseMechanism(inverse_coeffs=[1.0, 0.25], z_std=0.4),
+    )
+    distributed = DistributedDPOptimizer(
+        optimizer=torch.optim.SGD(base_b.parameters(), lr=0.05),
+        noise_multiplier=0.0,
+        max_grad_norm=1.0,
+        expected_batch_size=8,
+        loss_reduction="mean",
+        generator=torch.Generator().manual_seed(1730),
+        noise_mechanism=InverseBandNoiseMechanism(inverse_coeffs=[1.0, 0.25], z_std=0.4),
+    )
+
+    single.zero_grad()
+    distributed.zero_grad()
+    _set_zero_grad_samples(single, batch_size=8)
+    _set_zero_grad_samples(distributed, batch_size=8)
+    single.step()
+    distributed.step()
+
+    single_grad = torch.cat([p.grad.reshape(-1) for p in single.params])
+    distributed_grad = torch.cat([p.grad.reshape(-1) for p in distributed.params])
+    assert torch.allclose(single_grad, distributed_grad, atol=1e-7, rtol=1e-6)
+
+
+def test_distributed_bsr_supports_explicit_runtime_mechanism(monkeypatch) -> None:
     monkeypatch.setattr(pe_mod, "DDP", nn.Linear)
     _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
 
@@ -710,18 +807,18 @@ def test_distributed_bsr_one_step_rank0_smoke(monkeypatch) -> None:
         grad_sample_mode="hooks",
         noise_mechanism=CorrelatedNoiseMechanism(coeffs=[1.0, 0.2], z_std=0.01),
     )
-
     _one_step(private_model, dp_optimizer, private_loader)
     mechanism = dp_optimizer.noise_mechanism
+    assert isinstance(dp_optimizer, DistributedDPOptimizer)
     assert isinstance(mechanism, CorrelatedNoiseMechanism)
     assert mechanism.steps_with_noise == 1
     assert mechanism.last_flat_u is not None
     assert torch.isfinite(mechanism.last_flat_u).all()
 
 
-def test_distributed_bsr_one_step_rank_nonzero_smoke(monkeypatch) -> None:
+def test_distributed_bandinvmf_supports_explicit_runtime_mechanism(monkeypatch) -> None:
     monkeypatch.setattr(pe_mod, "DDP", nn.Linear)
-    _patch_distributed_primitives(monkeypatch, rank=1, world_size=2)
+    _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
 
     pe = PrivacyEngine()
     model = nn.Linear(4, 3)
@@ -735,14 +832,17 @@ def test_distributed_bsr_one_step_rank_nonzero_smoke(monkeypatch) -> None:
         poisson_sampling=False,
         clipping="flat",
         grad_sample_mode="hooks",
-        noise_mechanism=CorrelatedNoiseMechanism(coeffs=[1.0, 0.2], z_std=0.01),
+        noise_mechanism=InverseBandNoiseMechanism(
+            inverse_coeffs=[1.0, 0.2], z_std=0.01
+        ),
     )
-
     _one_step(private_model, dp_optimizer, private_loader)
     mechanism = dp_optimizer.noise_mechanism
-    assert isinstance(mechanism, CorrelatedNoiseMechanism)
-    assert mechanism.steps_with_noise == 0
-    assert mechanism.last_flat_u is None
+    assert isinstance(dp_optimizer, DistributedDPOptimizer)
+    assert isinstance(mechanism, InverseBandNoiseMechanism)
+    assert mechanism.steps_with_noise == 1
+    assert mechanism.last_flat_u is not None
+    assert torch.isfinite(mechanism.last_flat_u).all()
 
 
 def test_distributed_bsr_rank0_checkpoint_resume_parity(monkeypatch) -> None:
@@ -769,7 +869,11 @@ def test_distributed_bsr_rank0_checkpoint_resume_parity(monkeypatch) -> None:
         clipping="flat",
         grad_sample_mode="hooks",
         noise_generator=noise_gen1,
-        noise_mechanism=CorrelatedNoiseMechanism(coeffs=[1.1, 0.3, -0.2], z_std=0.03),
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"coeffs": [1.1, 0.3, -0.2], "z_std": 0.03},
+        ),
     )
     private_model2, dp_optimizer2, private_loader2 = pe2.make_private(
         module=model2,
@@ -781,7 +885,11 @@ def test_distributed_bsr_rank0_checkpoint_resume_parity(monkeypatch) -> None:
         clipping="flat",
         grad_sample_mode="hooks",
         noise_generator=noise_gen2,
-        noise_mechanism=CorrelatedNoiseMechanism(coeffs=[1.1, 0.3, -0.2], z_std=0.03),
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"coeffs": [1.1, 0.3, -0.2], "z_std": 0.03},
+        ),
     )
 
     batches1 = list(private_loader1)
@@ -829,7 +937,11 @@ def test_distributed_bsr_global_noise_scale_rank0_only(monkeypatch) -> None:
         clipping="flat",
         grad_sample_mode="hooks",
         noise_generator=noise_gen,
-        noise_mechanism=CorrelatedNoiseMechanism(coeffs=[1.0], z_std=0.4),
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"coeffs": [1.0], "z_std": 0.4},
+        ),
     )
 
     dp_optimizer.zero_grad()
@@ -865,8 +977,10 @@ def test_distributed_bsr_history_progression_and_bounds(monkeypatch) -> None:
             clipping="flat",
             grad_sample_mode="hooks",
             noise_generator=noise_gen,
-            noise_mechanism=CorrelatedNoiseMechanism(
-                coeffs=[1.0, 0.4, -0.1], z_std=0.2
+            noise_mechanism_config=NoiseMechanismConfig(
+                mechanism="bsr",
+                accounting_mode="bsr_accountant",
+                mechanism_state={"coeffs": [1.0, 0.4, -0.1], "z_std": 0.2},
             ),
         )
         mechanism = dp_optimizer.noise_mechanism

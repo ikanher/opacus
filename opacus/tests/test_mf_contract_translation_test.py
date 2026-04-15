@@ -33,7 +33,7 @@ def test_canonicalize_blt_public_state_from_decay_pair() -> None:
     )
 
     assert {"forward", "inverse", "z_std"}.issubset(state.keys())
-    assert state["_blt_distributed_policy"] == "single_process_only"
+    assert state["_blt_distributed_policy"] == "ddp_flat_only"
     assert state["_blt_distributed_runtime"] is False
 
 

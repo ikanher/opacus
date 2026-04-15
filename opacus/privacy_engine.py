@@ -486,19 +486,36 @@ class PrivacyEngine:
         mechanism_config: NoiseMechanismConfig,
         kwargs: Dict[str, Any],
         clipping: str,
-    ) -> tuple[nn.Module, DataLoader, bool, SamplingSemantics, float, int]:
+    ) -> tuple[nn.Module, DataLoader, bool, SamplingSemantics, float, int, int]:
         self._validate_optimizer_matches_module(module=module, optimizer=optimizer)
 
         distributed, is_fsdp = self._resolve_distributed_runtime(module)
         requested_noise_mechanism = kwargs.get("noise_mechanism")
+        if distributed and isinstance(
+            requested_noise_mechanism, BufferedToeplitzNoiseMechanism
+        ):
+            raise ValueError(
+                "distributed BLT requires noise_mechanism_config with mechanism='blt'; "
+                "explicit BufferedToeplitzNoiseMechanism injection is not supported"
+            )
         if distributed and mechanism_config.mechanism == "blt":
-            self._validate_distributed_blt_support(is_fsdp=is_fsdp)
+            self._validate_distributed_blt_support(
+                is_fsdp=is_fsdp,
+                clipping=clipping,
+                grad_sample_mode=grad_sample_mode,
+            )
         if distributed and (
             mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf", "bifr")
+            or isinstance(requested_noise_mechanism, InverseBandNoiseMechanism)
             or isinstance(requested_noise_mechanism, CorrelatedNoiseMechanism)
         ):
+            mechanism_name = mechanism_config.mechanism
+            if isinstance(requested_noise_mechanism, InverseBandNoiseMechanism):
+                mechanism_name = "inverse-band"
+            elif isinstance(requested_noise_mechanism, CorrelatedNoiseMechanism):
+                mechanism_name = "correlated"
             self._validate_distributed_correlated_support(
-                mechanism=mechanism_config.mechanism,
+                mechanism=mechanism_name,
                 clipping=clipping,
                 grad_sample_mode=grad_sample_mode,
                 is_fsdp=is_fsdp,
@@ -541,7 +558,15 @@ class PrivacyEngine:
             distributed=distributed,
             explicit_sampling_semantics=sampling_semantics,
         )
-        return module, data_loader, distributed, semantics, float(sample_rate), int(expected_batch_size)
+        return (
+            module,
+            data_loader,
+            distributed,
+            semantics,
+            float(sample_rate),
+            int(expected_batch_size),
+            int(batch_size) if batch_size is not None else 0,
+        )
 
     def _finalize_make_private_result(
         self,
@@ -1146,15 +1171,42 @@ class PrivacyEngine:
     def _validate_distributed_blt_support(
         *,
         is_fsdp: bool,
+        clipping: str,
+        grad_sample_mode: str,
     ) -> None:
         if is_fsdp:
             raise ValueError(
                 "blt noise mechanism is not yet supported with FSDP; "
-                "the validated BLT contract is single-process only"
+                "supported distributed mode is DDP/DPDDP with flat clipping"
             )
-        raise ValueError(
-            "blt noise mechanism is not yet supported in distributed mode; "
-            "the validated BLT contract is single-process only"
+        if clipping != "flat":
+            raise ValueError(
+                "blt noise mechanism supports only distributed flat clipping; "
+                f"got clipping={clipping!r}"
+            )
+        if grad_sample_mode not in ("hooks", "ew"):
+            raise ValueError(
+                "blt noise mechanism supports distributed grad_sample_mode "
+                "in {'hooks', 'ew'} only; "
+                f"got grad_sample_mode={grad_sample_mode!r}"
+            )
+
+    @staticmethod
+    def _stamp_blt_distributed_runtime(
+        *,
+        mechanism_config: NoiseMechanismConfig,
+        distributed: bool,
+    ) -> NoiseMechanismConfig:
+        if mechanism_config.mechanism != "blt":
+            return mechanism_config
+
+        state = copy.deepcopy(mechanism_config.mechanism_state)
+        state["_blt_distributed_policy"] = "ddp_flat_only"
+        state["_blt_distributed_runtime"] = bool(distributed)
+        return NoiseMechanismConfig(
+            mechanism=mechanism_config.mechanism,
+            accounting_mode=mechanism_config.accounting_mode,
+            mechanism_state=state,
         )
 
     @staticmethod
@@ -1564,6 +1616,12 @@ class PrivacyEngine:
             accounting_mode=accounting_mode,
         )
 
+        if accounting_mode == "random_allocation_accountant":
+            if sampling_semantics is None or sampling_semantics.sampling_mode != "k_out_of_t":
+                raise ValueError(
+                    f"{mechanism} mechanism with random_allocation_accountant requires sampling_mode='k_out_of_t'"
+                )
+
         if (
             sampling_semantics is not None
             and sampling_semantics.sampling_mode == "b_min_sep"
@@ -1595,11 +1653,6 @@ class PrivacyEngine:
             raise ValueError(
                 "k_out_of_t sampling is supported only for mechanism in {'gaussian', 'bandmf', 'bsr', 'bisr', 'bandinvmf'}"
             )
-        if accounting_mode == "random_allocation_accountant":
-            if sampling_semantics is None or sampling_semantics.sampling_mode != "k_out_of_t":
-                raise ValueError(
-                    f"{mechanism} mechanism with random_allocation_accountant requires sampling_mode='k_out_of_t'"
-                )
 
         if (
             validate_cyclic_poisson_mode
@@ -1812,6 +1865,7 @@ class PrivacyEngine:
         epochs: Optional[int],
         poisson_sampling: bool,
         data_loader: DataLoader,
+        logical_batch_size: int,
         sampling_semantics: Optional[SamplingSemantics],
         kwargs: Dict[str, Any],
         nm_kwargs: Dict[str, Any],
@@ -1844,7 +1898,7 @@ class PrivacyEngine:
                 phase="total_steps",
                 query_runtime_context={
                     "dataset_size": int(len(data_loader.dataset)),
-                    "logical_batch_size": int(data_loader.batch_size),
+                    "logical_batch_size": int(logical_batch_size),
                     "dataloader_len": int(len(data_loader)),
                 },
             )
@@ -1906,7 +1960,7 @@ class PrivacyEngine:
             phase="epochs",
             query_runtime_context={
                 "dataset_size": int(len(data_loader.dataset)),
-                "logical_batch_size": int(data_loader.batch_size),
+                "logical_batch_size": int(logical_batch_size),
                 "dataloader_len": int(len(data_loader)),
             },
         )
@@ -2104,6 +2158,7 @@ class PrivacyEngine:
         epochs: Optional[int],
         poisson_sampling: bool,
         data_loader: DataLoader,
+        logical_batch_size: int,
         sampling_semantics: Optional[SamplingSemantics],
         bnb_c_matrix: Optional[torch.Tensor],
         bnb_bands: Optional[int],
@@ -2142,6 +2197,7 @@ class PrivacyEngine:
             epochs=epochs,
             poisson_sampling=poisson_sampling,
             data_loader=data_loader,
+            logical_batch_size=logical_batch_size,
             sampling_semantics=sampling_semantics,
             kwargs=kwargs,
             nm_kwargs=nm_kwargs,
@@ -2673,7 +2729,15 @@ class PrivacyEngine:
                 "pass either noise_mechanism_config or noise_mechanism, not both"
             )
 
-        module, data_loader, distributed, semantics, sample_rate, expected_batch_size = (
+        (
+            module,
+            data_loader,
+            distributed,
+            semantics,
+            sample_rate,
+            expected_batch_size,
+            logical_batch_size,
+        ) = (
             self._prepare_make_private_runtime(
                 module=module,
                 optimizer=optimizer,
@@ -2707,7 +2771,7 @@ class PrivacyEngine:
             ),
             data_loader_len=int(len(data_loader)),
             dataset_size=int(len(data_loader.dataset)),
-            logical_batch_size=int(data_loader.batch_size) if data_loader.batch_size is not None else 0,
+            logical_batch_size=int(logical_batch_size),
             max_grad_norm=max_grad_norm,
             loss_reduction=loss_reduction,
             blt_noise_multiplier=float(noise_multiplier),
@@ -2774,6 +2838,10 @@ class PrivacyEngine:
             mechanism_config=mechanism_config,
             default_accountant=self.default_accountant,
             sampling_semantics=semantics,
+        )
+        mechanism_config = self._stamp_blt_distributed_runtime(
+            mechanism_config=mechanism_config,
+            distributed=distributed,
         )
 
         configured_noise_mechanism = self._build_noise_mechanism_from_config(
@@ -2991,7 +3059,11 @@ class PrivacyEngine:
         is_fsdp = isinstance(module, FSDPModule)
         distributed = is_dpddp or is_ddp or is_fsdp
         if distributed and mechanism_config.mechanism == "blt":
-            self._validate_distributed_blt_support(is_fsdp=is_fsdp)
+            self._validate_distributed_blt_support(
+                is_fsdp=is_fsdp,
+                clipping=clipping,
+                grad_sample_mode=grad_sample_mode,
+            )
 
         correlated_denominator = None
         if mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf", "bifr", "blt"):
@@ -3074,6 +3146,7 @@ class PrivacyEngine:
             epochs=epochs,
             poisson_sampling=poisson_sampling,
             data_loader=data_loader,
+            logical_batch_size=int(batch_size) if batch_size is not None else 0,
             sampling_semantics=local_sampling_semantics,
             bnb_c_matrix=bnb_c_matrix,
             bnb_bands=bnb_bands,
@@ -3285,7 +3358,7 @@ class PrivacyEngine:
                 payload["mechanism_state_summary"] = summarized_mf_state
             if mechanism_config.mechanism == "blt":
                 payload["distributed_support"] = mechanism_state.get(
-                    "_blt_distributed_policy", "single_process_only"
+                    "_blt_distributed_policy", "ddp_flat_only"
                 )
                 payload["distributed_runtime"] = bool(
                     mechanism_state.get("_blt_distributed_runtime", False)

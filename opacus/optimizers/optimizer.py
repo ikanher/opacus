@@ -20,6 +20,7 @@ from typing import Callable, List, Optional
 
 import torch
 from opacus.noise_mechanisms import (
+    BufferedToeplitzNoiseMechanism,
     CorrelatedNoiseMechanism,
     GaussianNoiseMechanism,
     InverseBandNoiseMechanism,
@@ -463,10 +464,14 @@ class DPOptimizer(Optimizer):
         }
         self.original_optimizer.load_state_dict(optimizer_state)
         if mechanism_state is None and type(self.noise_mechanism) in (
+            BufferedToeplitzNoiseMechanism,
             CorrelatedNoiseMechanism,
             InverseBandNoiseMechanism,
         ):
             missing_kind = (
+                "blt"
+                if isinstance(self.noise_mechanism, BufferedToeplitzNoiseMechanism)
+                else
                 "inverse-band"
                 if isinstance(self.noise_mechanism, InverseBandNoiseMechanism)
                 else "correlated"
