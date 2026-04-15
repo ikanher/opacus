@@ -52,33 +52,33 @@ def _resolve_steps_per_epoch(*, dataset_size: int, logical_batch_size: int) -> i
     return int(math.ceil(float(dataset_size) / float(logical_batch_size)))
 
 
-def _default_theta(rank: int, *, theta_min: float, theta_max: float) -> np.ndarray:
-    if rank < 1:
-        raise ValueError("rank must be >= 1")
+def _default_theta(buffers: int, *, theta_min: float, theta_max: float) -> np.ndarray:
+    if buffers < 1:
+        raise ValueError("buffers must be >= 1")
     if not (0.0 < theta_min <= theta_max <= 1.0):
         raise ValueError("require 0 < theta_min <= theta_max <= 1")
-    if rank == 1:
+    if buffers == 1:
         return np.array([float(theta_max)], dtype=np.float64)
-    return np.geomspace(float(theta_min), float(theta_max), int(rank), dtype=np.float64)[
+    return np.geomspace(float(theta_min), float(theta_max), int(buffers), dtype=np.float64)[
         ::-1
     ]
 
 
 def _resolve_base_theta(
     *,
-    rank: int | None,
+    buffers: int | None,
     theta: Sequence[float] | None,
     theta_min: float,
     theta_max: float,
 ) -> np.ndarray:
     if theta is None:
-        if rank is None:
-            raise ValueError("either rank or theta must be provided")
-        return _default_theta(int(rank), theta_min=theta_min, theta_max=theta_max)
+        if buffers is None:
+            raise ValueError("either buffers or theta must be provided")
+        return _default_theta(int(buffers), theta_min=theta_min, theta_max=theta_max)
 
     base_theta = _as_descending_positive_vector("theta", theta)
-    if rank is not None and int(rank) != int(base_theta.size):
-        raise ValueError("rank must match len(theta) when both are provided")
+    if buffers is not None and int(buffers) != int(base_theta.size):
+        raise ValueError("buffers must match len(theta) when both are provided")
     return base_theta
 
 
@@ -99,7 +99,7 @@ def _scaled_descending_candidate(values: np.ndarray, *, scale: float) -> np.ndar
 
 def generate_blt_theta_pair_candidates(
     *,
-    rank: int | None = None,
+    buffers: int | None = None,
     theta: Sequence[float] | None = None,
     theta_min: float = 0.2,
     theta_max: float = 0.8,
@@ -118,7 +118,7 @@ def generate_blt_theta_pair_candidates(
     """
 
     base_theta = _resolve_base_theta(
-        rank=rank,
+        buffers=buffers,
         theta=theta,
         theta_min=theta_min,
         theta_max=theta_max,
@@ -252,7 +252,7 @@ def optimize_blt_fixed_batch(
     loss_reduction: str = "mean",
     sampling_semantics: SamplingSemantics | None = None,
     theta: Sequence[float] | None = None,
-    rank: int | None = None,
+    buffers: int | None = None,
     theta_min: float = 0.2,
     theta_max: float = 0.8,
     theta_scale_grid: Sequence[float] = (1.0, 0.92),
@@ -292,7 +292,7 @@ def optimize_blt_fixed_batch(
     )
 
     candidates = generate_blt_theta_pair_candidates(
-        rank=rank,
+        buffers=buffers,
         theta=theta,
         theta_min=theta_min,
         theta_max=theta_max,

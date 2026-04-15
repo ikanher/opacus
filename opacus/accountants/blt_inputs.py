@@ -336,7 +336,7 @@ def resolve_blt_workload_mechanism_state(
     max_grad_norm: float,
     loss_reduction: str = "mean",
     sampling_semantics: SamplingSemantics | None = None,
-    rank: int | None = None,
+    buffers: int | None = None,
     target_epsilon: float | None = None,
     target_delta: float | None = None,
     noise_multiplier_ref: float | None = None,
@@ -359,9 +359,9 @@ def resolve_blt_workload_mechanism_state(
     if not math.isfinite(float(max_grad_norm)) or float(max_grad_norm) <= 0.0:
         raise ValueError("BLT workload resolution requires max_grad_norm > 0")
 
-    resolved_rank = 2 if rank is None else int(rank)
-    if resolved_rank < 1:
-        raise ValueError("blt rank must be >= 1")
+    resolved_buffers = 2 if buffers is None else int(buffers)
+    if resolved_buffers < 1:
+        raise ValueError("blt buffers must be >= 1")
 
     semantics = sampling_semantics or SamplingSemantics(
         sampling_mode="torch_sampler",
@@ -382,11 +382,11 @@ def resolve_blt_workload_mechanism_state(
                     max_grad_norm=float(max_grad_norm),
                     loss_reduction=str(loss_reduction),
                     sampling_semantics=semantics,
-                    rank=int(resolved_rank),
+                    buffers=int(resolved_buffers),
                 ).mechanism_state
             )
 
-    candidates = generate_blt_theta_pair_candidates(rank=int(resolved_rank))
+    candidates = generate_blt_theta_pair_candidates(buffers=int(resolved_buffers))
     theta_candidate, theta_hat_candidate = candidates[0]
     pair = blt_pair_from_theta_pair(
         theta=theta_candidate,
@@ -423,7 +423,7 @@ def resolve_blt_workload_mechanism_state(
             "blt_horizon": int(total_steps),
             "blt_min_separation": int(steps_per_epoch),
             "blt_max_participations": int(max_participations),
-            "blt_rank": int(resolved_rank),
+            "blt_buffers": int(resolved_buffers),
             "blt_selection_mode": (
                 "optimized_fixed_batch"
                 if target_epsilon is not None and semantics.sampling_mode == "torch_sampler"

@@ -61,7 +61,7 @@ def compute_blt_fixed_batch_report_surface(
     dataset_size: int,
     logical_batch_size: int,
     max_grad_norm: float,
-    rank: int,
+    buffers: int,
 ) -> BLTReportSurface:
     result = optimize_blt_fixed_batch(
         target_epsilon=float(target_epsilon),
@@ -70,7 +70,7 @@ def compute_blt_fixed_batch_report_surface(
         dataset_size=int(dataset_size),
         logical_batch_size=int(logical_batch_size),
         max_grad_norm=float(max_grad_norm),
-        rank=int(rank),
+        buffers=int(buffers),
         sampling_semantics=SamplingSemantics(
             sampling_mode="torch_sampler",
             privacy_metadata={},
