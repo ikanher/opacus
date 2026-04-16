@@ -375,6 +375,7 @@ class BNBAccountant(IAccountant):
         distributed_mode = calibration_cfg["bnb_distributed_mode"]
         distributed_dp_runtime = bool(calibration_cfg["bnb_distributed_dp_runtime"])
         calibration_mode = str(calibration_cfg["bnb_calibration_mode"])
+        sigma_reuse_state = kwargs.get("bnb_sigma_reuse_state")
         accounting_backend = str(
             kwargs.get(
                 "bnb_accounting_backend",
@@ -512,6 +513,7 @@ class BNBAccountant(IAccountant):
                         device=device,
                         distributed_mode=distributed_mode,
                         distributed_dp_runtime=distributed_dp_runtime,
+                        sigma_reuse_state=sigma_reuse_state,
                     )
                 )
 

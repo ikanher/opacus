@@ -235,6 +235,43 @@ class SingleVerificationResult:
 
 
 @dataclass(frozen=True)
+class BallsInBinsSigmaReuseChunk:
+    """
+    Candidate-local reusable chunk state for repeated sigma probes.
+
+    For one fixed balls-in-bins mechanism, repeated sigma probes differ only in
+    the final Gaussian scaling and privacy-loss normalization. The discrete mode
+    draw and the Gaussian RNG stream can therefore be fixed once and replayed
+    exactly across probes.
+    """
+
+    num_samples: int
+    starting_indices: torch.Tensor | None
+    noise_generator_state: torch.Tensor
+
+
+@dataclass(frozen=True)
+class BallsInBinsSigmaReuseState:
+    """
+    Candidate-local reusable sampling state for repeated balls-in-bins sigma
+    probes.
+
+    This state is intentionally candidate-local: it is valid only for one fixed
+    accountant coefficient column / cycle length / horizon triple.
+    """
+
+    cycle_length: int
+    horizon: int
+    backend: str
+    device: torch.device
+    distributed_mode: str
+    distributed_dp_runtime: bool
+    modes_matrix: torch.Tensor
+    positive_chunks: tuple[BallsInBinsSigmaReuseChunk, ...]
+    negative_chunks: tuple[BallsInBinsSigmaReuseChunk, ...]
+
+
+@dataclass(frozen=True)
 class BNBCalibrationReport:
     """
     Stable, versioned calibration payload for BNB Monte Carlo runs.
@@ -1337,6 +1374,64 @@ def _generate_balls_in_bins_samples_chunk(
     return means + noise
 
 
+def _build_balls_in_bins_sigma_reuse_chunk(
+    *,
+    cycle_length: int,
+    num_samples: int,
+    seed: int,
+    positive_sample: bool,
+    resolved_device: torch.device,
+) -> BallsInBinsSigmaReuseChunk:
+    generator = torch.Generator(device=resolved_device).manual_seed(int(seed))
+    starting_indices: torch.Tensor | None = None
+    if positive_sample:
+        starting_indices = torch.randint(
+            low=0,
+            high=int(cycle_length),
+            size=(int(num_samples),),
+            generator=generator,
+            device=resolved_device,
+        )
+    return BallsInBinsSigmaReuseChunk(
+        num_samples=int(num_samples),
+        starting_indices=starting_indices,
+        noise_generator_state=generator.get_state(),
+    )
+
+
+def _generate_balls_in_bins_samples_chunk_from_reuse(
+    *,
+    sigma: float,
+    reuse_chunk: BallsInBinsSigmaReuseChunk,
+    modes_matrix: torch.Tensor,
+    resolved_device: torch.device,
+) -> torch.Tensor:
+    if sigma <= 0.0:
+        raise ValueError("sigma must be > 0")
+
+    generator = torch.Generator(device=resolved_device)
+    generator.set_state(reuse_chunk.noise_generator_state)
+
+    if reuse_chunk.starting_indices is not None:
+        means = modes_matrix[reuse_chunk.starting_indices]
+    else:
+        means = torch.zeros(
+            (int(reuse_chunk.num_samples), int(modes_matrix.shape[1])),
+            dtype=torch.float64,
+            device=resolved_device,
+        )
+
+    noise = torch.randn(
+        int(reuse_chunk.num_samples),
+        int(modes_matrix.shape[1]),
+        generator=generator,
+        device=resolved_device,
+        dtype=torch.float64,
+    ) * float(sigma)
+
+    return means + noise
+
+
 def _compute_balls_in_bins_privacy_loss_chunk(
     *,
     samples: torch.Tensor,
@@ -1360,6 +1455,97 @@ def _compute_balls_in_bins_privacy_loss_chunk(
     )
 
 
+def build_balls_in_bins_sigma_reuse_state(
+    *,
+    coeffs: Sequence[float],
+    cycle_length: int,
+    horizon: int,
+    num_samples: int,
+    seed: int = 0,
+    chunk_size: int | None = None,
+    backend: str = "auto",
+    device: str | torch.device | None = None,
+    distributed_mode: str | None = "none",
+    distributed_dp_runtime: bool = False,
+) -> BallsInBinsSigmaReuseState:
+    """
+    Build candidate-local reusable sampling state for repeated sigma probes.
+
+    The returned object fixes the discrete mode choices and the Gaussian RNG
+    streams per chunk while leaving sigma itself free. This is a
+    semantics-preserving refinement of the direct seeded path for one fixed
+    candidate mechanism.
+    """
+    _validate_bnb_chunking(
+        num_samples=int(num_samples),
+        chunk_size=chunk_size,
+        num_workers=0,
+    )
+    resolved_backend, resolved_device = _resolve_bnb_backend_and_device(
+        backend=backend,
+        device=device,
+    )
+    resolved_distributed_mode, _auto_selected = _resolve_bnb_distributed_mode(
+        distributed_mode=distributed_mode,
+        distributed_dp_runtime=distributed_dp_runtime,
+    )
+    specs = _derive_bnb_chunk_specs(
+        num_samples=int(num_samples),
+        seed=int(seed),
+        chunk_size=chunk_size,
+    )
+    if resolved_distributed_mode == "chunk_shard":
+        if not dist.is_available() or not dist.is_initialized():
+            raise ValueError(
+                "bnb_distributed_mode='chunk_shard' requires torch.distributed to be initialized"
+            )
+        specs = _assign_bnb_chunk_specs_to_shard(
+            specs=specs,
+            rank=dist.get_rank(),
+            world_size=dist.get_world_size(),
+        )
+
+    modes_matrix = _build_balls_in_bins_modes_matrix(
+        coeffs=coeffs,
+        cycle_length=int(cycle_length),
+        horizon=int(horizon),
+        device=resolved_device,
+    )
+
+    positive_chunks = tuple(
+        _build_balls_in_bins_sigma_reuse_chunk(
+            cycle_length=int(cycle_length),
+            num_samples=int(chunk_num_samples),
+            seed=int(chunk_seed),
+            positive_sample=True,
+            resolved_device=resolved_device,
+        )
+        for chunk_num_samples, chunk_seed in specs
+    )
+    negative_chunks = tuple(
+        _build_balls_in_bins_sigma_reuse_chunk(
+            cycle_length=int(cycle_length),
+            num_samples=int(chunk_num_samples),
+            seed=int(chunk_seed) + 1,
+            positive_sample=False,
+            resolved_device=resolved_device,
+        )
+        for chunk_num_samples, chunk_seed in specs
+    )
+
+    return BallsInBinsSigmaReuseState(
+        cycle_length=int(cycle_length),
+        horizon=int(horizon),
+        backend=resolved_backend,
+        device=resolved_device,
+        distributed_mode=resolved_distributed_mode,
+        distributed_dp_runtime=bool(distributed_dp_runtime),
+        modes_matrix=modes_matrix,
+        positive_chunks=positive_chunks,
+        negative_chunks=negative_chunks,
+    )
+
+
 def sample_balls_in_bins_llr_chunks(
     *,
     coeffs: Sequence[float],
@@ -1375,6 +1561,7 @@ def sample_balls_in_bins_llr_chunks(
     device: str | torch.device | None = None,
     distributed_mode: str | None = "none",
     distributed_dp_runtime: bool = False,
+    sigma_reuse_state: BallsInBinsSigmaReuseState | None = None,
 ) -> list[torch.Tensor]:
     label = (
         "sample_balls_in_bins_llr_chunks "
@@ -1387,25 +1574,31 @@ def sample_balls_in_bins_llr_chunks(
             chunk_size=chunk_size,
             num_workers=int(num_workers),
         )
-        resolved_backend, resolved_device = _resolve_bnb_backend_and_device(
-            backend=backend,
-            device=device,
-        )
-        resolved_distributed_mode, _auto_selected = _resolve_bnb_distributed_mode(
-            distributed_mode=distributed_mode,
-            distributed_dp_runtime=distributed_dp_runtime,
-        )
-        specs = _derive_bnb_chunk_specs(
-            num_samples=int(num_samples),
-            seed=int(seed),
-            chunk_size=chunk_size,
-        )
+        if sigma_reuse_state is None:
+            resolved_backend, resolved_device = _resolve_bnb_backend_and_device(
+                backend=backend,
+                device=device,
+            )
+            resolved_distributed_mode, _auto_selected = _resolve_bnb_distributed_mode(
+                distributed_mode=distributed_mode,
+                distributed_dp_runtime=distributed_dp_runtime,
+            )
+            specs = _derive_bnb_chunk_specs(
+                num_samples=int(num_samples),
+                seed=int(seed),
+                chunk_size=chunk_size,
+            )
+        else:
+            resolved_backend = str(sigma_reuse_state.backend)
+            resolved_device = torch.device(sigma_reuse_state.device)
+            resolved_distributed_mode = str(sigma_reuse_state.distributed_mode)
+            specs = []
         _debug_timing(
             "sample_balls_in_bins_llr_chunks config "
             f"backend={resolved_backend} device={resolved_device} "
             f"distributed_mode={resolved_distributed_mode} chunks={len(specs)}"
         )
-    if resolved_distributed_mode == "chunk_shard":
+    if sigma_reuse_state is None and resolved_distributed_mode == "chunk_shard":
         if not dist.is_available() or not dist.is_initialized():
             raise ValueError(
                 "bnb_distributed_mode='chunk_shard' requires torch.distributed to be initialized"
@@ -1415,32 +1608,52 @@ def sample_balls_in_bins_llr_chunks(
             rank=dist.get_rank(),
             world_size=dist.get_world_size(),
         )
-    with _timed("build_balls_in_bins_modes_matrix"):
-        modes_matrix = _build_balls_in_bins_modes_matrix(
-            coeffs=coeffs,
-            cycle_length=int(cycle_length),
-            horizon=int(horizon),
-            device=resolved_device,
-        )
+    if sigma_reuse_state is None:
+        with _timed("build_balls_in_bins_modes_matrix"):
+            modes_matrix = _build_balls_in_bins_modes_matrix(
+                coeffs=coeffs,
+                cycle_length=int(cycle_length),
+                horizon=int(horizon),
+                device=resolved_device,
+            )
+    else:
+        modes_matrix = sigma_reuse_state.modes_matrix
     _debug_timing(
         "modes_matrix "
         f"shape={tuple(modes_matrix.shape)} device={modes_matrix.device}"
     )
 
-    def _one(chunk_num_samples: int, chunk_seed: int) -> torch.Tensor:
-        with _timed(f"chunk seed={int(chunk_seed)} n={int(chunk_num_samples)}"):
+    def _one(
+        chunk_num_samples: int | None,
+        chunk_seed: int | None,
+        reuse_chunk: BallsInBinsSigmaReuseChunk | None = None,
+    ) -> torch.Tensor:
+        label = (
+            f"chunk seed={int(chunk_seed)} n={int(chunk_num_samples)}"
+            if reuse_chunk is None
+            else f"chunk reuse n={int(reuse_chunk.num_samples)}"
+        )
+        with _timed(label):
             with _timed("generate_samples"):
-                samples = _generate_balls_in_bins_samples_chunk(
-                    coeffs=coeffs,
-                    cycle_length=int(cycle_length),
-                    horizon=int(horizon),
-                    sigma=float(sigma),
-                    num_samples=int(chunk_num_samples),
-                    seed=int(chunk_seed),
-                    positive_sample=bool(positive_sample),
-                    modes_matrix=modes_matrix,
-                    device=resolved_device,
-                )
+                if reuse_chunk is None:
+                    samples = _generate_balls_in_bins_samples_chunk(
+                        coeffs=coeffs,
+                        cycle_length=int(cycle_length),
+                        horizon=int(horizon),
+                        sigma=float(sigma),
+                        num_samples=int(chunk_num_samples),
+                        seed=int(chunk_seed),
+                        positive_sample=bool(positive_sample),
+                        modes_matrix=modes_matrix,
+                        device=resolved_device,
+                    )
+                else:
+                    samples = _generate_balls_in_bins_samples_chunk_from_reuse(
+                        sigma=float(sigma),
+                        reuse_chunk=reuse_chunk,
+                        modes_matrix=modes_matrix,
+                        resolved_device=resolved_device,
+                    )
             with _timed("compute_privacy_loss"):
                 llr = _compute_balls_in_bins_privacy_loss_chunk(
                     samples=samples,
@@ -1451,6 +1664,37 @@ def sample_balls_in_bins_llr_chunks(
                 llr = -llr
 
             return llr
+
+    reuse_chunks = (
+        sigma_reuse_state.positive_chunks
+        if (sigma_reuse_state is not None and positive_sample)
+        else sigma_reuse_state.negative_chunks
+        if sigma_reuse_state is not None
+        else ()
+    )
+
+    if sigma_reuse_state is not None:
+        if len(reuse_chunks) == 1:
+            with _timed(f"compute_single_reuse_chunk n={int(reuse_chunks[0].num_samples)}"):
+                local_chunks = [_one(None, None, reuse_chunks[0])]
+            with _timed("reduce_chunks_to_coordinator"):
+                return _reduce_bnb_llr_chunks_to_coordinator(
+                    local_chunks=local_chunks,
+                    distributed_mode=resolved_distributed_mode,
+                    backend=resolved_backend,
+                    device=resolved_device,
+                )
+
+        if resolved_backend == "cuda" or len(reuse_chunks) > 1:
+            with _timed(f"compute_reuse_chunks_serial count={len(reuse_chunks)}"):
+                local_chunks = [_one(None, None, reuse_chunk) for reuse_chunk in reuse_chunks]
+            with _timed("reduce_chunks_to_coordinator"):
+                return _reduce_bnb_llr_chunks_to_coordinator(
+                    local_chunks=local_chunks,
+                    distributed_mode=resolved_distributed_mode,
+                    backend=resolved_backend,
+                    device=resolved_device,
+                )
 
     if len(specs) == 1:
         chunk_num_samples, chunk_seed = specs[0]
@@ -1526,6 +1770,7 @@ def estimate_balls_in_bins_epsilon_monte_carlo(
     device: str | torch.device | None = None,
     distributed_mode: str | None = "none",
     distributed_dp_runtime: bool = False,
+    sigma_reuse_state: BallsInBinsSigmaReuseState | None = None,
 ) -> float:
     with _timed(
         "estimate_balls_in_bins_epsilon_monte_carlo "
@@ -1554,6 +1799,7 @@ def estimate_balls_in_bins_epsilon_monte_carlo(
                 device=device,
                 distributed_mode=distributed_mode,
                 distributed_dp_runtime=distributed_dp_runtime,
+                sigma_reuse_state=sigma_reuse_state,
             )
         with _timed("sample_negative_llr_chunks"):
             negative_chunks = sample_balls_in_bins_llr_chunks(
@@ -1570,6 +1816,7 @@ def estimate_balls_in_bins_epsilon_monte_carlo(
                 device=device,
                 distributed_mode=distributed_mode,
                 distributed_dp_runtime=distributed_dp_runtime,
+                sigma_reuse_state=sigma_reuse_state,
             )
     if distributed_mode == "chunk_shard" and dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
         result = _make_bnb_broadcast_result_tensor(
@@ -1628,6 +1875,7 @@ def estimate_balls_in_bins_epsilon_monte_carlo_optimistic(
     device: str | torch.device | None = None,
     distributed_mode: str | None = "none",
     distributed_dp_runtime: bool = False,
+    sigma_reuse_state: BallsInBinsSigmaReuseState | None = None,
 ) -> float:
     """
     Estimate epsilon directly from balls-in-bins Monte Carlo LLR samples.
@@ -1658,6 +1906,7 @@ def estimate_balls_in_bins_epsilon_monte_carlo_optimistic(
                 device=device,
                 distributed_mode=distributed_mode,
                 distributed_dp_runtime=distributed_dp_runtime,
+                sigma_reuse_state=sigma_reuse_state,
             )
         with _timed("sample_negative_llr_chunks"):
             negative_chunks = sample_balls_in_bins_llr_chunks(
@@ -1674,6 +1923,7 @@ def estimate_balls_in_bins_epsilon_monte_carlo_optimistic(
                 device=device,
                 distributed_mode=distributed_mode,
                 distributed_dp_runtime=distributed_dp_runtime,
+                sigma_reuse_state=sigma_reuse_state,
             )
     if (
         distributed_mode == "chunk_shard"
