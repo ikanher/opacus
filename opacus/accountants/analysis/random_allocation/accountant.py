@@ -41,6 +41,7 @@ PMF_MASS_TOL = 10 * np.finfo(float).eps
 SPACING_ATOL = 1e-12
 SPACING_RTOL = 1e-6
 MIN_GRID_SIZE = 100
+FLOAT64_LOG_MAX = math.log(np.finfo(np.float64).max)
 
 __all__ = [
     "RandomAllocationAccountantInputs",
@@ -333,9 +334,14 @@ class _GeometricDiscreteDist:
 
     @property
     def x_array(self) -> np.ndarray:
-        return self.x_min * (
-            self.ratio ** np.arange(self.PMF_array.size, dtype=np.float64)
-        )
+        log_x_min = math.log(self.x_min)
+        log_ratio = math.log(self.ratio)
+        logs = log_x_min + log_ratio * np.arange(self.PMF_array.size, dtype=np.float64)
+        out = np.empty(self.PMF_array.size, dtype=np.float64)
+        finite = logs <= FLOAT64_LOG_MAX
+        out[finite] = np.exp(logs[finite])
+        out[~finite] = np.inf
+        return out
 
     def truncate_edges(
         self, tail_truncation: float, bound_type: _BoundType
@@ -492,7 +498,12 @@ def _compute_bin_ratio(x_array: np.ndarray) -> float:
     if np.any(x_array <= 0):
         raise ValueError("Cannot compute geometric bin ratio for non-positive values")
 
-    logs = np.log(x_array[1:] / x_array[:-1])
+    finite = np.isfinite(x_array)
+    if np.count_nonzero(finite) < 2:
+        raise ValueError("Cannot compute geometric bin ratio with less than 2 finite bins")
+
+    finite_x = np.asarray(x_array[finite], dtype=np.float64)
+    logs = np.diff(np.log(finite_x))
     median = float(np.median(logs))
     if not np.allclose(logs, median, rtol=SPACING_RTOL, atol=SPACING_ATOL):
         raise ValueError("Distribution has non-uniform bin widths")
@@ -971,25 +982,28 @@ def _geometric_convolve(
     infinite masses are combined analytically. The result is then truncated in
     the domination direction requested by `bound_type`.
     """
-    ratio = _compute_bin_ratio_two_arrays(dist_1.x_array, dist_2.x_array)
-    x1 = dist_1.x_array
-    x2 = dist_2.x_array
+    if not _stable_isclose(dist_1.ratio, dist_2.ratio):
+        raise ValueError("Grid ratios must match")
+
+    ratio = 0.5 * (dist_1.ratio + dist_2.ratio)
+    x1_min = dist_1.x_min
+    x2_min = dist_2.x_min
     p1 = dist_1.PMF_array
     p2 = dist_2.PMF_array
-    if x1[0] > x2[0]:
-        x1, p1, x2, p2 = x2, p2, x1, p1
+    if x1_min > x2_min:
+        x1_min, p1, x2_min, p2 = x2_min, p2, x1_min, p1
 
-    scale = float(x2[0] / x1[0])
-    n = max(x1.size, x2.size)
-    if x1.size < n:
-        x1, p1 = _pad_right_geometric(x1, p1, ratio, n)
+    scale = float(x2_min / x1_min)
+    n = max(p1.size, p2.size)
+    if p1.size < n:
+        p1 = np.pad(p1, (0, n - p1.size), mode="constant")
 
-    if x2.size < n:
-        x2, p2 = _pad_right_geometric(x2, p2, ratio, n)
+    if p2.size < n:
+        p2 = np.pad(p2, (0, n - p2.size), mode="constant")
 
     if n == 1:
         mass = p1[0] * p2[0]
-        x_out = np.array([(scale + 1.0) * x1[0]], dtype=np.float64)
+        x_out_min = x1_min + x2_min
         pmf_out = np.array([mass], dtype=np.float64)
     else:
         log_r = math.log(ratio)
@@ -1042,7 +1056,7 @@ def _geometric_convolve(
                     comp[k2] = (t - pmf_out[k2]) - y
                     pmf_out[k2] = t
 
-        x_out = x1 * (scale + 1.0)
+        x_out_min = x1_min + x2_min
 
     expected_neg_inf, expected_pos_inf = _convolve_infinite_masses(
         dist_1.p_neg_inf, dist_1.p_pos_inf, dist_2.p_neg_inf, dist_2.p_pos_inf
@@ -1052,19 +1066,8 @@ def _geometric_convolve(
     )
 
     return _GeometricDiscreteDist(
-        float(x_out[0]), ratio, pmf_out, p_neg_inf, p_pos_inf
+        float(x_out_min), ratio, pmf_out, p_neg_inf, p_pos_inf
     ).truncate_edges(tail_truncation, bound_type)
-
-
-def _pad_right_geometric(x: np.ndarray, p: np.ndarray, ratio: float, target_n: int):
-    n = x.size
-    if n >= target_n:
-        return x, p
-
-    k = target_n - n
-    tail = x[-1] * (ratio ** np.arange(1, k + 1, dtype=np.float64))
-
-    return np.concatenate([x, tail]), np.pad(p, (0, k), mode="constant")
 
 
 def _exp_linear_to_geometric(dist: _LinearDiscreteDist) -> _GeometricDiscreteDist:

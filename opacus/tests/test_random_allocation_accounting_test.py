@@ -29,6 +29,7 @@ from opacus.accountants.analysis.random_allocation.fixed_bin import (
     _build_fixed_bin_gaussian_mixture_pair,
     _diagnose_fixed_bin_ambient_nonfinite_upper_bound,
     estimate_epsilon_range_fixed_bin_random_allocation,
+    estimate_epsilon_upper_fixed_bin_random_allocation,
     get_noise_multiplier_fixed_bin_random_allocation,
     resolve_fixed_bin_random_allocation_bridge_inputs,
     resolve_fixed_bin_random_allocation_bridge_runtime_config,
@@ -413,6 +414,43 @@ def test_initial_package_dominating_realization_avoids_overflow_warnings() -> No
     assert realization.p_loss_inf >= 0.0
 
 
+def test_compute_bin_ratio_accepts_geometric_grid_with_infinite_tail() -> None:
+    x_array = np.array([2.5e307, 5.0e307, 1.0e308, np.inf], dtype=np.float64)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        ratio = random_allocation_module._compute_bin_ratio(x_array)  # type: ignore[attr-defined]
+
+    assert ratio == pytest.approx(2.0, rel=0.0, abs=1e-12)
+
+
+def test_geometric_convolution_avoids_overflow_warnings_on_large_grids() -> None:
+    pmf = np.array([0.5, 0.3, 0.2, 0.0], dtype=np.float64)
+    dist_1 = random_allocation_module._GeometricDiscreteDist(  # type: ignore[attr-defined]
+        x_min=2.5e307,
+        ratio=2.0,
+        pmf=pmf,
+    )
+    dist_2 = random_allocation_module._GeometricDiscreteDist(  # type: ignore[attr-defined]
+        x_min=5.0e307,
+        ratio=2.0,
+        pmf=pmf,
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        out = random_allocation_module._geometric_convolve(  # type: ignore[attr-defined]
+            dist_1,
+            dist_2,
+            tail_truncation=1e-8,
+            bound_type=random_allocation_module._BoundType.DOMINATES,  # type: ignore[attr-defined]
+        )
+
+    assert out.x_min == pytest.approx(7.5e307, rel=1e-12)
+    assert out.ratio == pytest.approx(2.0, rel=0.0, abs=1e-12)
+    assert np.all(np.isfinite(out.PMF_array))
+
+
 def test_fixed_bin_bridge_keeps_source_law_distinct_from_repeated_random_allocation() -> None:
     repeated = resolve_random_allocation_accountant_inputs(
         mechanism="gaussian",
@@ -506,6 +544,29 @@ def test_fixed_bin_bridge_first_dpsgd_control_supports_package_backed_interval()
     assert upper >= lower or math.isinf(upper)
 
 
+def test_fixed_bin_bridge_upper_only_matches_interval_upper_for_exact_pair_route() -> None:
+    runtime = resolve_fixed_bin_random_allocation_bridge_runtime_config(target_delta=1e-5)
+    upper = estimate_epsilon_upper_fixed_bin_random_allocation(
+        mechanism="gaussian",
+        c_matrix=np.array([[1.0] * 6], dtype=np.float64),
+        bins=3,
+        noise_multiplier=2.0,
+        target_delta=1e-5,
+        runtime_config=runtime,
+    )
+    interval_upper, interval_lower = estimate_epsilon_range_fixed_bin_random_allocation(
+        mechanism="gaussian",
+        c_matrix=np.array([[1.0] * 6], dtype=np.float64),
+        bins=3,
+        noise_multiplier=2.0,
+        target_delta=1e-5,
+        runtime_config=runtime,
+    )
+    assert math.isfinite(upper)
+    assert upper == pytest.approx(interval_upper, rel=0.0, abs=1e-12)
+    assert interval_upper >= interval_lower or math.isinf(interval_upper)
+
+
 def test_fixed_bin_bridge_first_mf_extension_fixture_stays_separate_from_repeated_route() -> None:
     upper, lower = estimate_epsilon_range_fixed_bin_random_allocation(
         mechanism="bsr",
@@ -524,6 +585,30 @@ def test_fixed_bin_bridge_first_mf_extension_fixture_stays_separate_from_repeate
     assert repeated.route != "fixed_bin_bridge_exact_pair_package"
     assert math.isfinite(lower)
     assert upper >= lower or math.isinf(upper)
+
+
+def test_fixed_bin_bridge_upper_only_matches_interval_upper_for_ambient_route() -> None:
+    runtime = resolve_fixed_bin_random_allocation_bridge_runtime_config(target_delta=1e-5)
+    c_matrix = np.array([[1.0, 0.5, 1.0, 0.5, 1.0, 0.5]], dtype=np.float64)
+    upper = estimate_epsilon_upper_fixed_bin_random_allocation(
+        mechanism="bsr",
+        c_matrix=c_matrix,
+        bins=3,
+        noise_multiplier=2.5,
+        target_delta=1e-5,
+        runtime_config=runtime,
+    )
+    interval_upper, interval_lower = estimate_epsilon_range_fixed_bin_random_allocation(
+        mechanism="bsr",
+        c_matrix=c_matrix,
+        bins=3,
+        noise_multiplier=2.5,
+        target_delta=1e-5,
+        runtime_config=runtime,
+    )
+    assert math.isfinite(upper)
+    assert upper == pytest.approx(interval_upper, rel=0.0, abs=1e-12)
+    assert interval_upper >= interval_lower or math.isinf(interval_upper)
 
 
 def test_fixed_bin_bridge_runtime_policy_defaults_to_candidate_grid() -> None:
@@ -739,16 +824,14 @@ def test_fixed_bin_bridge_live_bsr_fixture_computes_after_explicit_remove_dual_r
 def test_fixed_bin_bridge_noise_search_returns_bracketed_sigma_at_interval_floor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def _fake_estimate(**kwargs):
+    def _fake_estimate_upper(**kwargs):
         sigma = float(kwargs["noise_multiplier"])
-        if sigma >= 1.25:
-            return (8.963280189895514, 8.90)
-        return (9.25, 9.10)
+        return 8.963280189895514 if sigma >= 1.25 else 9.25
 
     monkeypatch.setattr(
         fixed_bin_random_allocation_module,
-        "estimate_epsilon_range_fixed_bin_random_allocation",
-        _fake_estimate,
+        "estimate_epsilon_upper_fixed_bin_random_allocation",
+        _fake_estimate_upper,
     )
     monkeypatch.setattr(fixed_bin_random_allocation_module, "MIN_NOISE_SEARCH_SIGMA_INTERVAL", 0.05)
 
@@ -761,6 +844,41 @@ def test_fixed_bin_bridge_noise_search_returns_bracketed_sigma_at_interval_floor
     )
 
     assert sigma == pytest.approx(1.25, rel=0.0, abs=1e-12)
+
+
+def test_fixed_bin_bridge_noise_search_uses_upper_only_evaluator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[float] = []
+
+    def _fake_upper(**kwargs):
+        sigma = float(kwargs["noise_multiplier"])
+        calls.append(sigma)
+        return 8.5 if sigma >= 1.5 else 9.5
+
+    monkeypatch.setattr(
+        fixed_bin_random_allocation_module,
+        "estimate_epsilon_upper_fixed_bin_random_allocation",
+        _fake_upper,
+    )
+    monkeypatch.setattr(
+        fixed_bin_random_allocation_module,
+        "estimate_epsilon_range_fixed_bin_random_allocation",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("full interval evaluator should not be used by search")
+        ),
+    )
+
+    sigma = get_noise_multiplier_fixed_bin_random_allocation(
+        mechanism="gaussian",
+        c_matrix=np.eye(2, dtype=np.float64),
+        bins=1,
+        target_epsilon=9.0,
+        target_delta=1e-5,
+    )
+
+    assert sigma > 0.0
+    assert calls
 
 
 def test_fixed_bin_bridge_live_band_mf_fixture_computes_after_interval_floor_return() -> None:
@@ -857,15 +975,15 @@ def test_fixed_bin_bridge_noise_search_propagates_logical_horizon(
 ) -> None:
     calls: list[float | None] = []
 
-    def _fake_estimate_range(**kwargs):
+    def _fake_estimate_upper(**kwargs):
         calls.append(kwargs.get("logical_horizon"))
         sigma = float(kwargs["noise_multiplier"])
-        return (1.0 / sigma, 0.5 / sigma)
+        return 1.0 / sigma
 
     monkeypatch.setattr(
         fixed_bin_random_allocation_module,
-        "estimate_epsilon_range_fixed_bin_random_allocation",
-        _fake_estimate_range,
+        "estimate_epsilon_upper_fixed_bin_random_allocation",
+        _fake_estimate_upper,
     )
 
     sigma = get_noise_multiplier_fixed_bin_random_allocation(
@@ -1222,8 +1340,8 @@ def test_get_noise_multiplier_fixed_bin_random_allocation_raises_convergence_err
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "opacus.accountants.analysis.random_allocation.fixed_bin.estimate_epsilon_range_fixed_bin_random_allocation",
-        lambda **kwargs: (float("inf"), 0.0),
+        "opacus.accountants.analysis.random_allocation.fixed_bin.estimate_epsilon_upper_fixed_bin_random_allocation",
+        lambda **kwargs: float("inf"),
     )
     with pytest.raises(NoiseSearchConvergenceError) as exc_info:
         get_noise_multiplier_fixed_bin_random_allocation(

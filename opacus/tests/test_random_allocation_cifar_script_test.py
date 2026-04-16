@@ -165,6 +165,22 @@ def test_parse_args_exposes_amplified_direct_verification_surface(
     assert args.amplified_verify_budgets == ["200000,500000"]
 
 
+def test_parse_args_accepts_fixed_bin_loss_discretization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "replicate_bisr_paper_cifar_noise_multipliers.py",
+            "--fixed-bin-loss-discretization",
+            "0.02",
+        ],
+    )
+    args = _MODULE.parse_args()
+    assert args.fixed_bin_loss_discretization == pytest.approx(0.02)
+
+
 def test_parse_args_accepts_blt_method(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         sys,
@@ -1069,7 +1085,37 @@ def test_build_report_forwards_bnb_overrides_together(
     assert captured["bnb_device"] == "cpu"
     assert captured["bnb_distributed_mode"] == "chunk_shard"
     assert captured["bnb_distributed_dp_runtime"] is False
+    assert captured["fixed_bin_loss_discretization"] is None
     assert report["rows"][0]["method"] == "BLT"
+
+
+def test_build_report_forwards_fixed_bin_loss_discretization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_compute_comparison_rows(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(_MODULE, "compute_comparison_rows", _fake_compute_comparison_rows)
+    _MODULE.compute_comparison_rows.last_amplified_bsr_scale_probe = None
+    _MODULE.compute_comparison_rows.last_amplified_bandinvmf_accountant_probe = None
+    _MODULE.compute_comparison_rows.last_amplified_bandmf_matrix_family_probe = {}
+    _MODULE.compute_comparison_rows.last_non_amplified_bandinvmf_probe = None
+
+    report = _MODULE.build_report(
+        include_amplified=False,
+        include_non_amplified=False,
+        include_amplified_deterministic=True,
+        amplified_backends=["ra_fixed_bin_bnb"],
+        skip_bandinvmf=False,
+        methods=["BISR"],
+        fixed_bin_loss_discretization=0.02,
+    )
+
+    assert captured["fixed_bin_loss_discretization"] == pytest.approx(0.02)
+    assert report["metadata"]["fixed_bin_loss_discretization"] == pytest.approx(0.02)
 
 
 def test_direct_amplified_bsr_verification_rows_record_single_verify_and_evr(

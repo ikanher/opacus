@@ -275,6 +275,10 @@ def build_poisson_gaussian_mixture_neighboring_pair(
     reverse law is the centered single-mode Gaussian reference. This is an exact
     remove/add neighboring-pair object, not an approximation.
 
+    Route note:
+    - this constructor enumerates the exact trace family and is therefore a
+      tiny-control / diagnostic surface rather than a maintained scalable route
+
     Source: `PLD`.
 
     Args:
@@ -349,6 +353,10 @@ def build_product_gaussian_mixture_neighboring_pair(
     The forward law is the exact product-measure Gaussian mixture induced by the
     per-column participation probabilities. The reverse law is the centered
     single-mode Gaussian reference.
+
+    Route note:
+    - this constructor enumerates the exact trace family and is therefore a
+      tiny-control / diagnostic surface rather than a maintained scalable route
 
     Source: `PLD`.
 

@@ -203,7 +203,12 @@ def compute_prefix_workload_frobenius_sq_from_matrix(
         raise ValueError("c_matrix must have positive size")
 
     a = torch.tril(torch.ones((steps, steps), dtype=torch.float64))
-    ac_inv = torch.linalg.solve(matrix.T, a.T).T
+    ac_inv = torch.linalg.solve_triangular(
+        matrix.T,
+        a.T,
+        upper=True,
+        unitriangular=False,
+    ).T
     return float(torch.sum(ac_inv * ac_inv).item())
 
 

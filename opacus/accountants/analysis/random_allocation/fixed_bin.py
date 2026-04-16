@@ -37,6 +37,7 @@ from .accountant import (
 from .exact_laws import ExactLawMetadata, FiniteGaussianMixtureNeighboringPair
 from .initial_package import (
     _build_exact_family_accountant_contract_from_exact_law,
+    estimate_epsilon_random_allocation_from_initial_package,
     _estimate_epsilon_range_random_allocation_from_exact_family_round_pair_package,
     _ExactFamilyRoundPairPackageInputs,
     _PairDrivenAmbientQuantitativeWindowInputs,
@@ -54,6 +55,7 @@ __all__ = [
     "resolve_fixed_bin_random_allocation_bridge_inputs",
     "resolve_fixed_bin_random_allocation_bridge_runtime_config",
     "estimate_epsilon_range_fixed_bin_random_allocation",
+    "estimate_epsilon_upper_fixed_bin_random_allocation",
     "get_noise_multiplier_fixed_bin_random_allocation",
 ]
 
@@ -559,6 +561,63 @@ def estimate_epsilon_range_fixed_bin_random_allocation(
     )
 
 
+def estimate_epsilon_upper_fixed_bin_random_allocation(
+    *,
+    mechanism: str,
+    c_matrix: np.ndarray,
+    bins: int,
+    noise_multiplier: float,
+    target_delta: float,
+    runtime_config: RandomAllocationGaussianRuntimeConfig | None = None,
+    logical_horizon: int | None = None,
+) -> float:
+    """Evaluate only the conservative upper `ε` for the fixed-bin bridge.
+
+    This is the production upper-bound query used by fixed-bin sigma search.
+    It avoids lower-bound accounting work that is only needed by the full
+    interval API.
+    """
+
+    runtime = runtime_config or resolve_fixed_bin_random_allocation_bridge_runtime_config(
+        target_delta=target_delta
+    )
+    matrix = np.asarray(c_matrix, dtype=np.float64)
+    exact_pair = build_fixed_bin_exact_law_pair(
+        mechanism=mechanism,
+        c_matrix=matrix,
+        bins=int(bins),
+        noise_multiplier=noise_multiplier,
+        logical_horizon=logical_horizon,
+    )
+    resolved_package = _resolve_fixed_bin_exact_package(
+        exact_pair=exact_pair,
+        bins=int(bins),
+    )
+
+    if resolved_package.pair_inputs is not None:
+        return float(
+            estimate_epsilon_random_allocation_from_initial_package(
+                inputs=resolved_package.pair_inputs,
+                target_delta=target_delta,
+                runtime_config=runtime,
+            )
+        )
+
+    if resolved_package.exact_family_round_pair_package_inputs is not None:
+        return float(
+            estimate_epsilon_random_allocation_from_initial_package(
+                inputs=resolved_package.exact_family_round_pair_package_inputs.pair_driven_inputs,
+                target_delta=target_delta,
+                runtime_config=runtime,
+            )
+        )
+
+    raise NotImplementedError(
+        resolved_package.blocker
+        or "fixed-bin bridge exact package did not resolve to an evaluable exact route"
+    )
+
+
 def _diagnose_fixed_bin_ambient_nonfinite_upper_bound(
     *,
     mechanism: str,
@@ -678,7 +737,7 @@ def _fixed_bin_search_eval(
     runtime: RandomAllocationGaussianRuntimeConfig,
     logical_horizon: int | None = None,
 ) -> float:
-    eps_upper, _eps_lower = estimate_epsilon_range_fixed_bin_random_allocation(
+    eps_upper = estimate_epsilon_upper_fixed_bin_random_allocation(
         mechanism=mechanism,
         c_matrix=c_matrix,
         bins=bins,
