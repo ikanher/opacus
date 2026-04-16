@@ -94,7 +94,6 @@ from opacus.accountants.analysis.bandinvmf import (
 from opacus.accountants.analysis.bnb import (
     BNBCalibrationStatus,
     build_bnb_toeplitz_c_matrix_and_contract,
-    build_balls_in_bins_sigma_reuse_state,
     describe_bnb_calibration_report,
     make_bnb_calibration_report,
     parse_bnb_calibration_report,
@@ -119,18 +118,6 @@ from opacus.noise_mechanisms import (
 
 from opacus.schedulers import _GradClipScheduler, _NoiseScheduler
 from opacus.utils.fast_gradient_clipping_utils import DPLossFastGradientClipping
-from opacus.mf.bifr_auto_gamma import (
-    BIFRAutoGammaCandidateResult,
-    BIFRAutoGammaSelectionResult,
-    canonicalize_bifr_auto_gamma_runtime_state,
-    choose_best_bifr_auto_gamma_candidate,
-    clear_bifr_auto_gamma_derived_state,
-    clear_bifr_auto_gamma_policy_metadata,
-    has_explicit_bifr_auto_gamma_policy,
-    resolve_bifr_auto_gamma_candidate_fracs,
-    score_bifr_candidate_paper_rmse,
-    validate_bifr_auto_gamma_runtime_contract,
-)
 from opacus.validators.module_validator import ModuleValidator
 from opacus.utils.uniform_sampler import (
     BallsInBinsSampler,
@@ -2220,188 +2207,6 @@ class PrivacyEngine:
             nm_kwargs=nm_kwargs,
         )
 
-    @staticmethod
-    def _bifr_auto_gamma_policy_active(
-        *, mechanism_config: NoiseMechanismConfig
-    ) -> bool:
-        if mechanism_config.mechanism != "bifr":
-            return False
-        state = canonicalize_bifr_auto_gamma_runtime_state(
-            runtime_state=mechanism_config.mechanism_state
-        )
-        return has_explicit_bifr_auto_gamma_policy(state)
-
-    @staticmethod
-    def _build_bifr_auto_gamma_candidate_reuse_state(
-        *,
-        mechanism_config: NoiseMechanismConfig,
-        sampling_semantics: Optional[SamplingSemantics],
-        kwargs: Dict[str, Any],
-    ):
-        state = mechanism_config.mechanism_state
-        coeffs = state.get("bnb_accountant_coeffs", state.get("coeffs"))
-        cycle_length = state.get("bnb_cycle_length", state.get("bnb_bins"))
-        horizon = state.get("bifr_horizon")
-        if not isinstance(coeffs, (list, tuple)) or len(coeffs) == 0:
-            return None
-        if cycle_length is None or horizon is None:
-            return None
-
-        calibration_cfg = resolve_bnb_calibration_kwargs(overrides=kwargs)
-        try:
-            return build_balls_in_bins_sigma_reuse_state(
-                coeffs=[float(c) for c in coeffs],
-                cycle_length=int(cycle_length),
-                horizon=int(horizon),
-                num_samples=int(calibration_cfg["bnb_num_samples"]),
-                seed=int(calibration_cfg["bnb_seed"]),
-                chunk_size=calibration_cfg["bnb_chunk_size"],
-                backend=str(calibration_cfg["bnb_backend"]),
-                device=calibration_cfg["bnb_device"],
-                distributed_mode=str(calibration_cfg["bnb_distributed_mode"]),
-                distributed_dp_runtime=bool(
-                    calibration_cfg["bnb_distributed_dp_runtime"]
-                ),
-            )
-        except Exception:
-            return None
-
-    def _resolve_bifr_bnb_auto_gamma_for_target_epsilon(
-        self,
-        *,
-        mechanism_config: NoiseMechanismConfig,
-        target_epsilon: float,
-        target_delta: float,
-        total_steps: Optional[int],
-        epochs: Optional[int],
-        poisson_sampling: bool,
-        data_loader: DataLoader,
-        local_sampling_semantics: Optional[SamplingSemantics],
-        optimizer: optim.Optimizer,
-        query_runtime_context: Dict[str, Any],
-        kwargs: Dict[str, Any],
-    ) -> tuple[NoiseMechanismConfig, float, Dict[str, Any]]:
-        base_state = canonicalize_bifr_auto_gamma_runtime_state(
-            runtime_state=mechanism_config.mechanism_state
-        )
-        validate_bifr_auto_gamma_runtime_contract(
-            mechanism=mechanism_config.mechanism,
-            accounting_mode=mechanism_config.accounting_mode,
-            sampling_mode=(
-                local_sampling_semantics.sampling_mode
-                if local_sampling_semantics is not None
-                else None
-            ),
-            runtime_state=base_state,
-            target_epsilon=float(target_epsilon),
-            target_delta=float(target_delta),
-        )
-        candidate_fracs = resolve_bifr_auto_gamma_candidate_fracs(base_state)
-        candidate_results: list[BIFRAutoGammaCandidateResult] = []
-        candidate_configs: dict[float, NoiseMechanismConfig] = {}
-
-        for frac in candidate_fracs:
-            candidate_state = clear_bifr_auto_gamma_derived_state(runtime_state=base_state)
-            candidate_state["bifr_frac"] = float(frac)
-            candidate_config = NoiseMechanismConfig(
-                mechanism="bifr",
-                accounting_mode=mechanism_config.accounting_mode,
-                mechanism_state=candidate_state,
-            )
-            candidate_config = self._augment_mf_query_mechanism_config(
-                mechanism_config=candidate_config,
-                local_sampling_semantics=local_sampling_semantics,
-                total_steps=total_steps,
-                epochs=epochs,
-                poisson_sampling=poisson_sampling,
-                data_loader=data_loader,
-                kwargs=kwargs,
-                optimizer=optimizer,
-                query_runtime_context=query_runtime_context,
-            )
-
-            bnb_c_matrix, bnb_bands, bnb_cycle_length, _ = self._resolve_bnb_runtime_inputs_for_epsilon(
-                mechanism_config=candidate_config,
-                sampling_semantics=local_sampling_semantics,
-                kwargs=kwargs,
-            )
-            candidate_kwargs = dict(kwargs)
-            reuse_state = self._build_bifr_auto_gamma_candidate_reuse_state(
-                mechanism_config=candidate_config,
-                sampling_semantics=local_sampling_semantics,
-                kwargs=candidate_kwargs,
-            )
-            acceleration_mode = "direct_fallback"
-            if reuse_state is not None:
-                candidate_kwargs["bnb_sigma_reuse_state"] = reuse_state
-                acceleration_mode = "candidate_local_sigma_reuse"
-
-            try:
-                noise_multiplier, _ = self._resolve_bnb_noise_multiplier_for_target_epsilon(
-                    mechanism_config=candidate_config,
-                    target_epsilon=target_epsilon,
-                    target_delta=target_delta,
-                    total_steps=total_steps,
-                    epochs=epochs,
-                    poisson_sampling=poisson_sampling,
-                    data_loader=data_loader,
-                    sampling_semantics=local_sampling_semantics,
-                    bnb_c_matrix=bnb_c_matrix,
-                    bnb_bands=bnb_bands,
-                    bnb_cycle_length=bnb_cycle_length,
-                    kwargs=candidate_kwargs,
-                )
-                paper_rmse = score_bifr_candidate_paper_rmse(
-                    mechanism_state=candidate_config.mechanism_state,
-                    noise_multiplier=float(noise_multiplier),
-                )
-                candidate_configs[float(frac)] = candidate_config
-                candidate_results.append(
-                    BIFRAutoGammaCandidateResult(
-                        frac=float(frac),
-                        status="computed",
-                        computed_noise_multiplier=float(noise_multiplier),
-                        paper_rmse=float(paper_rmse),
-                        acceleration_mode=acceleration_mode,
-                    )
-                )
-            except Exception as exc:
-                candidate_results.append(
-                    BIFRAutoGammaCandidateResult(
-                        frac=float(frac),
-                        status="failed",
-                        computed_noise_multiplier=None,
-                        paper_rmse=None,
-                        acceleration_mode=acceleration_mode,
-                        notes=str(exc),
-                    )
-                )
-
-        selected = choose_best_bifr_auto_gamma_candidate(candidate_results)
-        selected_config = candidate_configs[float(selected.frac)]
-        selected_state = clear_bifr_auto_gamma_policy_metadata(
-            runtime_state=selected_config.mechanism_state
-        )
-        selected_config = NoiseMechanismConfig(
-            mechanism=selected_config.mechanism,
-            accounting_mode=selected_config.accounting_mode,
-            mechanism_state=selected_state,
-        )
-        selection_result = BIFRAutoGammaSelectionResult(
-            policy=str(base_state["bifr_frac_policy"]),
-            candidate_fracs=tuple(float(frac) for frac in candidate_fracs),
-            selected_frac=float(selected.frac),
-            selected_noise_multiplier=float(selected.computed_noise_multiplier),
-            selected_paper_rmse=float(selected.paper_rmse),
-            selected_acceleration_mode=str(selected.acceleration_mode or "unknown"),
-            candidates=tuple(candidate_results),
-        )
-        return (
-            selected_config,
-            float(selected.computed_noise_multiplier),
-            selection_result.to_dict(),
-        )
-
     def _build_bnb_calibration_report(
         self,
         *,
@@ -2916,11 +2721,6 @@ class PrivacyEngine:
             raise ValueError("Passing seed is prohibited in secure mode")
 
         mechanism_config = noise_mechanism_config or NoiseMechanismConfig()
-        if self._bifr_auto_gamma_policy_active(mechanism_config=mechanism_config):
-            raise ValueError(
-                "explicit bifr auto-gamma policy is supported only through "
-                "make_private_with_epsilon on the amplified balls_in_bins BNB path"
-            )
         self._validate_mechanism_sampling_compatibility(
             mechanism_config=mechanism_config,
             poisson_sampling=poisson_sampling,
@@ -3309,142 +3109,105 @@ class PrivacyEngine:
             "max_grad_norm": max_grad_norm,
             "total_steps": int(total_steps) if total_steps is not None else None,
         }
-        bifr_auto_gamma_audit: Optional[Dict[str, Any]] = None
-        if self._bifr_auto_gamma_policy_active(mechanism_config=mechanism_config):
+        mechanism_config = self._augment_mf_query_mechanism_config(
+            mechanism_config=mechanism_config,
+            local_sampling_semantics=local_sampling_semantics,
+            total_steps=total_steps,
+            epochs=epochs,
+            poisson_sampling=poisson_sampling,
+            data_loader=data_loader,
+            kwargs=kwargs,
+            optimizer=optimizer,
+            query_runtime_context=query_runtime_context,
+        )
+
+        bnb_c_matrix, bnb_bands, bnb_cycle_length, _ = self._resolve_bnb_runtime_inputs_for_epsilon(
+            mechanism_config=mechanism_config,
+            sampling_semantics=local_sampling_semantics,
+            kwargs=kwargs,
+        )
+
+        if (
+            mechanism_config.mechanism in ("bandmf", "bisr", "bandinvmf")
+            or (
+                mechanism_config.mechanism == "bsr"
+                and local_sampling_semantics is not None
+                and local_sampling_semantics.sampling_mode == "cyclic_poisson"
+            )
+        ):
             t0 = time.perf_counter()
-            mechanism_config, noise_multiplier, bifr_auto_gamma_audit = (
-                self._resolve_bifr_bnb_auto_gamma_for_target_epsilon(
-                    mechanism_config=mechanism_config,
-                    target_epsilon=float(target_epsilon),
-                    target_delta=float(target_delta),
-                    total_steps=total_steps,
-                    epochs=epochs,
-                    poisson_sampling=poisson_sampling,
-                    data_loader=data_loader,
-                    local_sampling_semantics=local_sampling_semantics,
-                    optimizer=optimizer,
-                    query_runtime_context=query_runtime_context,
-                    kwargs=kwargs,
-                )
+            if total_steps is not None:
+                strategy_steps = int(total_steps)
+            else:
+                strategy_steps = int(float(epochs) * float(len(data_loader)))
+            mechanism_config = ensure_bsr_family_cyclic_coeffs_helper(
+                mechanism_config=mechanism_config,
+                sampling_semantics=local_sampling_semantics,
+                steps=strategy_steps,
+                optimizer=optimizer,
+                kwargs=kwargs,
             )
             logger.info(
                 "OPACUS_DP_TIMING %s",
                 json.dumps(
                     {
-                        "phase": "resolve_bifr_auto_gamma_for_target_epsilon_total",
+                        "phase": "ensure_bsr_cyclic_coeffs",
                         "elapsed_s": round(float(time.perf_counter() - t0), 6),
                         "mechanism": mechanism_config.mechanism,
-                        "sampling_mode": (
-                            local_sampling_semantics.sampling_mode
-                            if local_sampling_semantics is not None
-                            else None
-                        ),
-                        "target_epsilon": float(target_epsilon),
-                        "target_delta": float(target_delta),
+                        "sampling_mode": "cyclic_poisson",
+                        "steps": int(strategy_steps),
                     },
                     sort_keys=True,
                 ),
             )
-        else:
-            mechanism_config = self._augment_mf_query_mechanism_config(
-                mechanism_config=mechanism_config,
-                local_sampling_semantics=local_sampling_semantics,
-                total_steps=total_steps,
-                epochs=epochs,
-                poisson_sampling=poisson_sampling,
-                data_loader=data_loader,
-                kwargs=kwargs,
-                optimizer=optimizer,
-                query_runtime_context=query_runtime_context,
-            )
 
-            bnb_c_matrix, bnb_bands, bnb_cycle_length, _ = self._resolve_bnb_runtime_inputs_for_epsilon(
-                mechanism_config=mechanism_config,
-                sampling_semantics=local_sampling_semantics,
-                kwargs=kwargs,
-            )
-
-            if (
-                mechanism_config.mechanism in ("bandmf", "bisr", "bandinvmf")
-                or (
-                    mechanism_config.mechanism == "bsr"
-                    and local_sampling_semantics is not None
-                    and local_sampling_semantics.sampling_mode == "cyclic_poisson"
-                )
-            ):
-                t0 = time.perf_counter()
-                if total_steps is not None:
-                    strategy_steps = int(total_steps)
-                else:
-                    strategy_steps = int(float(epochs) * float(len(data_loader)))
-                mechanism_config = ensure_bsr_family_cyclic_coeffs_helper(
-                    mechanism_config=mechanism_config,
-                    sampling_semantics=local_sampling_semantics,
-                    steps=strategy_steps,
-                    optimizer=optimizer,
-                    kwargs=kwargs,
-                )
-                logger.info(
-                    "OPACUS_DP_TIMING %s",
-                    json.dumps(
-                        {
-                            "phase": "ensure_bsr_cyclic_coeffs",
-                            "elapsed_s": round(float(time.perf_counter() - t0), 6),
-                            "mechanism": mechanism_config.mechanism,
-                            "sampling_mode": "cyclic_poisson",
-                            "steps": int(strategy_steps),
-                        },
-                        sort_keys=True,
+        t0 = time.perf_counter()
+        noise_multiplier, _ = self._resolve_noise_multiplier_for_target_epsilon(
+            mechanism_config=mechanism_config,
+            active_accountant=active_accountant,
+            target_epsilon=target_epsilon,
+            target_delta=target_delta,
+            total_steps=total_steps,
+            epochs=epochs,
+            poisson_sampling=poisson_sampling,
+            data_loader=data_loader,
+            logical_batch_size=int(batch_size) if batch_size is not None else 0,
+            sampling_semantics=local_sampling_semantics,
+            bnb_c_matrix=bnb_c_matrix,
+            bnb_bands=bnb_bands,
+            bnb_cycle_length=bnb_cycle_length,
+            kwargs=kwargs,
+        )
+        logger.info(
+            "OPACUS_DP_TIMING %s",
+            json.dumps(
+                {
+                    "phase": "resolve_noise_multiplier_for_target_epsilon_total",
+                    "elapsed_s": round(float(time.perf_counter() - t0), 6),
+                    "mechanism": mechanism_config.mechanism,
+                    "sampling_mode": (
+                        local_sampling_semantics.sampling_mode
+                        if local_sampling_semantics is not None
+                        else None
                     ),
-                )
+                    "target_epsilon": float(target_epsilon),
+                    "target_delta": float(target_delta),
+                },
+                sort_keys=True,
+            ),
+        )
 
-            t0 = time.perf_counter()
-            noise_multiplier, _ = self._resolve_noise_multiplier_for_target_epsilon(
-                mechanism_config=mechanism_config,
-                active_accountant=active_accountant,
-                target_epsilon=target_epsilon,
-                target_delta=target_delta,
-                total_steps=total_steps,
-                epochs=epochs,
-                poisson_sampling=poisson_sampling,
-                data_loader=data_loader,
-                logical_batch_size=int(batch_size) if batch_size is not None else 0,
-                sampling_semantics=local_sampling_semantics,
-                bnb_c_matrix=bnb_c_matrix,
-                bnb_bands=bnb_bands,
-                bnb_cycle_length=bnb_cycle_length,
-                kwargs=kwargs,
-            )
-            logger.info(
-                "OPACUS_DP_TIMING %s",
-                json.dumps(
-                    {
-                        "phase": "resolve_noise_multiplier_for_target_epsilon_total",
-                        "elapsed_s": round(float(time.perf_counter() - t0), 6),
-                        "mechanism": mechanism_config.mechanism,
-                        "sampling_mode": (
-                            local_sampling_semantics.sampling_mode
-                            if local_sampling_semantics is not None
-                            else None
-                        ),
-                        "target_epsilon": float(target_epsilon),
-                        "target_delta": float(target_delta),
-                    },
-                    sort_keys=True,
-                ),
-            )
-
-            mechanism_config = self._augment_mf_query_mechanism_config(
-                mechanism_config=mechanism_config,
-                local_sampling_semantics=local_sampling_semantics,
-                total_steps=total_steps,
-                epochs=epochs,
-                poisson_sampling=poisson_sampling,
-                data_loader=data_loader,
-                kwargs=kwargs,
-                optimizer=optimizer,
-                query_runtime_context=query_runtime_context,
-            )
+        mechanism_config = self._augment_mf_query_mechanism_config(
+            mechanism_config=mechanism_config,
+            local_sampling_semantics=local_sampling_semantics,
+            total_steps=total_steps,
+            epochs=epochs,
+            poisson_sampling=poisson_sampling,
+            data_loader=data_loader,
+            kwargs=kwargs,
+            optimizer=optimizer,
+            query_runtime_context=query_runtime_context,
+        )
 
         bnb_c_matrix, bnb_bands, bnb_cycle_length, _ = self._resolve_bnb_runtime_inputs_for_epsilon(
             mechanism_config=mechanism_config,
@@ -3477,16 +3240,6 @@ class PrivacyEngine:
             bnb_calibration_report=bnb_calibration_report,
             bnb_accounting_kwargs=bnb_accounting_kwargs,
         )
-        if bifr_auto_gamma_audit is not None:
-            state = copy.deepcopy(mechanism_config.mechanism_state)
-            state["bifr_selected_noise_multiplier"] = float(noise_multiplier)
-            state["bifr_candidate_audit"] = dict(bifr_auto_gamma_audit)
-            mechanism_config = NoiseMechanismConfig(
-                mechanism=mechanism_config.mechanism,
-                accounting_mode=mechanism_config.accounting_mode,
-                mechanism_state=state,
-            )
-
         self._log_bsr_trace(
             stage="make_private_with_epsilon_post_calibration",
             mechanism_config=mechanism_config,

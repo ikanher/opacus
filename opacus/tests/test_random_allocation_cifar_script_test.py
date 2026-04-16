@@ -1346,11 +1346,6 @@ def test_amplified_bifr_rows_use_real_bnb_path_and_preserve_selected_frac(
     assert row.opacus_bnb_c_col_scale == "abs_factor_c_col"
     assert "Unexpected amplified method: BIFR" not in row.notes
 
-    audit = getattr(_MODULE.compute_comparison_rows, "last_amplified_bifr_candidate_audit")
-    assert audit["balls_in_bins:p2"]["selected_frac"] == pytest.approx(1.0)
-    assert audit["balls_in_bins:p2"]["selected_paper_rmse"] == pytest.approx(10.0)
-    assert [candidate["frac"] for candidate in audit["balls_in_bins:p2"]["candidates"]] == [0.0, 0.25, 0.5, 1.0]
-
 
 def test_bisr_amplified_accountant_coeffs_use_exact_factor_column() -> None:
     workload = _MODULE._resolve_optimizer_workload(momentum=0.0, weight_decay=0.0)
@@ -1437,67 +1432,6 @@ def test_amplified_bifr_unstable_exact_slice_is_known_skip(
     assert row.parity_status == "known_skipped"
     assert row.reason_code == "known_unstable_exact_bifr_slice"
     assert row.computed_noise_multiplier is None
-
-    audit = getattr(_MODULE.compute_comparison_rows, "last_amplified_bifr_candidate_audit")
-    candidate = audit["balls_in_bins:p2"]["candidates"][0]
-    assert candidate["status"] == "known_unstable_exact_slice"
-    assert candidate["paper_rmse_reason"] == "known_unstable_exact_bifr_slice"
-
-
-def test_build_report_records_amplified_bifr_candidate_audit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    row = _MODULE._comparison_row(
-        row=_MODULE.PaperRow("amplified", "BIFR", float("nan"), 0.3, 4, 10.0),
-        backend="balls_in_bins",
-        status="computed",
-        computed=1.5,
-        sensitivity=1.0,
-        reason_code="computed_bnb_accountant_bifr_factor_c_col",
-        bifr_frac=0.5,
-        notes="test row",
-        source_law_kind="balls_in_bins",
-        accountant_engine_kind="bnb_monte_carlo",
-        route="bnb_accountant_balls_in_bins",
-    )
-    row.paper_rmse = 7.0
-    row.paper_rmse_reason = None
-
-    def fake_compute_comparison_rows(**kwargs):
-        fake_compute_comparison_rows.last_amplified_bsr_scale_probe = None
-        fake_compute_comparison_rows.last_amplified_bandinvmf_accountant_probe = None
-        fake_compute_comparison_rows.last_amplified_bandmf_matrix_family_probe = None
-        fake_compute_comparison_rows.last_non_amplified_bandinvmf_probe = None
-        fake_compute_comparison_rows.last_amplified_bifr_candidate_audit = {
-            "balls_in_bins:p4": {
-                "backend": "balls_in_bins",
-                "bandwidth": 4,
-                "selected_frac": 0.5,
-                "selected_noise_multiplier": 1.5,
-                "selected_paper_rmse": 7.0,
-                "candidates": [
-                    {"frac": 0.0, "status": "computed", "computed_noise_multiplier": 2.0, "paper_rmse": 9.0},
-                    {"frac": 0.5, "status": "computed", "computed_noise_multiplier": 1.5, "paper_rmse": 7.0},
-                ],
-            }
-        }
-        return [row]
-
-    monkeypatch.setattr(_MODULE, "compute_comparison_rows", fake_compute_comparison_rows)
-
-    report = _MODULE.build_report(
-        include_amplified=True,
-        include_non_amplified=False,
-        include_amplified_deterministic=False,
-        skip_bandinvmf=False,
-        methods=["BIFR"],
-        amplified_backends=["balls_in_bins"],
-        paper_rows=[_MODULE.PaperRow("amplified", "BIFR", float("nan"), 0.3, 4, 10.0)],
-    )
-
-    audit = report["summary"]["bifr"]["amplified_candidate_audit"]
-    assert audit["balls_in_bins:p4"]["selected_frac"] == pytest.approx(0.5)
-    assert audit["balls_in_bins:p4"]["candidates"][1]["paper_rmse"] == pytest.approx(7.0)
 
 
 def test_non_amplified_bandinvmf_optimizer_instability_uses_specific_reason_code(

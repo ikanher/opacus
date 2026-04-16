@@ -13,16 +13,11 @@ import copy
 from typing import Any, Dict, Mapping
 
 from opacus.accountants.analysis.bifr import validate_bifr_frac
-from opacus.mf.bifr_auto_gamma import (
-    canonicalize_bifr_auto_gamma_runtime_state,
-    has_explicit_bifr_auto_gamma_policy,
-)
 
 
 def canonicalize_bifr_runtime_state(*, runtime_state: Mapping[str, Any]) -> Dict[str, Any]:
     state = copy.deepcopy(dict(runtime_state))
     state["_noise_mechanism"] = "bifr"
-    state = canonicalize_bifr_auto_gamma_runtime_state(runtime_state=state)
 
     coeffs = state.get("coeffs")
     if isinstance(coeffs, (list, tuple)) and len(coeffs) > 0:
@@ -35,7 +30,7 @@ def canonicalize_bifr_runtime_state(*, runtime_state: Mapping[str, Any]) -> Dict
     if state.get("bsr_bands") is not None:
         state["bsr_bands"] = int(state["bsr_bands"])
 
-    if state.get("bifr_frac") is None and not has_explicit_bifr_auto_gamma_policy(state):
+    if state.get("bifr_frac") is None:
         state["bifr_frac"] = 0.5
 
     if state.get("bifr_frac") is not None:
@@ -75,8 +70,6 @@ def summarize_bifr_runtime_state(runtime_state: Mapping[str, Any]) -> Dict[str, 
         "bsr_iterations_number": state.get("bsr_iterations_number"),
         "bsr_bands": state.get("bsr_bands"),
         "bifr_frac": state.get("bifr_frac"),
-        "bifr_frac_policy": state.get("bifr_frac_policy"),
-        "bifr_frac_candidates": state.get("bifr_frac_candidates"),
         "bifr_horizon": state.get("bifr_horizon"),
         "bifr_inv_coeff_count": (
             len(state["bifr_inv_coeffs"])
