@@ -25,6 +25,7 @@ from .accountant import (
     _epsilon_from_remove_add_pmfs_for_delta,
     _allocation_pmf_add_from_realization,
     _allocation_pmf_remove_from_realization_with_dual,
+    _rescale_pmf_to_exp_neg_loss_moment_at_most_one,
     _PLDRealization,
     _SpacingType,
     build_gaussian_random_allocation_realization,
@@ -741,9 +742,11 @@ def _build_dominating_realization_from_cdf_lower_bounds(
     """
     seed = np.concatenate(([0.0], np.maximum.accumulate(np.clip(cdf_lower, 0.0, 1.0))))
     pmf = np.diff(seed)
-    moment = float(np.sum(pmf * np.exp(-x_array), dtype=np.float64))
-    if moment > 1.0 + 1e-12:
-        pmf *= 1.0 / moment
+    pmf = _rescale_pmf_to_exp_neg_loss_moment_at_most_one(
+        pmf,
+        x_array,
+        atol=1e-12,
+    )
 
     p_loss_inf = float(max(0.0, 1.0 - float(np.sum(pmf, dtype=np.float64))))
     x_gap = float(x_array[1] - x_array[0]) if x_array.size > 1 else 1.0
@@ -770,9 +773,11 @@ def _build_dominated_realization_from_cdf_upper_bounds(
     clipped = np.maximum.accumulate(np.clip(cdf_upper, 0.0, 1.0))
     seed = np.concatenate(([0.0], clipped))
     pmf = np.diff(seed)
-    moment = float(np.sum(pmf * np.exp(-x_array), dtype=np.float64))
-    if moment > 1.0 + 1e-12:
-        pmf *= 1.0 / moment
+    pmf = _rescale_pmf_to_exp_neg_loss_moment_at_most_one(
+        pmf,
+        x_array,
+        atol=1e-12,
+    )
 
     p_loss_inf = float(max(0.0, 1.0 - float(np.sum(pmf, dtype=np.float64))))
     x_gap = float(x_array[1] - x_array[0]) if x_array.size > 1 else 1.0

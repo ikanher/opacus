@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import textwrap
+import warnings
 
 import numpy as np
 import pytest
@@ -17,6 +18,7 @@ from torch.utils.data import DataLoader, TensorDataset
 import opacus.accountants.utils as accountant_utils_module
 import opacus.accountants.analysis.random_allocation.accountant as random_allocation_module
 import opacus.accountants.analysis.random_allocation.fixed_bin as fixed_bin_random_allocation_module
+import opacus.accountants.analysis.random_allocation.initial_package as random_allocation_initial_package_module
 from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
 from opacus.accountants.analysis.bnb import build_bnb_toeplitz_c_matrix_and_contract
 from opacus.accountants.analysis.bandmf import generate_bandmf_coeffs_from_sgd_workload
@@ -376,6 +378,39 @@ def test_fixed_bin_bridge_aggregates_modes_by_epoch_bin_for_dpsgd_control() -> N
         (1.0, 0.0, 1.0, 0.0, 1.0, 0.0),
         (0.0, 1.0, 0.0, 1.0, 0.0, 1.0),
     )
+
+
+def test_exp_neg_loss_moment_rescaling_avoids_overflow_warnings() -> None:
+    pmf = np.array([0.5, 0.5], dtype=np.float64)
+    x_array = np.array([-1000.0, 0.0], dtype=np.float64)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        scaled = random_allocation_module._rescale_pmf_to_exp_neg_loss_moment_at_most_one(
+            pmf,
+            x_array,
+            atol=1e-12,
+        )
+
+    assert np.all(np.isfinite(scaled))
+    assert float(np.sum(scaled, dtype=np.float64)) <= 1.0 + 1e-12
+
+
+def test_initial_package_dominating_realization_avoids_overflow_warnings() -> None:
+    x_array = np.array([-1000.0, 0.0], dtype=np.float64)
+    cdf_lower = np.array([0.5, 1.0], dtype=np.float64)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        realization = (
+            random_allocation_initial_package_module._build_dominating_realization_from_cdf_lower_bounds(
+                x_array=x_array,
+                cdf_lower=cdf_lower,
+            )
+        )
+
+    assert np.all(np.isfinite(realization.PMF_array))
+    assert realization.p_loss_inf >= 0.0
 
 
 def test_fixed_bin_bridge_keeps_source_law_distinct_from_repeated_random_allocation() -> None:

@@ -77,6 +77,46 @@ def _timed(label: str):
         _debug_timing(f"done {label} elapsed={time.perf_counter() - start:.3f}s")
 
 
+def _log_exp_neg_loss_moment(
+    pmf: np.ndarray,
+    x_array: np.ndarray,
+) -> float:
+    probs = np.asarray(pmf, dtype=np.float64)
+    losses = np.asarray(x_array, dtype=np.float64)
+    if probs.shape != losses.shape:
+        raise ValueError("pmf and x_array must have the same shape")
+
+    positive = probs > 0.0
+    if not np.any(positive):
+        return -math.inf
+
+    log_terms = np.log(probs[positive]) - losses[positive]
+    max_log = float(np.max(log_terms))
+    if not math.isfinite(max_log):
+        return max_log
+
+    return max_log + math.log(float(np.sum(np.exp(log_terms - max_log), dtype=np.float64)))
+
+
+def _rescale_pmf_to_exp_neg_loss_moment_at_most_one(
+    pmf: np.ndarray,
+    x_array: np.ndarray,
+    *,
+    atol: float,
+) -> np.ndarray:
+    probs = np.asarray(pmf, dtype=np.float64)
+    log_moment = _log_exp_neg_loss_moment(probs, np.asarray(x_array, dtype=np.float64))
+    if not math.isfinite(log_moment):
+        if log_moment > 0.0:
+            return np.zeros_like(probs, dtype=np.float64)
+        return probs
+
+    if log_moment <= math.log1p(float(atol)):
+        return probs
+
+    return probs * math.exp(-log_moment)
+
+
 class _BoundType(Enum):
     DOMINATES = "DOMINATES"
     IS_DOMINATED = "IS_DOMINATED"
@@ -410,8 +450,8 @@ class _PLDRealization(_LinearDiscreteDist):
         if self.p_neg_inf > 0.0:
             raise ValueError("DOMINATES bound_type requires p_neg_inf=0")
 
-        moment = float(np.sum(self.PMF_array * np.exp(-self.x_array), dtype=np.float64))
-        if moment > 1.0 + 1e-9:
+        log_moment = _log_exp_neg_loss_moment(self.PMF_array, self.x_array)
+        if log_moment > math.log1p(1e-9):
             raise ValueError("E[exp(-L)] must be <= 1 for a PLD realization")
 
         return self
