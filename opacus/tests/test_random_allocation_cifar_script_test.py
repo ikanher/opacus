@@ -84,7 +84,12 @@ def _install_fast_bridge_success(
     monkeypatch.setattr(
         _MODULE,
         "_resolve_fixed_bin_bridge_workload",
-        lambda *, method, bands: (_MODULE.np.eye(4, dtype=float), mechanism, coeff_source, sensitivity),
+        lambda *, method, bands, bifr_frac=None, optimizer_workload=_MODULE.DEFAULT_OPTIMIZER_WORKLOAD: (
+            _MODULE.np.eye(4, dtype=float),
+            mechanism,
+            coeff_source,
+            sensitivity,
+        ),
     )
     monkeypatch.setattr(
         _MODULE,
@@ -2648,6 +2653,49 @@ def test_dpsgd_fixed_bin_bridge_workload_uses_reduced_full_horizon_mode_norm_con
     assert coeff_source == "full_horizon_mode_norm_control"
     assert mechanism == "gaussian"
     assert sensitivity == pytest.approx(_MODULE.EPOCHS ** 0.5, rel=0.0, abs=1e-12)
+
+
+def test_fixed_bin_bridge_workload_trims_bnb_padding_to_logical_horizon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logical_horizon = int(_MODULE.TOTAL_STEPS)
+    padded_horizon = logical_horizon + 4
+    padded = _MODULE.np.arange(float(padded_horizon * padded_horizon), dtype=float).reshape(
+        padded_horizon,
+        padded_horizon,
+    )
+
+    monkeypatch.setattr(
+        _MODULE,
+        "_method_amplified_accountant_coeffs",
+        lambda method, bands, bifr_frac=None, optimizer_workload=_MODULE.DEFAULT_OPTIMIZER_WORKLOAD: (
+            [1.0],
+            "test_accountant_coeffs",
+        ),
+    )
+    monkeypatch.setattr(
+        _MODULE,
+        "build_bnb_toeplitz_c_matrix_and_contract",
+        lambda **kwargs: (
+            padded,
+            {
+                "horizon": logical_horizon,
+                "padded_horizon": padded_horizon,
+                "padding_columns": padded_horizon - logical_horizon,
+            },
+        ),
+    )
+
+    c_matrix, mechanism, coeff_source, sensitivity = _MODULE._resolve_fixed_bin_bridge_workload(
+        method="BISR",
+        bands=8,
+    )
+
+    assert c_matrix.shape == (logical_horizon, logical_horizon)
+    assert _MODULE.np.array_equal(c_matrix, padded[:logical_horizon, :logical_horizon])
+    assert mechanism == "bisr"
+    assert coeff_source == "test_accountant_coeffs"
+    assert sensitivity is None
 
 
 def test_dpsgd_fixed_bin_bridge_row_reports_exact_pair_route_without_live_search(

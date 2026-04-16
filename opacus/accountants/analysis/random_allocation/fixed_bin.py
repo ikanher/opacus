@@ -182,11 +182,25 @@ def resolve_fixed_bin_random_allocation_bridge_runtime_config(
 
 
 def _aggregate_fixed_bin_mode_family(
-    *, c_matrix: np.ndarray, bins: int
+    *, c_matrix: np.ndarray, bins: int, logical_horizon: int | None = None
 ) -> tuple[tuple[float, ...], ...]:
     matrix = np.asarray(c_matrix, dtype=np.float64)
     if matrix.ndim != 2:
         raise ValueError("c_matrix must be a 2-D array")
+
+    if logical_horizon is not None:
+        resolved_horizon = int(logical_horizon)
+        if resolved_horizon < 1:
+            raise ValueError("logical_horizon must be >= 1")
+        if matrix.shape[0] < resolved_horizon or matrix.shape[1] < resolved_horizon:
+            raise ValueError(
+                "logical_horizon exceeds c_matrix shape "
+                f"(shape={matrix.shape}, logical_horizon={resolved_horizon})"
+            )
+        matrix = np.asarray(
+            matrix[:resolved_horizon, :resolved_horizon],
+            dtype=np.float64,
+        )
 
     horizon = int(matrix.shape[1])
     resolved_bins = int(bins)
@@ -213,8 +227,13 @@ def _build_fixed_bin_gaussian_mixture_pair(
     *,
     c_matrix: np.ndarray,
     bins: int,
+    logical_horizon: int | None = None,
 ) -> _FixedBinGaussianMixturePair:
-    mode_family = _aggregate_fixed_bin_mode_family(c_matrix=c_matrix, bins=bins)
+    mode_family = _aggregate_fixed_bin_mode_family(
+        c_matrix=c_matrix,
+        bins=bins,
+        logical_horizon=logical_horizon,
+    )
     if not mode_family:
         raise ValueError("fixed-bin bridge requires at least one mode")
 
@@ -235,6 +254,7 @@ def build_fixed_bin_exact_law_pair(
     c_matrix: np.ndarray,
     bins: int,
     noise_multiplier: float,
+    logical_horizon: int | None = None,
 ) -> FiniteGaussianMixtureNeighboringPair:
     """Build the exact fixed-bin Gaussian-mixture pair for the bridge route.
 
@@ -249,7 +269,11 @@ def build_fixed_bin_exact_law_pair(
     if not math.isfinite(sigma) or sigma <= 0.0:
         raise ValueError("fixed-bin bridge requires positive finite noise_multiplier")
 
-    pair = _build_fixed_bin_gaussian_mixture_pair(c_matrix=c_matrix, bins=bins)
+    pair = _build_fixed_bin_gaussian_mixture_pair(
+        c_matrix=c_matrix,
+        bins=bins,
+        logical_horizon=logical_horizon,
+    )
     dim = len(pair.forward_modes[0])
 
     return FiniteGaussianMixtureNeighboringPair(
@@ -371,6 +395,7 @@ def resolve_fixed_bin_random_allocation_bridge_inputs(
     c_matrix: np.ndarray,
     bins: int,
     noise_multiplier: float,
+    logical_horizon: int | None = None,
 ) -> FixedBinRandomAllocationBridgeInputs:
     """Resolve the fixed-bin bridge metadata for a live workload.
 
@@ -389,6 +414,20 @@ def resolve_fixed_bin_random_allocation_bridge_inputs(
     if matrix.ndim != 2:
         raise ValueError("c_matrix must be a 2-D array")
 
+    if logical_horizon is not None:
+        resolved_horizon = int(logical_horizon)
+        if resolved_horizon < 1:
+            raise ValueError("logical_horizon must be >= 1")
+        if matrix.shape[0] < resolved_horizon or matrix.shape[1] < resolved_horizon:
+            raise ValueError(
+                "logical_horizon exceeds c_matrix shape "
+                f"(shape={matrix.shape}, logical_horizon={resolved_horizon})"
+            )
+        matrix = np.asarray(
+            matrix[:resolved_horizon, :resolved_horizon],
+            dtype=np.float64,
+        )
+
     horizon = int(matrix.shape[1])
     resolved_bins = int(bins)
     if resolved_bins < 1:
@@ -404,6 +443,7 @@ def resolve_fixed_bin_random_allocation_bridge_inputs(
         c_matrix=matrix,
         bins=resolved_bins,
         noise_multiplier=noise_multiplier,
+        logical_horizon=None,
     )
     resolved_package = _resolve_fixed_bin_exact_package(
         exact_pair=exact_pair,
@@ -431,6 +471,7 @@ def _resolve_fixed_bin_bridge_pair_inputs(
     c_matrix: np.ndarray,
     bins: int,
     noise_multiplier: float,
+    logical_horizon: int | None = None,
 ) -> _PairDrivenRandomAllocationInputs:
     matrix = np.asarray(c_matrix, dtype=np.float64)
     exact_pair = build_fixed_bin_exact_law_pair(
@@ -438,6 +479,7 @@ def _resolve_fixed_bin_bridge_pair_inputs(
         c_matrix=matrix,
         bins=int(bins),
         noise_multiplier=noise_multiplier,
+        logical_horizon=logical_horizon,
     )
     resolved_package = _resolve_fixed_bin_exact_package(
         exact_pair=exact_pair,
@@ -460,6 +502,7 @@ def estimate_epsilon_range_fixed_bin_random_allocation(
     noise_multiplier: float,
     target_delta: float,
     runtime_config: RandomAllocationGaussianRuntimeConfig | None = None,
+    logical_horizon: int | None = None,
 ) -> tuple[float, float]:
     """Evaluate a conservative `(ε_upper, ε_lower)` interval for the bridge.
 
@@ -478,6 +521,7 @@ def estimate_epsilon_range_fixed_bin_random_allocation(
         c_matrix=matrix,
         bins=int(bins),
         noise_multiplier=noise_multiplier,
+        logical_horizon=logical_horizon,
     )
     resolved_package = _resolve_fixed_bin_exact_package(
         exact_pair=exact_pair,
@@ -523,6 +567,7 @@ def _diagnose_fixed_bin_ambient_nonfinite_upper_bound(
     noise_multiplier: float,
     target_delta: float,
     runtime_config: RandomAllocationGaussianRuntimeConfig | None = None,
+    logical_horizon: int | None = None,
 ) -> _FixedBinAmbientNonfiniteUpperDiagnostic | None:
     runtime = runtime_config or resolve_fixed_bin_random_allocation_bridge_runtime_config(
         target_delta=target_delta
@@ -532,6 +577,7 @@ def _diagnose_fixed_bin_ambient_nonfinite_upper_bound(
         c_matrix=c_matrix,
         bins=bins,
         noise_multiplier=noise_multiplier,
+        logical_horizon=logical_horizon,
     )
     if (
         pair_inputs.initial_package.route
@@ -630,6 +676,7 @@ def _fixed_bin_search_eval(
     sigma: float,
     target_delta: float,
     runtime: RandomAllocationGaussianRuntimeConfig,
+    logical_horizon: int | None = None,
 ) -> float:
     eps_upper, _eps_lower = estimate_epsilon_range_fixed_bin_random_allocation(
         mechanism=mechanism,
@@ -638,6 +685,7 @@ def _fixed_bin_search_eval(
         noise_multiplier=float(sigma),
         target_delta=target_delta,
         runtime_config=runtime,
+        logical_horizon=logical_horizon,
     )
     return float(eps_upper)
 
@@ -664,6 +712,7 @@ def _grow_fixed_bin_sigma_bracket(
     target_delta: float,
     runtime: RandomAllocationGaussianRuntimeConfig,
     state: _FixedBinNoiseSearchState,
+    logical_horizon: int | None = None,
 ) -> float:
     while state.eps_high > float(target_epsilon):
         state.sigma_high = 2.0 * state.sigma_high
@@ -674,6 +723,7 @@ def _grow_fixed_bin_sigma_bracket(
             sigma=state.sigma_high,
             target_delta=target_delta,
             runtime=runtime,
+            logical_horizon=logical_horizon,
         )
         _record_fixed_bin_search_epsilon(
             state=state,
@@ -699,6 +749,7 @@ def _advance_fixed_bin_binary_search(
     target_delta: float,
     runtime: RandomAllocationGaussianRuntimeConfig,
     state: _FixedBinNoiseSearchState,
+    logical_horizon: int | None = None,
 ) -> None:
     sigma = 0.5 * (state.sigma_low + state.sigma_high)
     if sigma <= state.sigma_low or sigma >= state.sigma_high:
@@ -715,6 +766,7 @@ def _advance_fixed_bin_binary_search(
         sigma=sigma,
         target_delta=target_delta,
         runtime=runtime,
+        logical_horizon=logical_horizon,
     )
     state.iterations += 1
     _record_fixed_bin_search_epsilon(
@@ -739,6 +791,7 @@ def _refine_fixed_bin_sigma_bracket(
     epsilon_tolerance: float,
     runtime: RandomAllocationGaussianRuntimeConfig,
     state: _FixedBinNoiseSearchState,
+    logical_horizon: int | None = None,
 ) -> float:
     while float(target_epsilon) - state.eps_high > float(epsilon_tolerance):
         if state.iterations >= MAX_NOISE_SEARCH_BINARY_STEPS:
@@ -763,6 +816,7 @@ def _refine_fixed_bin_sigma_bracket(
             target_delta=target_delta,
             runtime=runtime,
             state=state,
+            logical_horizon=logical_horizon,
         )
 
     return float(state.sigma_high)
@@ -777,6 +831,7 @@ def get_noise_multiplier_fixed_bin_random_allocation(
     target_delta: float,
     runtime_config: RandomAllocationGaussianRuntimeConfig | None = None,
     epsilon_tolerance: float = 0.01,
+    logical_horizon: int | None = None,
 ) -> float:
     """Calibrate `σ` for the fixed-bin bridge at a target `ε`.
 
@@ -803,6 +858,7 @@ def get_noise_multiplier_fixed_bin_random_allocation(
         target_delta=target_delta,
         runtime=runtime,
         state=state,
+        logical_horizon=logical_horizon,
     )
     return _refine_fixed_bin_sigma_bracket(
         mechanism=mechanism,
@@ -813,4 +869,5 @@ def get_noise_multiplier_fixed_bin_random_allocation(
         epsilon_tolerance=epsilon_tolerance,
         runtime=runtime,
         state=state,
+        logical_horizon=logical_horizon,
     )

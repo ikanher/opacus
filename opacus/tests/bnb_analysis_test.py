@@ -18,6 +18,10 @@ from unittest import mock
 
 import torch
 
+from opacus.accountants.analysis.bifr import (
+    derive_bifr_amplified_accountant_coeffs_from_factor_coeffs,
+    resolve_bifr_exact_factor_coeffs_for_accounting,
+)
 from opacus.accountants.analysis.bnb import (
     _build_balls_in_bins_modes_matrix,
     _assign_bnb_chunk_specs_to_shard,
@@ -25,6 +29,7 @@ from opacus.accountants.analysis.bnb import (
     _reduce_bnb_llr_chunks_to_coordinator,
     _resolve_bnb_distributed_mode,
     BNBCalibrationReport,
+    build_balls_in_bins_sigma_reuse_state,
     DeltaVerificationResult,
     GaussianMixture,
     SingleVerificationResult,
@@ -88,6 +93,115 @@ class BNBAnalysisTest(unittest.TestCase):
         self.assertAlmostEqual(float(actual[0, 3]), float(expected[0, 3]), places=12)
         self.assertAlmostEqual(float(actual[0, 6]), float(expected[0, 6]), places=12)
         self.assertAlmostEqual(float(actual[0, 9]), float(expected[0, 9]), places=12)
+
+    def test_balls_in_bins_sigma_reuse_matches_direct_path_on_representative_bifr_case(
+        self,
+    ) -> None:
+        factor_coeffs, _source = resolve_bifr_exact_factor_coeffs_for_accounting(
+            bands=4,
+            steps=16,
+            momentum=0.9,
+            weight_decay=0.9999,
+            frac=0.25,
+        )
+        accountant_coeffs = derive_bifr_amplified_accountant_coeffs_from_factor_coeffs(
+            coeffs=factor_coeffs
+        )
+        reuse_state = build_balls_in_bins_sigma_reuse_state(
+            coeffs=accountant_coeffs,
+            cycle_length=4,
+            horizon=16,
+            num_samples=32,
+            seed=11,
+            chunk_size=8,
+            backend="cpu",
+            device="cpu",
+        )
+
+        direct_positive = sample_balls_in_bins_llr_chunks(
+            coeffs=accountant_coeffs,
+            cycle_length=4,
+            horizon=16,
+            sigma=1.25,
+            num_samples=32,
+            seed=11,
+            chunk_size=8,
+            positive_sample=True,
+            backend="cpu",
+            device="cpu",
+        )
+        reuse_positive = sample_balls_in_bins_llr_chunks(
+            coeffs=accountant_coeffs,
+            cycle_length=4,
+            horizon=16,
+            sigma=1.25,
+            num_samples=32,
+            seed=999,
+            chunk_size=8,
+            positive_sample=True,
+            backend="cpu",
+            device="cpu",
+            sigma_reuse_state=reuse_state,
+        )
+        self.assertEqual(len(direct_positive), len(reuse_positive))
+        for direct_chunk, reuse_chunk in zip(direct_positive, reuse_positive):
+            self.assertTrue(torch.equal(direct_chunk, reuse_chunk))
+
+        direct_negative = sample_balls_in_bins_llr_chunks(
+            coeffs=accountant_coeffs,
+            cycle_length=4,
+            horizon=16,
+            sigma=1.25,
+            num_samples=32,
+            seed=12,
+            chunk_size=8,
+            positive_sample=False,
+            backend="cpu",
+            device="cpu",
+        )
+        reuse_negative = sample_balls_in_bins_llr_chunks(
+            coeffs=accountant_coeffs,
+            cycle_length=4,
+            horizon=16,
+            sigma=1.25,
+            num_samples=32,
+            seed=999,
+            chunk_size=8,
+            positive_sample=False,
+            backend="cpu",
+            device="cpu",
+            sigma_reuse_state=reuse_state,
+        )
+        self.assertEqual(len(direct_negative), len(reuse_negative))
+        for direct_chunk, reuse_chunk in zip(direct_negative, reuse_negative):
+            self.assertTrue(torch.equal(direct_chunk, reuse_chunk))
+
+        epsilon_direct = estimate_balls_in_bins_epsilon_monte_carlo_optimistic(
+            coeffs=accountant_coeffs,
+            cycle_length=4,
+            horizon=16,
+            noise_multiplier=1.25,
+            target_delta=1e-4,
+            num_samples=32,
+            seed=11,
+            chunk_size=8,
+            backend="cpu",
+            device="cpu",
+        )
+        epsilon_reuse = estimate_balls_in_bins_epsilon_monte_carlo_optimistic(
+            coeffs=accountant_coeffs,
+            cycle_length=4,
+            horizon=16,
+            noise_multiplier=1.25,
+            target_delta=1e-4,
+            num_samples=32,
+            seed=11,
+            chunk_size=8,
+            backend="cpu",
+            device="cpu",
+            sigma_reuse_state=reuse_state,
+        )
+        self.assertAlmostEqual(float(epsilon_direct), float(epsilon_reuse), places=12)
 
     def test_resolve_bnb_distributed_mode_auto_selects_chunk_shard_for_dp_runtime(self) -> None:
         mode, auto_selected = _resolve_bnb_distributed_mode(

@@ -793,6 +793,60 @@ def test_fixed_bin_bridge_cifar_identity_control_collapses_to_random_allocation_
     assert package.add.realization.p_loss_inf < 1e-5
 
 
+def test_fixed_bin_bridge_accepts_logical_horizon_for_padded_identity_control() -> None:
+    padded = np.eye(984, dtype=np.float64)
+
+    bridge = resolve_fixed_bin_random_allocation_bridge_inputs(
+        mechanism="gaussian",
+        c_matrix=padded,
+        bins=98,
+        noise_multiplier=1.0,
+        logical_horizon=980,
+    )
+
+    assert bridge.horizon == 980
+    assert bridge.epochs == 10
+    assert bridge.route == "fixed_bin_bridge_exact_pair_package"
+
+    mode_family = _aggregate_fixed_bin_mode_family(
+        c_matrix=padded,
+        bins=98,
+        logical_horizon=980,
+    )
+    assert len(mode_family) == 98
+    assert len(mode_family[0]) == 980
+
+
+def test_fixed_bin_bridge_noise_search_propagates_logical_horizon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[float | None] = []
+
+    def _fake_estimate_range(**kwargs):
+        calls.append(kwargs.get("logical_horizon"))
+        sigma = float(kwargs["noise_multiplier"])
+        return (1.0 / sigma, 0.5 / sigma)
+
+    monkeypatch.setattr(
+        fixed_bin_random_allocation_module,
+        "estimate_epsilon_range_fixed_bin_random_allocation",
+        _fake_estimate_range,
+    )
+
+    sigma = get_noise_multiplier_fixed_bin_random_allocation(
+        mechanism="gaussian",
+        c_matrix=np.eye(984, dtype=np.float64),
+        bins=98,
+        logical_horizon=980,
+        target_epsilon=2.0,
+        target_delta=1e-5,
+    )
+
+    assert sigma > 0.0
+    assert calls
+    assert all(call == 980 for call in calls)
+
+
 def test_nonorthogonal_fixed_bin_exact_mixture_builds_ambient_quantitative_window_realization_package() -> None:
     pair = build_fixed_bin_exact_law_pair(
         mechanism="gaussian",
