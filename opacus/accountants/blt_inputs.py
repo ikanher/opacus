@@ -95,7 +95,12 @@ def _copy_blt_runtime_metadata(
     for key, value in source_state.items():
         if key in {"theta", "theta_hat", "forward", "inverse", "z_std"}:
             continue
-        if key == "noise_multiplier_ref" or key.startswith("blt_") or key.startswith("_"):
+        if (
+            key == "noise_multiplier_ref"
+            or key.startswith("blt_")
+            or key.startswith("random_allocation_")
+            or key.startswith("_")
+        ):
             canonical_state[key] = copy.deepcopy(value)
     return canonical_state
 

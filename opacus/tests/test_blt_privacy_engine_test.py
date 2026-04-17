@@ -356,15 +356,13 @@ def test_make_private_with_epsilon_rejects_unsupported_blt_coefficient_regime() 
         )
 
 
-def test_blt_rejects_accountant_driven_mode() -> None:
-    with pytest.raises(
-        ValueError, match="blt mechanism requires blt_accountant or bnb_accountant routing"
-    ):
-        NoiseMechanismConfig(
-            mechanism="blt",
-            accounting_mode="random_allocation_accountant",
-            mechanism_state={"theta": [0.8], "theta_hat": [0.6], "z_std": 0.03},
-        )
+def test_blt_accepts_random_allocation_accountant_mode() -> None:
+    cfg = NoiseMechanismConfig(
+        mechanism="blt",
+        accounting_mode="random_allocation_accountant",
+        mechanism_state={"theta": [0.8], "theta_hat": [0.6], "z_std": 0.03},
+    )
+    assert cfg.accounting_mode == "random_allocation_accountant"
 
 
 def test_make_private_supports_blt_balls_in_bins_bnb_accountant(monkeypatch) -> None:

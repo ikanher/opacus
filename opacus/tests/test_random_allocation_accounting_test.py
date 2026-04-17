@@ -1762,6 +1762,21 @@ def test_unsupported_public_repeated_family_fails_clearly() -> None:
         )
 
 
+@pytest.mark.parametrize("mechanism", ["bifr", "blt"])
+def test_supported_public_repeated_family_resolves_for_widened_matrix(mechanism: str) -> None:
+    inputs = resolve_random_allocation_accountant_inputs(
+        mechanism=mechanism,
+        accountant_coeffs=[1.0, 0.5],
+        cycle_length=5,
+        horizon=20,
+        noise_multiplier=1.0,
+    )
+
+    assert inputs.mechanism == mechanism
+    assert inputs.route == "pair_driven_public_exact_initial_package"
+    assert inputs.package_alignment_kind == "repeated_k_out_of_t"
+
+
 def test_exact_mixture_fixture_builds_initial_package_for_first_1d_control() -> None:
     pair = build_poisson_gaussian_mixture_neighboring_pair(
         mechanism="gaussian",

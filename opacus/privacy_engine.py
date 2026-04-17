@@ -35,7 +35,11 @@ from itertools import chain
 from typing import IO, Any, BinaryIO, Callable, Dict, List, Mapping, Optional, Tuple, Union
 
 import torch
-from opacus.accountants.analysis.blt import BLTParams, BLTPairedParams
+from opacus.accountants.analysis.blt import (
+    BLTParams,
+    BLTPairedParams,
+    build_blt_amplified_bnb_accountant_coeffs,
+)
 from opacus.accountants.blt_inputs import (
     canonicalize_blt_public_or_runtime_state,
 )
@@ -67,6 +71,7 @@ from opacus.accountants.bsr import (
 )
 from opacus.accountants.bifr import (
     ensure_bifr_exact_runtime_coeffs as ensure_bifr_exact_runtime_coeffs_helper,
+    resolve_bifr_amplified_accountant_coeffs,
 )
 from opacus.mf.optimizer_utils import resolve_uniform_sgd_workload_from_optimizer
 from opacus.accountants.bandinvmf import (
@@ -90,6 +95,9 @@ from opacus.accountants.analysis.bisr import (
 )
 from opacus.accountants.analysis.bandinvmf import (
     derive_bandinvmf_amplified_accountant_coeffs_from_inv_coeffs,
+)
+from opacus.accountants.analysis.bifr import (
+    derive_bifr_amplified_accountant_coeffs_from_factor_coeffs,
 )
 from opacus.accountants.analysis.bnb import (
     BNBCalibrationStatus,
@@ -224,11 +232,28 @@ def _build_bandinvmf_random_allocation_accountant_coeffs(*, state: Dict[str, Any
     return list(coeffs), "abs_factor_c_col"
 
 
+def _build_bifr_random_allocation_accountant_coeffs(*, state: Dict[str, Any], horizon: int) -> tuple[list[float], str]:
+    coeffs = derive_bifr_amplified_accountant_coeffs_from_factor_coeffs(
+        coeffs=list(state["coeffs"])
+    )
+    return list(coeffs), "abs_exact_factor_c_col"
+
+
+def _build_blt_random_allocation_accountant_coeffs(*, state: Dict[str, Any], horizon: int) -> tuple[list[float], str]:
+    coeffs, source = build_blt_amplified_bnb_accountant_coeffs(
+        pair=BLTFamilyState.from_input_state(state).pair,
+        horizon=int(horizon),
+    )
+    return list(coeffs), str(source)
+
+
 _RANDOM_ALLOCATION_ACCOUNTANT_COEFF_BUILDERS: Dict[str, Callable[..., tuple[list[float], str]]] = {
     "bsr": _build_bsr_random_allocation_accountant_coeffs,
     "bisr": _build_bisr_random_allocation_accountant_coeffs,
     "bandmf": _build_bandmf_random_allocation_accountant_coeffs,
     "bandinvmf": _build_bandinvmf_random_allocation_accountant_coeffs,
+    "bifr": _build_bifr_random_allocation_accountant_coeffs,
+    "blt": _build_blt_random_allocation_accountant_coeffs,
 }
 
 
@@ -379,12 +404,18 @@ class PrivacyEngine:
             sampling_semantics=sampling_semantics,
             kwargs=coeff_resolution_kwargs,
         )
-        mechanism_config = ensure_bifr_exact_runtime_coeffs_helper(
-            mechanism_config=mechanism_config,
-            optimizer=optimizer,
-            sampling_semantics=sampling_semantics,
-            kwargs=coeff_resolution_kwargs,
-        )
+        if not (
+            include_random_allocation_state
+            and mechanism_config.mechanism == "bifr"
+            and sampling_semantics is not None
+            and sampling_semantics.sampling_mode == "k_out_of_t"
+        ):
+            mechanism_config = ensure_bifr_exact_runtime_coeffs_helper(
+                mechanism_config=mechanism_config,
+                optimizer=optimizer,
+                sampling_semantics=sampling_semantics,
+                kwargs=coeff_resolution_kwargs,
+            )
         mechanism_config = ensure_bandmf_fixed_analytical_coeffs_helper(
             mechanism_config=mechanism_config,
             optimizer=optimizer,
@@ -620,7 +651,7 @@ class PrivacyEngine:
         if sampling_semantics is None or sampling_semantics.sampling_mode != "k_out_of_t":
             return mechanism_config
 
-        if mechanism_config.mechanism not in ("gaussian", "bsr", "bisr", "bandmf", "bandinvmf"):
+        if mechanism_config.mechanism not in ("gaussian", "bsr", "bisr", "bandmf", "bandinvmf", "bifr", "blt"):
             return mechanism_config
 
         state = copy.deepcopy(mechanism_config.mechanism_state)
@@ -634,6 +665,60 @@ class PrivacyEngine:
             state.setdefault("coeffs", [1.0])
             state["random_allocation_accountant_coeffs"] = [1.0]
             state["random_allocation_accountant_coeffs_source"] = "raw_c_col"
+            return NoiseMechanismConfig(
+                mechanism=mechanism_config.mechanism,
+                accounting_mode=mechanism_config.accounting_mode,
+                mechanism_state=state,
+            )
+
+        if mechanism_config.mechanism == "blt":
+            state = BLTFamilyState.from_input_state(state).to_state_dict()
+            state["_noise_mechanism"] = mechanism_config.mechanism
+            horizon = state.get(
+                "random_allocation_horizon",
+                kwargs.get("total_steps", kwargs.get("steps", num_steps)),
+            )
+            accountant_coeffs, accountant_coeffs_source = _RANDOM_ALLOCATION_ACCOUNTANT_COEFF_BUILDERS[
+                mechanism_config.mechanism
+            ](
+                state=state,
+                horizon=int(horizon),
+            )
+            state = attach_accountant_coeff_surface(
+                state,
+                coeff_key="random_allocation_accountant_coeffs",
+                coeff_source_key="random_allocation_accountant_coeffs_source",
+                coeffs=accountant_coeffs,
+                coeff_source=accountant_coeffs_source,
+            )
+            return NoiseMechanismConfig(
+                mechanism=mechanism_config.mechanism,
+                accounting_mode=mechanism_config.accounting_mode,
+                mechanism_state=state,
+            )
+
+        if mechanism_config.mechanism == "bifr":
+            horizon = state.get(
+                "random_allocation_horizon",
+                kwargs.get("total_steps", kwargs.get("steps", num_steps)),
+            )
+            accountant_coeffs, accountant_coeffs_source, state = resolve_bifr_amplified_accountant_coeffs(
+                mechanism_state=state,
+                sampling_semantics=sampling_semantics,
+                optimizer=optimizer,
+                kwargs=kwargs,
+                total_steps=int(horizon),
+            )
+            state["_noise_mechanism"] = mechanism_config.mechanism
+            state["random_allocation_num_steps"] = num_steps
+            state["random_allocation_num_selected"] = int(metadata["num_selected"])
+            state = attach_accountant_coeff_surface(
+                state,
+                coeff_key="random_allocation_accountant_coeffs",
+                coeff_source_key="random_allocation_accountant_coeffs_source",
+                coeffs=accountant_coeffs,
+                coeff_source=accountant_coeffs_source,
+            )
             return NoiseMechanismConfig(
                 mechanism=mechanism_config.mechanism,
                 accounting_mode=mechanism_config.accounting_mode,
@@ -1648,10 +1733,10 @@ class PrivacyEngine:
         if (
             sampling_semantics is not None
             and sampling_semantics.sampling_mode == "k_out_of_t"
-            and mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bandinvmf")
+            and mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bandinvmf", "bifr", "blt")
         ):
             raise ValueError(
-                "k_out_of_t sampling is supported only for mechanism in {'gaussian', 'bandmf', 'bsr', 'bisr', 'bandinvmf'}"
+                "k_out_of_t sampling is supported only for mechanism in {'gaussian', 'bandmf', 'bsr', 'bisr', 'bandinvmf', 'bifr', 'blt'}"
             )
 
         if (
@@ -3050,6 +3135,9 @@ class PrivacyEngine:
             ),
             sample_rate_hint=float(sample_rate_hint),
             kwargs=kwargs,
+            include_random_allocation_state=(
+                mechanism_config.accounting_mode == "random_allocation_accountant"
+            ),
         )
 
         active_accountant = self._accountant_for_mechanism(
@@ -3057,10 +3145,10 @@ class PrivacyEngine:
             default_accountant=self.default_accountant,
             sampling_semantics=local_sampling_semantics,
         )
-        if mechanism_config.mechanism == "blt" and active_accountant.mechanism() not in ("blt", "bnb"):
+        if mechanism_config.mechanism == "blt" and active_accountant.mechanism() not in ("blt", "bnb", "random_allocation"):
             raise ValueError(
                 "BLT target-epsilon calibration is only supported for the BLT fixed-batch "
-                "or supported amplified BNB accountant contracts"
+                "or supported amplified BNB/random_allocation accountant contracts"
             )
 
         is_dpddp = isinstance(module, DPDDP)

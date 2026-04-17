@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
 from opacus.accountants import RandomAllocationAccountant, create_accountant
+import opacus.privacy_engine as pe_mod
 
 
 def _loader(*, n_samples: int = 40, in_dim: int = 4, n_classes: int = 3, batch_size: int = 8) -> DataLoader:
@@ -140,12 +141,14 @@ def test_privacy_engine_bnb_get_epsilon_uses_persisted_runtime_context() -> None
         ('bisr', {'bisr_inv_coeffs': [1.0, -0.1], 'bsr_bands': 2}),
         ('bandmf', {'coeffs': [1.0, 0.2], 'bsr_bands': 2}),
         ('bandinvmf', {'bandinvmf_inv_coeffs': [1.0, -0.1], 'bsr_bands': 2}),
+        ('bifr', {'bsr_bands': 2, 'bifr_frac': 0.5}),
+        ('blt', {'theta': [0.8], 'theta_hat': [0.6], 'z_std': 0.03}),
     ],
 )
 def test_privacy_engine_supports_random_allocation_family_state_resolution(mechanism: str, mechanism_state: dict) -> None:
     pe = PrivacyEngine(accountant='random_allocation')
     model = nn.Linear(4, 3)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9, weight_decay=0.1)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.0, weight_decay=0.0)
     pe.make_private(
         module=model,
         optimizer=optimizer,
@@ -163,12 +166,83 @@ def test_privacy_engine_supports_random_allocation_family_state_resolution(mecha
         ),
         sampling_semantics=SamplingSemantics(
             sampling_mode='k_out_of_t',
-            privacy_metadata={'num_steps': 5, 'num_selected': 2, 'bands': 2},
+            privacy_metadata=(
+                {'num_steps': 5, 'num_selected': 2}
+                if mechanism == 'blt'
+                else {'num_steps': 5, 'num_selected': 2, 'bands': 2}
+            ),
         ),
     )
     state = pe.noise_mechanism_config.mechanism_state
     assert 'random_allocation_accountant_coeffs' in state
     assert len(state['random_allocation_accountant_coeffs']) > 0
+
+
+@pytest.mark.parametrize(
+    ("mechanism", "mechanism_state", "privacy_metadata", "expected_source"),
+    [
+        ("gaussian", {}, {"num_steps": 5, "num_selected": 2}, "raw_c_col"),
+        ("bsr", {"coeffs": [1.0, 0.2], "bsr_bands": 2}, {"num_steps": 5, "num_selected": 2, "bands": 2}, "raw_c_col"),
+        ("bandmf", {"coeffs": [1.0, 0.2], "bsr_bands": 2}, {"num_steps": 5, "num_selected": 2, "bands": 2}, "runtime_c_col"),
+        ("bifr", {"bsr_bands": 2, "bifr_frac": 0.5}, {"num_steps": 5, "num_selected": 2, "bands": 2}, "abs_exact_factor_c_col"),
+        ("blt", {"theta": [0.8], "theta_hat": [0.6], "z_std": 0.03}, {"num_steps": 5, "num_selected": 2}, "normalized_forward_c_col"),
+    ],
+)
+def test_make_private_with_epsilon_supports_random_allocation_k_out_of_t_target_epsilon_route(
+    monkeypatch: pytest.MonkeyPatch,
+    mechanism: str,
+    mechanism_state: dict,
+    privacy_metadata: dict,
+    expected_source: str,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_get_noise_multiplier(*, target_epsilon, target_delta, sample_rate, steps, accountant, **kwargs):
+        captured.update(
+            {
+                "target_epsilon": float(target_epsilon),
+                "target_delta": float(target_delta),
+                "sample_rate": float(sample_rate),
+                "steps": int(steps),
+                "accountant": str(accountant),
+                **kwargs,
+            }
+        )
+        return 1.0
+
+    monkeypatch.setattr(pe_mod, "get_noise_multiplier", _fake_get_noise_multiplier)
+
+    pe = PrivacyEngine(accountant='random_allocation')
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    _private_model, dp_optimizer, private_loader = pe.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        target_epsilon=3.0,
+        target_delta=1e-5,
+        total_steps=10,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping='flat',
+        grad_sample_mode='hooks',
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism=mechanism,
+            accounting_mode='random_allocation_accountant',
+            mechanism_state=mechanism_state,
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode='k_out_of_t',
+            privacy_metadata=privacy_metadata,
+        ),
+    )
+
+    assert captured["accountant"] == "random_allocation"
+    assert captured["sampling_semantics"].sampling_mode == "k_out_of_t"
+    assert captured["mechanism_state"]["random_allocation_accountant_coeffs_source"] == expected_source
+    assert len(captured["mechanism_state"]["random_allocation_accountant_coeffs"]) > 0
+    assert dp_optimizer.accounting_mode == "random_allocation_accountant"
+    assert len(private_loader) == int(privacy_metadata["num_steps"])
 
 
 def test_k_out_of_t_requires_random_allocation_routing() -> None:

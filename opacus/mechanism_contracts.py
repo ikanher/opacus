@@ -172,9 +172,9 @@ class NoiseMechanismConfig:
                 "for authoritative accounting"
             )
 
-        if mechanism == "bifr" and accounting_mode not in ("bsr_accountant", "bnb_accountant"):
+        if mechanism == "bifr" and accounting_mode not in ("bsr_accountant", "bnb_accountant", "random_allocation_accountant"):
             raise ValueError(
-                "bifr mechanism requires bsr_accountant or bnb_accountant"
+                "bifr mechanism requires bsr_accountant, bnb_accountant, or random_allocation_accountant"
             )
 
         if (
@@ -204,5 +204,7 @@ class NoiseMechanismConfig:
                 "for authoritative accounting"
             )
 
-        if mechanism == "blt" and accounting_mode not in ("blt_accountant", "bnb_accountant"):
-            raise ValueError("blt mechanism requires blt_accountant or bnb_accountant routing")
+        if mechanism == "blt" and accounting_mode not in ("blt_accountant", "bnb_accountant", "random_allocation_accountant"):
+            raise ValueError(
+                "blt mechanism requires blt_accountant, bnb_accountant, or random_allocation_accountant routing"
+            )

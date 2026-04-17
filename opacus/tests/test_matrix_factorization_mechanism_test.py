@@ -122,7 +122,7 @@ def test_noise_mechanism_config_blt_canonicalizes_legacy_accounting_mode() -> No
 
 def test_noise_mechanism_config_blt_rejects_non_blt_accountant() -> None:
     with pytest.raises(
-        ValueError, match="blt mechanism requires blt_accountant or bnb_accountant routing"
+        ValueError, match="blt mechanism requires blt_accountant, bnb_accountant, or random_allocation_accountant routing"
     ):
         NoiseMechanismConfig(
             mechanism="blt",

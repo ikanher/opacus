@@ -267,6 +267,9 @@ class BLTFamily:
                 ),
             )
 
+        if sampling_mode == "k_out_of_t":
+            return mechanism_config
+
         max_grad_norm = context.get("max_grad_norm")
         if isinstance(max_grad_norm, list):
             max_grad_norm = None

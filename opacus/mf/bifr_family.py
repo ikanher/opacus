@@ -71,7 +71,17 @@ class BIFRFamily(SupportsBallsInBins):
                 )
             return
 
-        raise ValueError("bifr mechanism currently supports accounting_mode in {'bsr_accountant', 'bnb_accountant'} only")
+        if mechanism_config.accounting_mode == "random_allocation_accountant":
+            if sampling_semantics is None or sampling_semantics.sampling_mode != "k_out_of_t":
+                raise ValueError(
+                    "bifr mechanism with random_allocation_accountant requires sampling_mode='k_out_of_t'"
+                )
+            return
+
+        raise ValueError(
+            "bifr mechanism currently supports accounting_mode in "
+            "{'bsr_accountant', 'bnb_accountant', 'random_allocation_accountant'} only"
+        )
 
     def canonicalize(self, raw_state: Mapping[str, Any]) -> dict[str, Any]:
         return canonicalize_bifr_runtime_state(runtime_state=raw_state)
@@ -103,6 +113,9 @@ class BIFRFamily(SupportsBallsInBins):
                     "sampling_mode": mode,
                 },
             )
+
+        if mode == "k_out_of_t":
+            return state
 
         raise ValueError("bifr runtime currently supports fixed-batch or supported BNB amplified semantics only")
 
@@ -162,6 +175,8 @@ class BIFRFamily(SupportsBallsInBins):
         if sampling_semantics is not None and sampling_semantics.sampling_mode not in (None, "torch_sampler"):
             if sampling_semantics.sampling_mode in ("balls_in_bins", "b_min_sep"):
                 return {}, None
+            if sampling_semantics.sampling_mode == "k_out_of_t":
+                return {}, None
             raise ValueError("bifr target-epsilon calibration currently supports fixed-batch or supported BNB amplified semantics only")
 
         return {}, self.resolve_fixed_batch(
@@ -208,6 +223,9 @@ class BIFRFamily(SupportsBallsInBins):
                     },
                 ),
             )
+
+        if local_sampling_semantics is not None and local_sampling_semantics.sampling_mode == "k_out_of_t":
+            return mechanism_config
 
         if local_sampling_semantics is not None and local_sampling_semantics.sampling_mode not in (None, "torch_sampler"):
             raise ValueError("bifr runtime currently supports fixed-batch or supported BNB amplified semantics only")

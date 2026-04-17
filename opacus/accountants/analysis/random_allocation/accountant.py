@@ -188,7 +188,7 @@ class RandomAllocationAccountantInputs:
 
 
 _SUPPORTED_PUBLIC_EXACT_MECHANISMS = frozenset(
-    {"gaussian", "bsr", "bisr", "bandmf", "bandinvmf", "blt"}
+    {"gaussian", "bsr", "bisr", "bandmf", "bandinvmf", "bifr", "blt"}
 )
 
 
