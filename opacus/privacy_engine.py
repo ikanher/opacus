@@ -2019,6 +2019,7 @@ class PrivacyEngine:
         bnb_c_matrix: Optional[torch.Tensor],
         bnb_bands: Optional[int],
         bnb_cycle_length: Optional[int],
+        bnb_c_matrix_contract: Optional[Dict[str, Any]],
         kwargs: Dict[str, Any],
     ) -> Tuple[float, float]:
         """
@@ -2094,6 +2095,8 @@ class PrivacyEngine:
                 calibration_cfg["bnb_distributed_dp_runtime"]
             ),
         }
+        if bnb_c_matrix_contract is not None:
+            estimator_kwargs["bnb_c_matrix_contract"] = bnb_c_matrix_contract
         if "bnb_sigma_reuse_state" in kwargs:
             estimator_kwargs["bnb_sigma_reuse_state"] = kwargs[
                 "bnb_sigma_reuse_state"
@@ -2167,6 +2170,7 @@ class PrivacyEngine:
         bnb_c_matrix: Optional[torch.Tensor],
         bnb_bands: Optional[int],
         bnb_cycle_length: Optional[int],
+        bnb_c_matrix_contract: Optional[Dict[str, Any]],
         kwargs: Dict[str, Any],
     ) -> Tuple[float, float]:
         """
@@ -2189,6 +2193,7 @@ class PrivacyEngine:
                 bnb_c_matrix=bnb_c_matrix,
                 bnb_bands=bnb_bands,
                 bnb_cycle_length=bnb_cycle_length,
+                bnb_c_matrix_contract=bnb_c_matrix_contract,
                 kwargs=kwargs,
             )
 
@@ -3121,7 +3126,7 @@ class PrivacyEngine:
             query_runtime_context=query_runtime_context,
         )
 
-        bnb_c_matrix, bnb_bands, bnb_cycle_length, _ = self._resolve_bnb_runtime_inputs_for_epsilon(
+        bnb_c_matrix, bnb_bands, bnb_cycle_length, bnb_c_matrix_contract = self._resolve_bnb_runtime_inputs_for_epsilon(
             mechanism_config=mechanism_config,
             sampling_semantics=local_sampling_semantics,
             kwargs=kwargs,
@@ -3176,6 +3181,7 @@ class PrivacyEngine:
             bnb_c_matrix=bnb_c_matrix,
             bnb_bands=bnb_bands,
             bnb_cycle_length=bnb_cycle_length,
+            bnb_c_matrix_contract=bnb_c_matrix_contract,
             kwargs=kwargs,
         )
         logger.info(

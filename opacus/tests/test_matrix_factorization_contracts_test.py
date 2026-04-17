@@ -1774,6 +1774,52 @@ def test_make_private_with_epsilon_bnb_uses_accountant_get_noise_multiplier_path
     assert captured["mechanism_state"]["bnb_c_matrix_contract"]["sampling_mode"] == "b_min_sep"
 
 
+def test_make_private_with_epsilon_bsr_bnb_forwards_c_matrix_contract_to_calibration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    pe = PrivacyEngine()
+    captured: dict[str, object] = {}
+
+    def wrapped_get_noise_multiplier(**kwargs):
+        captured.update(copy.deepcopy(kwargs))
+        return 1.23
+
+    monkeypatch.setattr(privacy_engine_mod, "get_noise_multiplier", wrapped_get_noise_multiplier)
+
+    _, dp_optimizer, _ = pe.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        target_epsilon=0.5,
+        target_delta=0.2,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        total_steps=9,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bnb_accountant",
+            mechanism_state={
+                "coeffs": [1.0, 0.25],
+                "z_std": 0.01,
+                "bsr_bands": 2,
+            },
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 5, "bands": 2},
+        ),
+    )
+
+    assert float(dp_optimizer.noise_multiplier) == pytest.approx(1.23)
+    assert captured["accountant"] == "bnb"
+    assert captured["sampling_semantics"].sampling_mode == "balls_in_bins"
+    assert captured["bnb_c_matrix_contract"]["sampling_mode"] == "b_min_sep"
+    assert captured["bnb_c_matrix_contract"]["bands"] == 2
+    assert captured["mechanism_state"]["bnb_c_matrix_contract"] == captured["bnb_c_matrix_contract"]
+
+
 def test_make_private_with_epsilon_epochs_uses_balls_in_bins_rate() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
