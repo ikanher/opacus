@@ -2744,6 +2744,121 @@ def test_fixed_bin_bridge_workload_trims_bnb_padding_to_logical_horizon(
     assert sensitivity is None
 
 
+def test_blt_fixed_bin_bridge_workload_reuses_accountant_owned_toeplitz_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    logical_horizon = int(_MODULE.TOTAL_STEPS)
+    padded_horizon = logical_horizon + 4
+    padded = _MODULE.np.arange(float(padded_horizon * padded_horizon), dtype=float).reshape(
+        padded_horizon,
+        padded_horizon,
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        _MODULE,
+        "_compute_blt_fixed_batch_runtime_z_std",
+        lambda *, buffers, blt_lambda=None: (
+            0.314,
+            {
+                "noise_multiplier_ref": 1.27,
+                "blt_horizon": logical_horizon,
+                "blt_min_separation": 4,
+                "blt_max_participations": 2,
+                "selected_candidate_index": 0,
+                "candidate_count": 3,
+                "selected_theta": [0.8, 0.3],
+                "selected_theta_hat": [0.6, 0.1],
+            },
+        ),
+    )
+
+    def _resolve_state(**kwargs):
+        captured.update(kwargs)
+        return {
+            "bnb_c_matrix": padded,
+            "bnb_c_matrix_contract": {
+                "horizon": logical_horizon,
+                "padded_horizon": padded_horizon,
+            },
+            "bnb_accountant_coeffs_source": "normalized_forward_c_col",
+        }
+
+    monkeypatch.setattr(_MODULE, "resolve_blt_balls_in_bins_accountant_state", _resolve_state)
+
+    c_matrix, coeff_source, blt_meta = _MODULE._resolve_blt_fixed_bin_bridge_workload(
+        buffers=4,
+        blt_lambda=None,
+    )
+
+    assert c_matrix.shape == (logical_horizon, logical_horizon)
+    assert _MODULE.np.array_equal(c_matrix, padded[:logical_horizon, :logical_horizon])
+    assert coeff_source == "normalized_forward_c_col"
+    assert blt_meta["selected_candidate_index"] == 0
+    assert captured["kwargs"]["bnb_cycle_length"] == int(_MODULE.STEPS_PER_EPOCH)
+    assert captured["kwargs"]["bnb_bands"] == 4
+
+
+def test_blt_fixed_bin_bridge_row_preserves_selected_theta_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = _MODULE.BLT_AMPLIFIED_DIAGNOSTIC_ROW
+    monkeypatch.setattr(
+        _MODULE,
+        "_resolve_blt_fixed_bin_bridge_workload",
+        lambda *, buffers, blt_lambda=None: (
+            _MODULE.np.eye(4, dtype=float),
+            "normalized_forward_c_col",
+            {
+                "selected_candidate_index": 1,
+                "candidate_count": 5,
+                "selected_theta": [0.8, 0.3],
+                "selected_theta_hat": [0.6, 0.1],
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        _MODULE,
+        "resolve_fixed_bin_random_allocation_bridge_inputs",
+        lambda **kwargs: SimpleNamespace(
+            source_law_kind="balls_in_bins_fixed_bin",
+            accountant_engine_kind="deterministic_random_allocation",
+            route="fixed_bin_bridge_exact_pair_package",
+            exact_law_route="exact_fixed_bin_gaussian_mixture_pair",
+            initial_package_route="pair_driven_exact_initial_package",
+        ),
+    )
+    monkeypatch.setattr(
+        _MODULE,
+        "_compute_fixed_bin_bridge_noise_multiplier",
+        lambda **kwargs: (
+            0.8125,
+            {
+                "source_law_kind": "balls_in_bins_fixed_bin",
+                "accountant_engine_kind": "deterministic_random_allocation",
+                "route": "fixed_bin_bridge_exact_pair_package",
+                "exact_law_route": "exact_fixed_bin_gaussian_mixture_pair",
+                "initial_package_route": "pair_driven_exact_initial_package",
+                "runtime_policy_name": "fixed_bin_bridge_candidate_grid_1e-2",
+                "runtime_loss_discretization": 1e-2,
+            },
+        ),
+    )
+
+    bridge_row = _MODULE._build_amplified_fixed_bin_bridge_row(row)
+
+    assert bridge_row.status == "computed"
+    assert bridge_row.backend == "ra_fixed_bin_bnb"
+    assert bridge_row.route == "fixed_bin_bridge_exact_pair_package"
+    assert bridge_row.blt_selection_mode == "optimizer_selected"
+    assert bridge_row.blt_buffers == int(row.bandwidth)
+    assert bridge_row.blt_selected_candidate_index == 1
+    assert bridge_row.blt_candidate_count == 5
+    assert bridge_row.blt_selected_theta == [0.8, 0.3]
+    assert bridge_row.blt_selected_theta_hat == [0.6, 0.1]
+    assert bridge_row.computed_noise_multiplier == pytest.approx(0.8125)
+
+
 def test_dpsgd_fixed_bin_bridge_row_reports_exact_pair_route_without_live_search(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2870,6 +2985,63 @@ def test_band_inv_mf_fixed_bin_bridge_row_reports_ambient_route_without_live_sea
     assert bridge_row.initial_package_route == "pair_driven_ambient_quantitative_window_realization_package"
     assert bridge_row.parity_status == "computed_far"
     assert bridge_row.computed_noise_multiplier == pytest.approx(6.89601366667091)
+
+
+def test_blt_amplified_report_keeps_explicit_failed_fixed_bin_bridge_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        _MODULE,
+        "_resolve_blt_amplified_accountant_coeffs",
+        lambda *, buffers, blt_lambda: (
+            [1.0] + [0.0] * (int(_MODULE.TOTAL_STEPS) - 1),
+            "normalized_forward_c_col",
+            {
+                "selected_candidate_index": 0,
+                "candidate_count": 1,
+                "selected_theta": [0.8, 0.3],
+                "selected_theta_hat": [0.6, 0.1],
+                "blt_min_separation": 4,
+                "blt_horizon": int(_MODULE.TOTAL_STEPS),
+            },
+        ),
+    )
+    monkeypatch.setattr(_MODULE, "_compute_bnb_noise_multiplier_for_coeffs", lambda **kwargs: 0.75)
+    monkeypatch.setattr(
+        _MODULE,
+        "_build_amplified_fixed_bin_bridge_row",
+        lambda row, **kwargs: _MODULE._comparison_row(
+            row=row,
+            backend="ra_fixed_bin_bnb",
+            status="failed",
+            computed=None,
+            sensitivity=None,
+            reason_code="known_missing_fixed_bin_bridge_quantitative_window_realization",
+            blt_selection_mode="optimizer_selected",
+            blt_buffers=int(row.bandwidth),
+            source_law_kind="balls_in_bins_fixed_bin",
+            accountant_engine_kind="deterministic_random_allocation",
+            route="fixed_bin_bridge_ambient_quantitative_window_realization_package",
+            notes="test unsupported BLT fixed-bin row",
+        ),
+    )
+
+    rows = _MODULE.compute_comparison_rows(
+        include_amplified=True,
+        include_non_amplified=False,
+        include_amplified_deterministic=True,
+        methods=["BLT"],
+        amplified_backends=["balls_in_bins"],
+    )
+
+    bridge_rows = [row for row in rows if row.method == "BLT" and row.backend == "ra_fixed_bin_bnb"]
+    assert len(bridge_rows) == 1
+    assert bridge_rows[0].status == "failed"
+    assert (
+        bridge_rows[0].reason_code
+        == "known_missing_fixed_bin_bridge_quantitative_window_realization"
+    )
+    assert bridge_rows[0].route == "fixed_bin_bridge_ambient_quantitative_window_realization_package"
 
 
 def test_ambient_quantitative_window_route_maps_nonfinite_upper_bound_separately(
