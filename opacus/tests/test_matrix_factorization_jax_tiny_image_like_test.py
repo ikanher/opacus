@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Tiny CIFAR-like JAX-linked parity tests.
+"""Tiny image-like JAX-linked parity tests.
 
 Runtime constraints:
 - synthetic dataset only (`n_samples=64`, `batch_size=8`)
