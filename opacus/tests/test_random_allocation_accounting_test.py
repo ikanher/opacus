@@ -451,6 +451,178 @@ def test_geometric_convolution_avoids_overflow_warnings_on_large_grids() -> None
     assert np.all(np.isfinite(out.PMF_array))
 
 
+def _reference_geometric_convolve(
+    dist_1,
+    dist_2,
+    *,
+    tail_truncation: float,
+    bound_type,
+):
+    if not math.isclose(
+        float(dist_1.ratio),
+        float(dist_2.ratio),
+        rel_tol=random_allocation_module.SPACING_RTOL,  # type: ignore[attr-defined]
+        abs_tol=random_allocation_module.SPACING_ATOL,  # type: ignore[attr-defined]
+    ):
+        raise ValueError("Grid ratios must match")
+
+    ratio = 0.5 * (dist_1.ratio + dist_2.ratio)
+    x1_min = dist_1.x_min
+    x2_min = dist_2.x_min
+    p1 = dist_1.PMF_array
+    p2 = dist_2.PMF_array
+    if x1_min > x2_min:
+        x1_min, p1, x2_min, p2 = x2_min, p2, x1_min, p1
+
+    scale = float(x2_min / x1_min)
+    n = max(p1.size, p2.size)
+    if p1.size < n:
+        p1 = np.pad(p1, (0, n - p1.size), mode="constant")
+    if p2.size < n:
+        p2 = np.pad(p2, (0, n - p2.size), mode="constant")
+
+    if n == 1:
+        pmf_out = np.array([float(p1[0] * p2[0])], dtype=np.float64)
+        x_out_min = x1_min + x2_min
+    else:
+        log_r = math.log(ratio)
+        log_scale = math.log(scale)
+        log_ap1 = math.log(scale + 1.0)
+        d_vec = np.arange(n, dtype=np.float64)
+        log_r_d = d_vec * log_r
+        log_lohi = np.logaddexp(0.0, log_scale + log_r_d)
+        tau_lohi = (log_lohi - log_ap1) / log_r
+        log_hilo = np.logaddexp(log_scale, log_r_d)
+        tau_hilo = (log_hilo - log_ap1) / log_r
+        rounding_eps = 1e-16
+
+        if bound_type == random_allocation_module._BoundType.DOMINATES:  # type: ignore[attr-defined]
+            delta_lohi = np.ceil(tau_lohi - rounding_eps).astype(np.int64)
+            delta_hilo = np.ceil(tau_hilo - rounding_eps).astype(np.int64)
+        else:
+            delta_lohi = np.floor(tau_lohi + rounding_eps).astype(np.int64)
+            delta_hilo = np.floor(tau_hilo + rounding_eps).astype(np.int64)
+
+        pmf_out = np.zeros(n, dtype=np.float64)
+        comp = np.zeros(n, dtype=np.float64)
+        for i in range(n):
+            mass = float(p1[i] * p2[i])
+            y = mass - comp[i]
+            t = pmf_out[i] + y
+            comp[i] = (t - pmf_out[i]) - y
+            pmf_out[i] = t
+
+        for d in range(1, n):
+            imax = n - d
+            kshift1 = int(delta_lohi[d])
+            kshift2 = int(delta_hilo[d])
+
+            for i in range(imax):
+                k1 = i + kshift1
+                mass1 = float(p1[i] * p2[i + d])
+                if 0 <= k1 < n:
+                    y = mass1 - comp[k1]
+                    t = pmf_out[k1] + y
+                    comp[k1] = (t - pmf_out[k1]) - y
+                    pmf_out[k1] = t
+
+                k2 = i + kshift2
+                mass2 = float(p1[i + d] * p2[i])
+                if 0 <= k2 < n:
+                    y = mass2 - comp[k2]
+                    t = pmf_out[k2] + y
+                    comp[k2] = (t - pmf_out[k2]) - y
+                    pmf_out[k2] = t
+
+        x_out_min = x1_min + x2_min
+
+    expected_neg_inf, expected_pos_inf = random_allocation_module._convolve_infinite_masses(  # type: ignore[attr-defined]
+        dist_1.p_neg_inf,
+        dist_1.p_pos_inf,
+        dist_2.p_neg_inf,
+        dist_2.p_pos_inf,
+    )
+    pmf_out, p_neg_inf, p_pos_inf = random_allocation_module._enforce_mass_conservation(  # type: ignore[attr-defined]
+        pmf_out,
+        expected_neg_inf,
+        expected_pos_inf,
+        bound_type,
+    )
+    return random_allocation_module._GeometricDiscreteDist(  # type: ignore[attr-defined]
+        float(x_out_min),
+        ratio,
+        pmf_out,
+        p_neg_inf,
+        p_pos_inf,
+    ).truncate_edges(tail_truncation, bound_type)
+
+
+@pytest.mark.parametrize(
+    ("size_1", "size_2", "scale"),
+    [
+        (16, 16, 1.0),
+        (16, 16, 2.0),
+        (16, 16, 4.0),
+        (16, 16, 8.0),
+        (16, 16, 9.0),
+        (21, 13, 4.0),
+    ],
+)
+@pytest.mark.parametrize(
+    "bound_type",
+    [
+        random_allocation_module._BoundType.DOMINATES,  # type: ignore[attr-defined]
+        random_allocation_module._BoundType.IS_DOMINATED,  # type: ignore[attr-defined]
+    ],
+)
+def test_geometric_convolution_matches_reference_for_representative_scales(
+    size_1: int,
+    size_2: int,
+    scale: float,
+    bound_type,
+) -> None:
+    gen = np.random.default_rng(20260416 + size_1 + size_2)
+    pmf_1 = gen.random(size_1)
+    pmf_1 /= np.sum(pmf_1, dtype=np.float64)
+    pmf_2 = gen.random(size_2)
+    pmf_2 /= np.sum(pmf_2, dtype=np.float64)
+
+    dist_1 = random_allocation_module._GeometricDiscreteDist(  # type: ignore[attr-defined]
+        x_min=1.0,
+        ratio=1.02,
+        pmf=pmf_1,
+        p_neg_inf=0.05,
+        p_pos_inf=0.0,
+    )
+    dist_2 = random_allocation_module._GeometricDiscreteDist(  # type: ignore[attr-defined]
+        x_min=float(scale),
+        ratio=1.02,
+        pmf=pmf_2,
+        p_neg_inf=0.0,
+        p_pos_inf=0.02,
+    )
+
+    observed = random_allocation_module._geometric_convolve(  # type: ignore[attr-defined]
+        dist_1,
+        dist_2,
+        tail_truncation=0.0,
+        bound_type=bound_type,
+    )
+    expected = _reference_geometric_convolve(
+        dist_1,
+        dist_2,
+        tail_truncation=0.0,
+        bound_type=bound_type,
+    )
+
+    assert observed.x_min == pytest.approx(expected.x_min, rel=0.0, abs=1e-12)
+    assert observed.ratio == pytest.approx(expected.ratio, rel=0.0, abs=1e-12)
+    assert observed.p_neg_inf == pytest.approx(expected.p_neg_inf, rel=0.0, abs=1e-12)
+    assert observed.p_pos_inf == pytest.approx(expected.p_pos_inf, rel=0.0, abs=1e-12)
+    assert observed.PMF_array.shape == expected.PMF_array.shape
+    assert np.max(np.abs(observed.PMF_array - expected.PMF_array)) <= 1e-12
+
+
 def test_fixed_bin_bridge_keeps_source_law_distinct_from_repeated_random_allocation() -> None:
     repeated = resolve_random_allocation_accountant_inputs(
         mechanism="gaussian",

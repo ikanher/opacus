@@ -970,6 +970,56 @@ def _binary_self_convolve_linear(
     return acc if acc is not None else base
 
 
+def _iter_constant_int_runs(values: np.ndarray) -> list[tuple[int, int, int]]:
+    if values.ndim != 1:
+        raise ValueError("values must be a 1-D array")
+
+    if values.size == 0:
+        return []
+
+    change_indices = np.nonzero(np.diff(values))[0]
+    starts = np.concatenate(
+        (np.array([0], dtype=np.int64), change_indices + 1),
+        dtype=np.int64,
+    )
+    ends = np.concatenate(
+        (change_indices, np.array([values.size - 1], dtype=np.int64)),
+        dtype=np.int64,
+    )
+    return [
+        (int(start), int(end), int(values[start]))
+        for start, end in zip(starts, ends, strict=False)
+    ]
+
+
+def _compensated_slice_add_inplace(
+    pmf_out: np.ndarray,
+    comp: np.ndarray,
+    start: int,
+    values: np.ndarray,
+) -> None:
+    if values.size == 0:
+        return
+
+    if start < 0:
+        offset = -start
+        if offset >= values.size:
+            return
+        start = 0
+        values = values[offset:]
+
+    stop = min(start + values.size, pmf_out.size)
+    if stop <= start:
+        return
+
+    values = values[: stop - start]
+    sl = slice(start, stop)
+    y = values - comp[sl]
+    t = pmf_out[sl] + y
+    comp[sl] = (t - pmf_out[sl]) - y
+    pmf_out[sl] = t
+
+
 def _geometric_convolve(
     dist_1: _GeometricDiscreteDist,
     dist_2: _GeometricDiscreteDist,
@@ -1026,35 +1076,49 @@ def _geometric_convolve(
 
         pmf_out = np.zeros(n, dtype=np.float64)
         comp = np.zeros(n, dtype=np.float64)
-        for i in range(n):
-            mass = float(p1[i] * p2[i])
-            y = mass - comp[i]
-            t = pmf_out[i] + y
-            comp[i] = (t - pmf_out[i]) - y
-            pmf_out[i] = t
+        _compensated_slice_add_inplace(pmf_out, comp, 0, p1 * p2)
 
-        for d in range(1, n):
-            imax = n - d
-            kshift1 = int(delta_lohi[d])
-            kshift2 = int(delta_hilo[d])
+        if n > 1:
+            diag_offsets = np.arange(n, dtype=np.int64)
+            diff_lohi = delta_lohi - diag_offsets
+            diff_hilo = delta_hilo - diag_offsets
+            prefix_1 = np.concatenate(
+                (np.array([0.0], dtype=np.float64), np.cumsum(p1, dtype=np.float64))
+            )
+            prefix_2 = np.concatenate(
+                (np.array([0.0], dtype=np.float64), np.cumsum(p2, dtype=np.float64))
+            )
+            target_indices = np.arange(n, dtype=np.int64)
 
-            for i in range(imax):
-                k1 = i + kshift1
-                mass1 = float(p1[i] * p2[i + d])
+            for start_idx, end_idx, offset in _iter_constant_int_runs(diff_lohi[1:]):
+                start_d = start_idx + 1
+                end_d = end_idx + 1
+                j = target_indices[start_d:]
+                left = np.maximum(j - end_d, 0)
+                right = j - start_d
+                window_mass = prefix_1[right + 1] - prefix_1[left]
+                values = p2[start_d:] * window_mass
+                _compensated_slice_add_inplace(
+                    pmf_out,
+                    comp,
+                    start_d + offset,
+                    values,
+                )
 
-                if 0 <= k1 < n:
-                    y = mass1 - comp[k1]
-                    t = pmf_out[k1] + y
-                    comp[k1] = (t - pmf_out[k1]) - y
-                    pmf_out[k1] = t
-
-                k2 = i + kshift2
-                mass2 = float(p1[i + d] * p2[i])
-                if 0 <= k2 < n:
-                    y = mass2 - comp[k2]
-                    t = pmf_out[k2] + y
-                    comp[k2] = (t - pmf_out[k2]) - y
-                    pmf_out[k2] = t
+            for start_idx, end_idx, offset in _iter_constant_int_runs(diff_hilo[1:]):
+                start_d = start_idx + 1
+                end_d = end_idx + 1
+                j = target_indices[start_d:]
+                left = np.maximum(j - end_d, 0)
+                right = j - start_d
+                window_mass = prefix_2[right + 1] - prefix_2[left]
+                values = p1[start_d:] * window_mass
+                _compensated_slice_add_inplace(
+                    pmf_out,
+                    comp,
+                    start_d + offset,
+                    values,
+                )
 
         x_out_min = x1_min + x2_min
 
