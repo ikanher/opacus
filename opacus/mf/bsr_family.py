@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+"""
+Provider-layer family wrapper for the BSR/BISR/BandMF/BandInvMF stack.
+
+This module owns family-local canonicalization, capability dispatch, and
+query-state augmentation for the shared BSR-style provider surface used by
+`PrivacyEngine`.
+"""
+
 import copy
 import math
 from dataclasses import dataclass
@@ -23,10 +31,12 @@ def _resolve_optional_int(*values: Any, default: int = 0) -> int:
 
 
 def _noop_bsr_runtime_state_normalizer(*, state: Dict[str, Any]) -> None:
+    """Leave plain BSR/BandMF runtime state untouched."""
     return None
 
 
 def _normalize_bisr_runtime_state(*, state: Dict[str, Any]) -> None:
+    """Normalize BISR inverse-side state and lazily materialize runtime coeffs."""
     inv_coeffs = state.get("bisr_inv_coeffs")
     if not (isinstance(inv_coeffs, (list, tuple)) and len(inv_coeffs) > 0):
         return
@@ -37,6 +47,9 @@ def _normalize_bisr_runtime_state(*, state: Dict[str, Any]) -> None:
 
     state["bisr_inv_coeffs"] = [float(c) for c in inv_coeffs]
     if not (isinstance(state.get("coeffs"), list) and len(state["coeffs"]) > 0):
+        # BISR may arrive as inverse coefficients only; derive the correlated
+        # runtime coefficients once so later provider/accountant code can use a
+        # single canonical state shape.
         state["coeffs"] = derive_bisr_runtime_coeffs_from_inverse_coeffs(
             coeffs=state["bisr_inv_coeffs"]
         )
@@ -44,6 +57,7 @@ def _normalize_bisr_runtime_state(*, state: Dict[str, Any]) -> None:
 
 
 def _normalize_bandinvmf_runtime_state(*, state: Dict[str, Any]) -> None:
+    """Normalize Band-Inv-MF inverse-side state and lazily materialize runtime coeffs."""
     inv_coeffs = state.get("bandinvmf_inv_coeffs")
     if not (isinstance(inv_coeffs, (list, tuple)) and len(inv_coeffs) > 0):
         return
@@ -61,6 +75,7 @@ def _normalize_bandinvmf_runtime_state(*, state: Dict[str, Any]) -> None:
 
 
 def _resolve_bsr_cyclic_input(*, state: Dict[str, Any], sampling_semantics, steps: int, kwargs: Mapping[str, Any]) -> float:
+    """Resolve the cyclic sensitivity-scale input for the BSR accountant path."""
     from opacus.accountants.bsr import resolve_bsr_sensitivity_scale_for_cyclic
 
     return float(
@@ -74,6 +89,7 @@ def _resolve_bsr_cyclic_input(*, state: Dict[str, Any], sampling_semantics, step
 
 
 def _resolve_bisr_cyclic_input(*, state: Dict[str, Any], sampling_semantics, steps: int, kwargs: Mapping[str, Any]) -> float:
+    """Resolve the cyclic sensitivity-scale input for the BISR accountant path."""
     from opacus.accountants.bsr import resolve_bisr_sensitivity_scale_for_cyclic
 
     return float(
@@ -87,6 +103,7 @@ def _resolve_bisr_cyclic_input(*, state: Dict[str, Any], sampling_semantics, ste
 
 
 def _resolve_bandinvmf_cyclic_input(*, state: Dict[str, Any], sampling_semantics, steps: int, kwargs: Mapping[str, Any]) -> float:
+    """Resolve the cyclic sensitivity-scale input for the Band-Inv-MF accountant path."""
     from opacus.accountants.bandinvmf import resolve_bandinvmf_sensitivity_scale_for_cyclic
 
     return float(
@@ -107,6 +124,7 @@ def _resolve_bsr_fixed_batch_input(
     sample_rate: float,
     kwargs: Mapping[str, Any],
 ) -> float:
+    """Resolve the fixed-batch sensitivity input for the BSR accountant path."""
     from opacus.accountants.bsr import resolve_bsr_mf_sensitivity_for_fixed_batch
 
     return float(
@@ -128,6 +146,7 @@ def _resolve_bandmf_fixed_batch_input(
     sample_rate: float,
     kwargs: Mapping[str, Any],
 ) -> float:
+    """Resolve the fixed-batch sensitivity input for the BandMF accountant path."""
     from opacus.accountants.bandmf import resolve_bandmf_mf_sensitivity_for_fixed_batch
 
     return float(
@@ -149,6 +168,7 @@ def _resolve_bisr_fixed_batch_input(
     sample_rate: float,
     kwargs: Mapping[str, Any],
 ) -> float:
+    """Resolve the fixed-batch sensitivity input for the BISR accountant path."""
     from opacus.accountants.bsr import resolve_bisr_mf_sensitivity_for_fixed_batch
 
     return float(
@@ -170,6 +190,7 @@ def _resolve_bandinvmf_fixed_batch_input(
     sample_rate: float,
     kwargs: Mapping[str, Any],
 ) -> float:
+    """Resolve the fixed-batch sensitivity input for the Band-Inv-MF accountant path."""
     from opacus.accountants.bandinvmf import resolve_bandinvmf_mf_sensitivity_for_fixed_batch
 
     return float(
@@ -210,6 +231,9 @@ def canonicalize_bsr_family_runtime_state(
     mechanism: str,
     runtime_state: Mapping[str, Any],
 ) -> Dict[str, Any]:
+    """
+    Canonicalize BSR-family runtime state into a single provider-layer payload shape.
+    """
     state = copy.deepcopy(dict(runtime_state))
     state["_noise_mechanism"] = mechanism
 
@@ -253,6 +277,7 @@ def resolve_bsr_family_cyclic_accountant_input(
     steps: int,
     kwargs: Mapping[str, Any],
 ) -> float:
+    """Resolve the cyclic accountant input for the selected BSR-family mechanism."""
     state = canonicalize_bsr_family_runtime_state(
         mechanism=mechanism,
         runtime_state=runtime_state,
@@ -278,6 +303,7 @@ def resolve_bsr_family_fixed_batch_accountant_input(
     sample_rate: float,
     kwargs: Mapping[str, Any],
 ) -> float:
+    """Resolve the fixed-batch accountant input for the selected BSR-family mechanism."""
     state = canonicalize_bsr_family_runtime_state(
         mechanism=mechanism,
         runtime_state=runtime_state,
@@ -305,6 +331,7 @@ def augment_bsr_family_cyclic_query_state(
     steps: int,
     kwargs: Mapping[str, Any],
 ) -> Dict[str, Any]:
+    """Stamp cyclic sensitivity-scale metadata onto canonical BSR-family state."""
     state = canonicalize_bsr_family_runtime_state(
         mechanism=mechanism,
         runtime_state=runtime_state,
@@ -328,6 +355,7 @@ def augment_bsr_family_fixed_batch_query_state(
     sample_rate: float,
     kwargs: Mapping[str, Any],
 ) -> Dict[str, Any]:
+    """Stamp fixed-batch sensitivity metadata onto canonical BSR-family state."""
     state = canonicalize_bsr_family_runtime_state(
         mechanism=mechanism,
         runtime_state=runtime_state,
@@ -352,6 +380,9 @@ def augment_bsr_family_balls_in_bins_query_state(
     total_steps: int,
     kwargs: Mapping[str, Any],
 ) -> Dict[str, Any]:
+    """
+    Build the amplified balls-in-bins accountant bridge state for a BSR-family mechanism.
+    """
     from opacus.accountants.analysis.bandinvmf import (
         derive_bandinvmf_amplified_accountant_coeffs_from_inv_coeffs,
     )
@@ -410,6 +441,8 @@ def augment_bsr_family_balls_in_bins_query_state(
                 momentum=momentum,
                 weight_decay=weight_decay,
             )
+            # Re-run canonicalization so the shared state shape picks up the
+            # derived runtime coefficients from the fresh inverse-side payload.
             state = canonicalize_bsr_family_runtime_state(
                 mechanism=mechanism,
                 runtime_state=state,
@@ -459,6 +492,8 @@ def augment_bsr_family_balls_in_bins_query_state(
     state["bnb_horizon"] = int(horizon)
     state["bnb_bins"] = int(bins)
     state["bnb_cycle_length"] = int(bins)
+    # Persist both the accountant coefficient surface and the Toeplitz matrix
+    # contract so later BNB epsilon queries can reconstruct the same bridge.
     state = attach_accountant_coeff_surface(
         state,
         coeff_key="bnb_accountant_coeffs",
@@ -477,6 +512,7 @@ def augment_bsr_family_balls_in_bins_query_state(
 
 
 def summarize_bsr_runtime_state(runtime_state: Mapping[str, Any]) -> Dict[str, Any]:
+    """Return a lightweight provider-facing summary of canonical BSR-family state."""
     mechanism = str(runtime_state.get("_noise_mechanism", "bsr"))
     state = canonicalize_bsr_family_runtime_state(
         mechanism=mechanism,
@@ -508,6 +544,7 @@ def summarize_bsr_runtime_state(runtime_state: Mapping[str, Any]) -> Dict[str, A
 
 @dataclass(frozen=True)
 class BSRFamily:
+    """Registry-facing provider for BSR, BISR, BandMF, and Band-Inv-MF."""
     name: str
 
     def validate_sampling_compatibility(
@@ -518,6 +555,9 @@ class BSRFamily:
         sampling_semantics,
         validate_cyclic_poisson_mode: bool,
     ) -> None:
+        """
+        Enforce the runtime/accountant sampling contracts for the selected family member.
+        """
         mechanism = mechanism_config.mechanism
         if poisson_sampling:
             raise ValueError(
@@ -579,6 +619,7 @@ class BSRFamily:
             return
 
     def canonicalize(self, raw_state: Mapping[str, Any]) -> dict[str, Any]:
+        """Canonicalize raw family state through the shared BSR-family normalizer."""
         return canonicalize_bsr_family_runtime_state(
             mechanism=self.name,
             runtime_state=raw_state,
@@ -590,6 +631,7 @@ class BSRFamily:
         mechanism_state: Mapping[str, Any],
         context: Mapping[str, Any],
     ) -> dict[str, Any]:
+        """Build provider-layer runtime state for the active sampling mode."""
         state = self.canonicalize(mechanism_state)
         mode = context.get("sampling_mode")
         if mode == "cyclic_poisson":
@@ -612,6 +654,7 @@ class BSRFamily:
         return state
 
     def summarize(self, mechanism_state: Mapping[str, Any]) -> dict[str, Any]:
+        """Return a lightweight provider-facing summary of family runtime state."""
         return summarize_bsr_runtime_state(mechanism_state)
 
     def resolve_fixed_batch(
@@ -620,6 +663,7 @@ class BSRFamily:
         mechanism_state: Mapping[str, Any],
         context: Mapping[str, Any],
     ) -> float:
+        """Resolve the fixed-batch accountant input for the active family member."""
         return resolve_bsr_family_fixed_batch_accountant_input(
             mechanism=self.name,
             runtime_state=mechanism_state,
@@ -635,6 +679,7 @@ class BSRFamily:
         mechanism_state: Mapping[str, Any],
         context: Mapping[str, Any],
     ) -> float:
+        """Resolve the cyclic accountant input for the active family member."""
         return resolve_bsr_family_cyclic_accountant_input(
             mechanism=self.name,
             runtime_state=mechanism_state,
@@ -649,6 +694,7 @@ class BSRFamily:
         mechanism_state: Mapping[str, Any],
         context: Mapping[str, Any],
     ) -> dict[str, Any]:
+        """Resolve the balls-in-bins amplified accountant bridge state when supported."""
         optimizer = context.get("optimizer")
         sampling_semantics = context.get("sampling_semantics")
         if optimizer is None or sampling_semantics is None:
@@ -673,6 +719,9 @@ class BSRFamily:
         phase: str,
         query_runtime_context: Optional[Mapping[str, Any]] = None,
     ) -> tuple[dict[str, Any], Optional[float]]:
+        """
+        Resolve the query-time terms required by the active BSR-family epsilon solver.
+        """
         mechanism = mechanism_config.mechanism
         nm_kwargs: Dict[str, Any] = {}
         bsr_mf_sensitivity: Optional[float] = None
@@ -745,6 +794,9 @@ class BSRFamily:
         optimizer=None,
         query_runtime_context: Optional[Mapping[str, Any]] = None,
     ):
+        """
+        Augment provider-layer query config with cyclic or amplified BNB bridge state.
+        """
         from opacus.mechanism_contracts import NoiseMechanismConfig
 
         mechanism = mechanism_config.mechanism
@@ -778,6 +830,9 @@ class BSRFamily:
             resolved_scale = nm_kwargs.get("bsr_sensitivity_scale")
             if resolved_scale is None:
                 return mechanism_config
+            # Persist the resolved cyclic sensitivity scale on the mechanism
+            # state so the later sigma solve and epsilon queries agree on the
+            # same cyclic contract.
             state = augment_bsr_family_cyclic_query_state(
                 mechanism=mechanism,
                 runtime_state=mechanism_config.mechanism_state,

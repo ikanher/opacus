@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+"""
+Provider-layer family wrapper for BIFR.
+
+This module owns the BIFR-specific registry hooks used by `PrivacyEngine`. It
+does not own the BIFR accountant formulas themselves; those remain in
+`opacus.accountants.bifr` and `opacus.accountants.bifr_inputs`.
+"""
+
 from typing import Any, Dict, Mapping, Optional
 
 from opacus.accountants.bifr_inputs import (
@@ -31,6 +39,9 @@ def augment_bifr_family_fixed_batch_query_state(
     sample_rate: float,
     kwargs: Mapping[str, Any],
 ) -> Dict[str, Any]:
+    """
+    Stamp fixed-batch BIFR sensitivity onto a canonical runtime state payload.
+    """
     from opacus.accountants.bifr import resolve_bifr_mf_sensitivity_for_fixed_batch
 
     state = canonicalize_bifr_runtime_state(runtime_state=runtime_state)
@@ -45,6 +56,7 @@ def augment_bifr_family_fixed_batch_query_state(
 
 
 class BIFRFamily(SupportsBallsInBins):
+    """Registry-facing BIFR family provider."""
     name = "bifr"
 
     def validate_sampling_compatibility(
@@ -55,6 +67,9 @@ class BIFRFamily(SupportsBallsInBins):
         sampling_semantics,
         validate_cyclic_poisson_mode: bool,
     ) -> None:
+        """
+        Enforce the runtime/accountant sampling contracts currently supported by BIFR.
+        """
         del validate_cyclic_poisson_mode
         if poisson_sampling:
             raise ValueError("bifr mechanism requires fixed-batch semantics; set poisson_sampling=False")
@@ -84,9 +99,13 @@ class BIFRFamily(SupportsBallsInBins):
         )
 
     def canonicalize(self, raw_state: Mapping[str, Any]) -> dict[str, Any]:
+        """Canonicalize raw BIFR runtime state through the accountant-owned input layer."""
         return canonicalize_bifr_runtime_state(runtime_state=raw_state)
 
     def build_runtime(self, *, mechanism_state: Mapping[str, Any], context: Mapping[str, Any]) -> dict[str, Any]:
+        """
+        Build the provider-layer runtime/accountant state for the active BIFR sampling mode.
+        """
         state = self.canonicalize(mechanism_state)
         mode = context.get("sampling_mode")
         if mode in (None, "torch_sampler"):
@@ -99,6 +118,8 @@ class BIFRFamily(SupportsBallsInBins):
             )
 
         if mode in ("balls_in_bins", "b_min_sep"):
+            # The amplified BNB path needs an accountant-state bridge rather than
+            # the plain fixed-batch sensitivity scalar.
             return self.resolve_balls_in_bins(
                 mechanism_state=state,
                 context={
@@ -120,6 +141,7 @@ class BIFRFamily(SupportsBallsInBins):
         raise ValueError("bifr runtime currently supports fixed-batch or supported BNB amplified semantics only")
 
     def summarize(self, mechanism_state: Mapping[str, Any]) -> dict[str, Any]:
+        """Return a lightweight provider-facing summary of canonical BIFR state."""
         return summarize_bifr_runtime_state(mechanism_state)
 
     def resolve_balls_in_bins(
@@ -128,6 +150,9 @@ class BIFRFamily(SupportsBallsInBins):
         mechanism_state: Mapping[str, Any],
         context: Mapping[str, Any],
     ) -> dict[str, Any]:
+        """
+        Resolve the amplified BNB accountant-state bridge for BIFR.
+        """
         from opacus.accountants.bifr import resolve_bifr_bnb_accountant_state
         from opacus.mechanism_contracts import SamplingSemantics
 
@@ -147,6 +172,7 @@ class BIFRFamily(SupportsBallsInBins):
         )
 
     def resolve_fixed_batch(self, *, mechanism_state: Mapping[str, Any], context: Mapping[str, Any]) -> float:
+        """Resolve the fixed-batch BIFR sensitivity used by the BSR accountant path."""
         from opacus.accountants.bifr import resolve_bifr_mf_sensitivity_for_fixed_batch
 
         return float(
@@ -170,6 +196,9 @@ class BIFRFamily(SupportsBallsInBins):
         phase: str,
         query_runtime_context: Optional[Mapping[str, Any]] = None,
     ) -> tuple[dict[str, Any], Optional[float]]:
+        """
+        Resolve the query-time terms needed by BIFR epsilon calibration.
+        """
         del query_runtime_context
         del phase
         if sampling_semantics is not None and sampling_semantics.sampling_mode not in (None, "torch_sampler"):
@@ -203,6 +232,9 @@ class BIFRFamily(SupportsBallsInBins):
         optimizer=None,
         query_runtime_context: Optional[Mapping[str, Any]] = None,
     ):
+        """
+        Augment BIFR query config with the family-specific state required by the active accountant path.
+        """
         from opacus.mechanism_contracts import NoiseMechanismConfig
 
         context = dict(query_runtime_context or {})
@@ -260,6 +292,8 @@ class BIFRFamily(SupportsBallsInBins):
             batch_size=logical_batch_size,
             dataset_size=dataset_size,
         )
+        # BIFR fixed-batch sensitivity still lives on the BSR-accountant side,
+        # so query augmentation computes and persists that scalar here.
         mf_steps = int(total_steps) if total_steps is not None else int(float(epochs) / float(sample_rate))
         state = augment_bifr_family_fixed_batch_query_state(
             runtime_state=mechanism_config.mechanism_state,

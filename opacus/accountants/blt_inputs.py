@@ -38,6 +38,13 @@ from opacus.accountants.blt_fixed_batch import (
 
 
 def _pair_from_input_state(state: Mapping[str, Any]) -> BLTPairedParams:
+    """
+    Resolve a canonical BLT pair from either public input surface.
+
+    Accepted shapes:
+    - decay-pair input: `theta`, `theta_hat`
+    - explicit paired input: `forward`, `inverse`
+    """
     if "theta" in state or "theta_hat" in state:
         if "theta" not in state or "theta_hat" not in state:
             raise ValueError("blt decay-pair input requires both `theta` and `theta_hat`")
@@ -70,6 +77,7 @@ def _canonical_state_from_pair(
     pair: BLTPairedParams,
     z_std: float,
 ) -> dict[str, Any]:
+    """Build the canonical BLT runtime/accountant state dictionary from a pair."""
     forward = pair.forward.canonicalized()
     inverse = pair.inverse.canonicalized()
     return {
@@ -92,6 +100,13 @@ def _copy_blt_runtime_metadata(
     source_state: Mapping[str, Any],
     canonical_state: dict[str, Any],
 ) -> dict[str, Any]:
+    """
+    Preserve BLT runtime/accountant metadata that should survive canonicalization.
+
+    Structural pair keys are rebuilt from the canonical pair, so only runtime
+    metadata such as accountant references, BLT selection fields, and
+    random-allocation attachments are copied through.
+    """
     for key, value in source_state.items():
         if key in {"theta", "theta_hat", "forward", "inverse", "z_std"}:
             continue
@@ -312,6 +327,8 @@ def resolve_blt_balls_in_bins_accountant_state(
         ),
     )
 
+    # Build the accountant-side BLT bridge object on the resolved visible
+    # horizon before attaching the normalized coefficient surface.
     resolved = build_blt_amplified_bnb_inputs(
         pair=state.pair,
         bands=bands,
@@ -377,6 +394,8 @@ def resolve_blt_workload_mechanism_state(
         if target_delta is None:
             raise ValueError("BLT target-epsilon workload resolution requires target_delta")
         if semantics.sampling_mode == "torch_sampler":
+            # Fixed-batch target-epsilon BLT uses the accountant-backed search
+            # surface rather than the default deterministic candidate.
             return dict(
                 optimize_blt_fixed_batch(
                     target_epsilon=float(target_epsilon),
@@ -391,6 +410,8 @@ def resolve_blt_workload_mechanism_state(
                 ).mechanism_state
             )
 
+    # Outside the fixed-batch target-epsilon path, choose the maintained default
+    # candidate deterministically from the canonical candidate family.
     candidates = generate_blt_theta_pair_candidates(buffers=int(resolved_buffers))
     theta_candidate, theta_hat_candidate = candidates[0]
     pair = blt_pair_from_theta_pair(
@@ -418,6 +439,8 @@ def resolve_blt_workload_mechanism_state(
     else:
         if not math.isfinite(float(noise_multiplier_ref)) or float(noise_multiplier_ref) < 0.0:
             raise ValueError("noise_multiplier_ref must be finite and >= 0")
+        # Convert the accountant-side Gaussian reference sigma into the runtime
+        # BLT noise scale seen by the optimizer release.
         z_std = float(noise_multiplier_ref) * float(max_grad_norm) / float(denominator)
 
     mechanism_state = canonicalize_blt_public_or_runtime_state(

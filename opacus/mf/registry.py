@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+"""
+Registry of engine-facing matrix-factorization family providers.
+
+This module is the single dispatch table that maps mechanism names such as
+`bsr`, `bisr`, `bandinvmf`, `bifr`, and `blt` onto family provider objects plus
+their capability flags.
+"""
+
 from opacus.mf.interfaces import MFFamilyEntry
 from opacus.mf.blt_family import BLTFamily
 from opacus.mf.bsr_family import BSRFamily
@@ -71,10 +79,16 @@ _MF_FAMILY_REGISTRY = {
 
 
 def get_mf_family_entry(mechanism: str) -> MFFamilyEntry | None:
+    """
+    Return the provider entry for an MF mechanism name, if one is registered.
+    """
     return _MF_FAMILY_REGISTRY.get(mechanism)
 
 
 def mf_accounting_requires_context(accountant_mechanism: str) -> bool:
+    """
+    Report whether epsilon queries for this family need persisted runtime context.
+    """
     entry = _MF_FAMILY_REGISTRY.get(accountant_mechanism)
     if entry is None:
         return False

@@ -113,6 +113,9 @@ def augment_blt_family_query_state(
     loss_reduction: str,
     kwargs: Mapping[str, Any],
 ) -> dict[str, Any]:
+    """
+    Augment BLT state with fixed-batch defaults implied by the active workload.
+    """
     state = BLTFamilyState.from_input_state(mechanism_state)
     metadata = (
         sampling_semantics.privacy_metadata
@@ -130,6 +133,9 @@ def augment_blt_family_query_state(
     ):
         return state.to_state_dict() if changed else dict(mechanism_state)
 
+    # Under the plain torch-sampler fallback, BLT derives its fixed-batch
+    # metadata from the workload geometry instead of from explicit sampler
+    # metadata.
     calibration_denominator = (
         1.0 if loss_reduction == "sum" else float(logical_batch_size)
     )
@@ -159,9 +165,11 @@ class BLTFamily:
         sampling_semantics,
         validate_cyclic_poisson_mode: bool,
     ) -> None:
+        """BLT currently accepts the sampling compatibility filtering done upstream."""
         return None
 
     def canonicalize(self, raw_state: Mapping[str, Any]) -> dict[str, Any]:
+        """Canonicalize raw BLT mechanism state through the accountant-owned input layer."""
         return canonicalize_blt_public_or_runtime_state(raw_state)
 
     def build_runtime(
@@ -170,6 +178,7 @@ class BLTFamily:
         mechanism_state: Mapping[str, Any],
         context: Mapping[str, Any],
     ) -> dict[str, Any]:
+        """Build the provider-layer BLT runtime state from canonical inputs and overrides."""
         state = BLTFamilyState.from_input_state(mechanism_state)
         metadata = context.get("metadata", {})
         kwargs = context.get("kwargs", {})
@@ -177,6 +186,7 @@ class BLTFamily:
         return state.to_state_dict()
 
     def summarize(self, mechanism_state: Mapping[str, Any]) -> dict[str, Any]:
+        """Return a lightweight provider-facing summary of BLT runtime state."""
         return summarize_blt_runtime_state(mechanism_state)
 
     def resolve_fixed_batch(
@@ -185,6 +195,7 @@ class BLTFamily:
         mechanism_state: Mapping[str, Any],
         context: Mapping[str, Any],
     ) -> Any:
+        """Resolve the fixed-batch BLT accountant-input tuple."""
         return resolve_blt_fixed_batch_accountant_inputs(
             runtime_state=mechanism_state,
             metadata=context.get("metadata", {}),
@@ -198,6 +209,7 @@ class BLTFamily:
         mechanism_state: Mapping[str, Any],
         context: Mapping[str, Any],
     ) -> dict[str, Any]:
+        """Resolve the amplified BLT balls-in-bins accountant bridge state."""
         return resolve_blt_balls_in_bins_accountant_state(
             runtime_state=mechanism_state,
             metadata=context.get("metadata", {}),
@@ -206,6 +218,7 @@ class BLTFamily:
         )
 
     def optimize(self, *, objective: Any, context: Mapping[str, Any]) -> Any:
+        """Dispatch BLT family-local optimization to the fixed-batch optimizer surface."""
         kwargs = dict(context)
         kwargs.update(dict(objective) if isinstance(objective, Mapping) else {})
 
@@ -222,6 +235,7 @@ class BLTFamily:
         phase: str,
         query_runtime_context: Mapping[str, Any] | None = None,
     ) -> tuple[dict[str, Any], None]:
+        """BLT does not currently emit extra query-time epsilon terms beyond state augmentation."""
         del query_runtime_context
 
         return {}, None
@@ -240,6 +254,9 @@ class BLTFamily:
         optimizer=None,
         query_runtime_context: Mapping[str, Any] | None = None,
     ):
+        """
+        Augment BLT query config with balls-in-bins bridge state or torch-sampler defaults.
+        """
         from opacus.mechanism_contracts import NoiseMechanismConfig
 
         del resolve_total_steps_sample_rate
@@ -254,6 +271,9 @@ class BLTFamily:
                 context.get("total_steps"),
                 default=0,
             )
+            # The amplified BLT path converts the public/runtime pair into the
+            # accountant-facing balls-in-bins bridge state before epsilon
+            # calibration begins.
             return NoiseMechanismConfig(
                 mechanism=mechanism_config.mechanism,
                 accounting_mode=mechanism_config.accounting_mode,

@@ -21,6 +21,7 @@ from opacus.mechanism_contracts import SamplingSemantics
 
 
 def _as_descending_positive_vector(name: str, values: Sequence[float]) -> np.ndarray:
+    """Normalize one BLT decay vector to a descending positive `float64` array."""
     arr = np.asarray(values, dtype=np.float64)
     if arr.ndim != 1 or arr.size == 0:
         raise ValueError(f"{name} must be a non-empty 1D sequence")
@@ -35,6 +36,7 @@ def _as_descending_positive_vector(name: str, values: Sequence[float]) -> np.nda
 
 
 def _bsr_calibration_denominator(*, loss_reduction: str, logical_batch_size: int) -> float:
+    """Return the runtime-to-accountant scale denominator for fixed-batch BLT."""
     if loss_reduction == "sum":
         return 1.0
     if logical_batch_size <= 0:
@@ -45,6 +47,7 @@ def _bsr_calibration_denominator(*, loss_reduction: str, logical_batch_size: int
 
 
 def _resolve_steps_per_epoch(*, dataset_size: int, logical_batch_size: int) -> int:
+    """Resolve the fixed-batch epoch length used by the BLT workload contract."""
     if dataset_size < 1:
         raise ValueError("dataset_size must be >= 1")
     if logical_batch_size < 1:
@@ -53,6 +56,7 @@ def _resolve_steps_per_epoch(*, dataset_size: int, logical_batch_size: int) -> i
 
 
 def _default_theta(buffers: int, *, theta_min: float, theta_max: float) -> np.ndarray:
+    """Build the maintained default forward decay family for a buffer count."""
     if buffers < 1:
         raise ValueError("buffers must be >= 1")
     if not (0.0 < theta_min <= theta_max <= 1.0):
@@ -71,6 +75,7 @@ def _resolve_base_theta(
     theta_min: float,
     theta_max: float,
 ) -> np.ndarray:
+    """Resolve the base forward decay family from either `buffers` or explicit `theta`."""
     if theta is None:
         if buffers is None:
             raise ValueError("either buffers or theta must be provided")
@@ -83,6 +88,7 @@ def _resolve_base_theta(
 
 
 def _validated_scale_grid(name: str, values: Sequence[float]) -> list[float]:
+    """Filter one BLT scale grid down to finite positive scale values."""
     valid: list[float] = []
     for value in values:
         scale = float(value)
@@ -94,6 +100,7 @@ def _validated_scale_grid(name: str, values: Sequence[float]) -> list[float]:
 
 
 def _scaled_descending_candidate(values: np.ndarray, *, scale: float) -> np.ndarray:
+    """Scale, clip, and sort one BLT decay candidate into canonical descending order."""
     return np.sort(np.clip(float(scale) * values, 1e-6, 1.0))[::-1]
 
 
@@ -153,7 +160,21 @@ def generate_blt_theta_pair_candidates(
 
 @dataclass(frozen=True)
 class BLTFixedBatchOptimizationResult:
-    """Canonical result package for the fixed-batch BLT calibration search."""
+    """
+    Canonical result package for the fixed-batch BLT calibration search.
+
+    Attributes:
+        mechanism_state: Canonical BLT runtime/accountant state for the winning
+            candidate.
+        selected_theta: Chosen forward decay family.
+        selected_theta_hat: Chosen inverse-side decay family.
+        selected_candidate_index: Index of the winning deterministic candidate.
+        noise_multiplier_ref: Accountant-side Gaussian reference sigma returned
+            by the fixed-batch search.
+        score: Scalar objective used to rank candidates; currently identical to
+            `noise_multiplier_ref`.
+        candidate_count: Number of deterministic candidates that were scored.
+    """
     mechanism_state: Mapping[str, Any]
     selected_theta: tuple[float, ...]
     selected_theta_hat: tuple[float, ...]
@@ -170,6 +191,7 @@ def _canonical_blt_mechanism_state(
     steps_per_epoch: int,
     max_participations: int,
 ) -> dict[str, Any]:
+    """Build the canonical BLT mechanism state emitted by the fixed-batch search."""
     forward = pair.forward.canonicalized()
     inverse = pair.inverse.canonicalized()
     return {
@@ -204,6 +226,13 @@ def _score_blt_candidate(
     semantics: SamplingSemantics,
     candidate_count: int,
 ) -> BLTFixedBatchOptimizationResult:
+    """
+    Score one deterministic BLT candidate under the fixed-batch accountant path.
+
+    This helper calibrates the accountant-side Gaussian reference sigma for one
+    `(theta, theta_hat)` pair, then converts that sigma to the runtime `z_std`
+    seen by the optimizer release.
+    """
     pair = blt_pair_from_theta_pair(
         theta=theta_candidate,
         theta_hat=theta_hat_candidate,
@@ -227,6 +256,8 @@ def _score_blt_candidate(
         )
     )
     mechanism_state["noise_multiplier_ref"] = noise_multiplier_ref
+    # Convert the accountant-side sigma to the runtime BLT release scale on the
+    # summed-gradient normalization used by the training loop.
     mechanism_state["z_std"] = float(noise_multiplier_ref) * float(max_grad_norm) / float(
         denominator
     )

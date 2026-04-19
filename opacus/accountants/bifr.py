@@ -1,3 +1,24 @@
+"""
+BIFR accountant-side runtime/accounting contract helpers.
+
+This module bridges engine/runtime BIFR state to the accountant-facing objects
+used by the fixed-batch Gaussian path and the amplified BNB path. It resolves
+three kinds of quantities:
+- exact finite-horizon factor coefficients for runtime/accountant use
+- fixed-batch sensitivity terms on the factor side
+- amplified non-negative accountant coefficients and attached BNB state
+
+Source: BIFR (Kalinin et al., 2026) for the `γ`-indexed inverse/factor family.
+
+Claim-type notes:
+- runtime-state augmentation and canonicalization are implementation-contract
+  surfaces
+- fixed-batch sensitivity resolution is an accountant input surface, not a full
+  privacy statement by itself
+- amplified BNB helpers build the accountant-side bridge object consumed by the
+  current `balls_in_bins` / `b_min_sep` routes
+"""
+
 from __future__ import annotations
 
 import copy
@@ -32,6 +53,17 @@ def ensure_bifr_exact_runtime_coeffs(
     sampling_semantics,
     kwargs: Dict[str, Any],
 ) -> NoiseMechanismConfig:
+    """
+    Ensure a BIFR mechanism state carries exact finite-horizon factor coeffs.
+
+    If explicit factor coefficients are already present, the payload is returned
+    unchanged apart from normal `NoiseMechanismConfig` reconstruction. Otherwise
+    this helper derives inverse-side coefficients from the optimizer workload
+    and resolves the exact finite-horizon factor column used by the runtime and
+    accountant surfaces.
+
+    Mapping type: implementation-contract.
+    """
     if mechanism_config.mechanism != "bifr":
         return mechanism_config
 
@@ -57,11 +89,15 @@ def ensure_bifr_exact_runtime_coeffs(
     steps_hint = kwargs.get("total_steps", metadata.get("total_steps"))
     if steps_hint is None:
         raise ValueError("bifr exact finite-horizon coeff generation requires `total_steps`")
+
     if int(steps_hint) < int(bands):
         raise ValueError(
             f"bifr exact finite-horizon coeff generation requires steps >= bands; got steps={int(steps_hint)}, bands={int(bands)}"
         )
 
+    # The exact finite-horizon BIFR runtime is parameterized by the SGD
+    # workload, so auto-resolution starts from the optimizer-side `(momentum,
+    # weight_decay)` pair.
     momentum, weight_decay = resolve_uniform_sgd_workload_from_optimizer(optimizer=optimizer)
     frac = validate_bifr_frac(float(kwargs.get("bifr_frac", state.get("bifr_frac", metadata.get("bifr_frac", 0.5)))))
     inv_coeffs = generate_bifr_inverse_coeffs_from_sgd_workload(
@@ -97,6 +133,20 @@ def resolve_bifr_mf_sensitivity_for_fixed_batch(
     sample_rate: Optional[float],
     kwargs: Dict[str, Any],
 ) -> float:
+    """
+    Resolve the BIFR fixed-batch factor-side sensitivity term.
+
+    Resolution order:
+    - explicit `bsr_mf_sensitivity`
+    - explicit exact factor coefficients already stored in the mechanism state
+    - exact workload parameters `(bands, steps, momentum, weight_decay, frac)`
+
+    Returns:
+        The fixed-batch sensitivity on the factor-side release object consumed
+        by the Gaussian accountant reduction.
+
+    Mapping type: accountant input surface.
+    """
     metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
     explicit = kwargs.get(
         "bsr_mf_sensitivity",
@@ -137,6 +187,8 @@ def resolve_bifr_mf_sensitivity_for_fixed_batch(
     )
     coeffs = mechanism_state.get("coeffs")
     if isinstance(coeffs, (list, tuple)) and len(coeffs) > 0:
+        # When exact factor coefficients are already available, reuse them
+        # directly instead of regenerating the workload-dependent inverse side.
         return float(
             ToeplitzMechanismFamily(
                 coeffs=[float(c) for c in coeffs],
@@ -157,6 +209,7 @@ def resolve_bifr_mf_sensitivity_for_fixed_batch(
         )
 
     frac = validate_bifr_frac(float(kwargs.get("bifr_frac", mechanism_state.get("bifr_frac", metadata.get("bifr_frac", 0.5)))))
+
     return float(
         compute_bifr_fixed_batch_sensitivity_from_sgd_workload(
             bands=int(bands),
@@ -179,6 +232,19 @@ def resolve_bifr_amplified_accountant_coeffs(
     kwargs: Mapping[str, Any],
     total_steps: int,
 ) -> tuple[list[float], str, dict[str, Any]]:
+    """
+    Resolve amplified BIFR accountant coefficients and the attached state.
+
+    This helper canonicalizes the BIFR runtime state, resolves the exact
+    visible-horizon factor column, converts it to the non-negative accountant
+    first column used by the amplified BNB routes, and returns the updated
+    state payload together with the coefficient-source tag.
+
+    Returns:
+        A tuple of `(accountant_coeffs, accountant_source, attached_state)`.
+
+    Mapping type: implementation-contract bridge for amplified BNB accounting.
+    """
     metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
     state = canonicalize_bifr_runtime_state(runtime_state=mechanism_state)
     bands = resolve_canonical_bsr_bands(
@@ -225,6 +291,7 @@ def resolve_bifr_amplified_accountant_coeffs(
     state["bsr_bands"] = int(bands)
     state["bifr_frac"] = float(frac)
     state["bifr_horizon"] = int(total_steps)
+
     if state.get("coeff_source") is None:
         state["coeff_source"] = str(factor_source)
 
@@ -242,6 +309,13 @@ def resolve_bifr_bnb_accountant_state(
     kwargs: Mapping[str, Any],
     total_steps: int,
 ) -> dict[str, Any]:
+    """
+    Attach the full BIFR amplified BNB accountant state surface.
+
+    The returned dictionary includes the canonical BIFR runtime state together
+    with the accountant-side non-negative coefficient column and the resolved
+    BNB cycle metadata (`bands`, `horizon`, `cycle_length`, `bins`).
+    """
     metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
     cycle_length = resolve_canonical_bnb_cycle_length(
         runtime_state=mechanism_state,
@@ -267,4 +341,5 @@ def resolve_bifr_bnb_accountant_state(
     state["bnb_horizon"] = int(total_steps)
     state["bnb_cycle_length"] = int(cycle_length)
     state["bnb_bins"] = int(cycle_length)
+
     return state

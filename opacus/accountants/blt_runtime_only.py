@@ -1,3 +1,12 @@
+"""
+Runtime-only BLT accountant boundary.
+
+This module owns the explicit honesty boundary for BLT runs that have runtime
+support and checkpoint support but no authoritative epsilon accountant for the
+current contract. It allows the privacy engine to attach an accountant-shaped
+object without pretending that `get_epsilon` is meaningful.
+"""
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,25 +44,31 @@ class BLTRuntimeOnlyAccountant(IAccountant):
     )
 
     def __init__(self):
+        """Initialize an empty runtime-only BLT event counter."""
         super().__init__()
         self._events_recorded = 0
 
     def step(self, *, noise_multiplier: float, sample_rate: float):
+        """Record that one runtime-only BLT event occurred."""
         del noise_multiplier, sample_rate
         self._events_recorded += 1
 
     def get_epsilon(self, delta: float, *args, **kwargs) -> float:
+        """Reject epsilon queries because this accountant is explicitly runtime-only."""
         del delta, args, kwargs
         raise ValueError(self._RUNTIME_ONLY_ERROR)
 
     def __len__(self) -> int:
+        """Return the number of runtime-only BLT events that were recorded."""
         return int(self._events_recorded)
 
     @classmethod
     def mechanism(cls) -> str:
+        """Return the router tag used for the runtime-only BLT accountant boundary."""
         return "blt_runtime_only"
 
     def state_dict(self, destination: T_state_dict = None) -> T_state_dict:
+        """Serialize the runtime-only BLT accountant state for checkpointing."""
         if destination is None:
             destination = OrderedDict()
         destination["history"] = []
@@ -63,6 +78,7 @@ class BLTRuntimeOnlyAccountant(IAccountant):
         return destination
 
     def load_state_dict(self, state_dict: T_state_dict):
+        """Restore the runtime-only BLT accountant event counter from a checkpoint."""
         super().load_state_dict(state_dict)
         self.history = []
         self._events_recorded = int(state_dict.get("events_recorded", 0))

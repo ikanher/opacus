@@ -67,6 +67,9 @@ def ensure_bsr_family_cyclic_coeffs(
     optimizer: optim.Optimizer,
     kwargs: Dict[str, Any],
 ) -> NoiseMechanismConfig:
+    """
+    Ensure the BSR/BISR runtime state carries the coefficients needed by cyclic accounting.
+    """
     if mechanism_config.mechanism not in ("bsr", "bisr"):
         return mechanism_config
 
@@ -119,6 +122,9 @@ def ensure_bsr_family_fixed_analytical_coeffs(
     sampling_semantics,
     kwargs: Dict[str, Any],
 ) -> NoiseMechanismConfig:
+    """
+    Ensure the BSR/BISR runtime state carries analytical coefficients for fixed-batch accounting.
+    """
     if mechanism_config.mechanism not in ("bsr", "bisr"):
         return mechanism_config
 
@@ -166,6 +172,9 @@ def resolve_bisr_sensitivity_scale_for_cyclic(
     steps: int,
     kwargs: Dict[str, Any],
 ) -> float:
+    """
+    Resolve the cyclic sensitivity scale used by the BISR reduced Gaussian contract.
+    """
     metadata = (
         sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
     )
@@ -239,6 +248,9 @@ def resolve_bisr_mf_sensitivity_for_fixed_batch(
     sample_rate: Optional[float],
     kwargs: Dict[str, Any],
 ) -> float:
+    """
+    Resolve the fixed-batch BISR MF sensitivity from runtime state and workload metadata.
+    """
     metadata = (
         sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
     )
@@ -312,6 +324,9 @@ def resolve_bsr_mf_sensitivity_for_fixed_batch(
     sample_rate: Optional[float],
     kwargs: Dict[str, Any],
 ) -> float:
+    """
+    Resolve the fixed-batch BSR MF sensitivity from runtime state and workload metadata.
+    """
     metadata = (
         sampling_semantics.privacy_metadata
         if sampling_semantics is not None
@@ -356,6 +371,9 @@ def resolve_bsr_sensitivity_scale_for_cyclic(
     steps: int,
     kwargs: Dict[str, Any],
 ) -> float:
+    """
+    Resolve the cyclic sensitivity scale used by the BSR reduced Gaussian contract.
+    """
     metadata = (
         sampling_semantics.privacy_metadata
         if sampling_semantics is not None

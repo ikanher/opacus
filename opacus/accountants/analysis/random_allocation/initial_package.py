@@ -49,6 +49,19 @@ __all__ = [
 ]
 
 
+_CERTIFIED_AMBIENT_QUANTITATIVE_WINDOW_MECHANISMS = frozenset(
+    {
+        "gaussian",
+        "bsr",
+        "bisr",
+        "band_mf",
+        "bandinvmf",
+        "bifr",
+        "blt",
+    }
+)
+
+
 @dataclass(frozen=True)
 class _DeterministicInitialDirection:
     """One direction of a deterministic initial package.

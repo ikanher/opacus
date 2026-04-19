@@ -21,7 +21,12 @@ import opacus.accountants.analysis.random_allocation.fixed_bin as fixed_bin_rand
 import opacus.accountants.analysis.random_allocation.initial_package as random_allocation_initial_package_module
 from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
 from opacus.accountants.analysis.bnb import build_bnb_toeplitz_c_matrix_and_contract
+from opacus.accountants.analysis.bandinvmf import (
+    derive_bandinvmf_amplified_accountant_coeffs_from_inv_coeffs,
+    optimize_bandinvmf_inv_coeffs_for_sgd_workload,
+)
 from opacus.accountants.analysis.bandmf import generate_bandmf_coeffs_from_sgd_workload
+from opacus.accountants.analysis.bisr import generate_bisr_coeffs_from_sgd_workload
 from opacus.accountants.analysis.bsr import generate_bsr_coeffs_from_sgd_workload
 from opacus.accountants.analysis.random_allocation.fixed_bin import (
     _aggregate_fixed_bin_mode_family,
@@ -46,6 +51,7 @@ from opacus.accountants.analysis.random_allocation.initial_package import (
     _build_exact_family_accountant_contract_from_exact_law,
     _build_exact_family_round_pair_from_contract,
     _build_deterministic_witness_family_package_from_exact_law,
+    estimate_epsilon_random_allocation_from_initial_package,
     _estimate_epsilon_range_random_allocation_from_exact_family_round_pair_package,
     estimate_epsilon_range_random_allocation_from_initial_package,
     resolve_pair_driven_ambient_quantitative_window_inputs,
@@ -136,6 +142,91 @@ def _amplified_bsr_random_allocation_state(*, bands: int = 4) -> tuple[dict, Sam
         privacy_metadata={"num_steps": 98, "num_selected": 1},
     )
     return state, semantics
+
+
+def _live_bisr_fixed_bin_c_matrix(*, bands: int) -> np.ndarray:
+    coeffs = generate_bisr_coeffs_from_sgd_workload(
+        bands=bands,
+        momentum=0.0,
+        weight_decay=0.0,
+    )
+    c_matrix, _contract = build_bnb_toeplitz_c_matrix_and_contract(
+        coeffs=coeffs,
+        bands=bands,
+        horizon=980,
+    )
+    return np.asarray(c_matrix, dtype=np.float64)
+
+
+def _live_bandinvmf_fixed_bin_c_matrix(*, bands: int) -> np.ndarray:
+    inv_coeffs = optimize_bandinvmf_inv_coeffs_for_sgd_workload(
+        bands=bands,
+        momentum=0.0,
+        weight_decay=0.0,
+        steps=980,
+        max_participations=10,
+        min_separation=bands,
+        optimizer_steps=20,
+    )
+    coeffs = derive_bandinvmf_amplified_accountant_coeffs_from_inv_coeffs(
+        inv_coeffs=inv_coeffs,
+        steps=980,
+    )
+    c_matrix, _contract = build_bnb_toeplitz_c_matrix_and_contract(
+        coeffs=coeffs,
+        bands=bands,
+        horizon=980,
+    )
+    return np.asarray(c_matrix, dtype=np.float64)
+
+
+def _toy_lower_toeplitz_c_matrix(coeffs: list[float] | tuple[float, ...]) -> np.ndarray:
+    coeffs_arr = np.asarray(coeffs, dtype=np.float64)
+    n = int(coeffs_arr.shape[0])
+    c_matrix = np.zeros((n, n), dtype=np.float64)
+    for row in range(n):
+        for col in range(row + 1):
+            c_matrix[row, col] = coeffs_arr[row - col]
+    return c_matrix
+
+
+def _one_window_pair_driven_vs_fixed_bin_epsilons(
+    *, c_matrix: np.ndarray, noise_multiplier: float = 1.0, target_delta: float = 1e-5
+) -> tuple[float, float]:
+    runtime = resolve_random_allocation_gaussian_runtime_config(
+        target_delta=target_delta,
+        loss_discretization=1e-3,
+        tail_truncation=1e-12,
+        max_grid_fft=200000,
+        max_grid_mult=200000,
+    )
+    matrix = np.asarray(c_matrix, dtype=np.float64)
+    pair = build_realizable_gaussian_one_step_neighboring_pair(
+        mechanism="gaussian",
+        forward_mean=matrix[:, 0],
+        reverse_mean=np.zeros(matrix.shape[0], dtype=np.float64),
+        noise_multiplier=noise_multiplier,
+    )
+    pair_inputs = resolve_pair_driven_random_allocation_inputs(
+        pair=pair,
+        num_steps=matrix.shape[1],
+        num_selected=1,
+        num_epochs=1,
+    )
+    pair_epsilon = estimate_epsilon_random_allocation_from_initial_package(
+        inputs=pair_inputs,
+        target_delta=target_delta,
+        runtime_config=runtime,
+    )
+    fixed_bin_epsilon = estimate_epsilon_upper_fixed_bin_random_allocation(
+        mechanism="gaussian",
+        c_matrix=matrix,
+        bins=matrix.shape[1],
+        noise_multiplier=noise_multiplier,
+        target_delta=target_delta,
+        runtime_config=runtime,
+    )
+    return pair_epsilon, fixed_bin_epsilon
 
 
 def _simple_gaussian_random_allocation_inputs(*, noise_multiplier: float = 1.0):
@@ -1085,6 +1176,37 @@ def test_fixed_bin_bridge_live_band_mf_fixture_computes_after_interval_floor_ret
     assert lower <= upper <= 9.01
 
 
+def test_fixed_bin_bridge_live_bisr_p8_fixture_keeps_certified_ambient_route() -> None:
+    bridge = resolve_fixed_bin_random_allocation_bridge_inputs(
+        mechanism="bisr",
+        c_matrix=_live_bisr_fixed_bin_c_matrix(bands=8),
+        bins=98,
+        noise_multiplier=1.0,
+        logical_horizon=980,
+    )
+
+    assert bridge.route == "fixed_bin_bridge_ambient_quantitative_window_realization_package"
+    assert bridge.initial_package_route == "pair_driven_ambient_quantitative_window_realization_package"
+    assert bridge.pair_driven_route == "pair_driven_exact_initial_package"
+
+
+def test_fixed_bin_bridge_live_bandinvmf_p8_fixture_stays_explicit_until_conservative_route_exists() -> None:
+    bridge = resolve_fixed_bin_random_allocation_bridge_inputs(
+        mechanism="bandinvmf",
+        c_matrix=_live_bandinvmf_fixed_bin_c_matrix(bands=8),
+        bins=98,
+        noise_multiplier=1.0,
+        logical_horizon=980,
+    )
+
+    assert (
+        bridge.route
+        == "fixed_bin_bridge_ambient_quantitative_window_uncertified_conservativity"
+    )
+    assert bridge.initial_package_route is None
+    assert bridge.exact_law_route == "exact_fixed_bin_gaussian_mixture_pair"
+
+
 def test_geometric_mass_conservation_accepts_all_positive_infinity_mass() -> None:
     pmf = np.zeros(5, dtype=np.float64)
     adjusted_pmf, p_neg_inf, p_pos_inf = random_allocation_module._enforce_mass_conservation(  # type: ignore[attr-defined]
@@ -1116,6 +1238,57 @@ def test_fixed_bin_bridge_cifar_identity_control_collapses_to_random_allocation_
     assert "orthogonal equal-norm one-hot mode family" in package.bounds.justification
     assert package.route == "pair_driven_exact_initial_package"
     assert package.add.realization.p_loss_inf < 1e-5
+
+
+def test_one_window_identity_control_matches_pair_driven_exact_route() -> None:
+    pair_epsilon, fixed_bin_epsilon = _one_window_pair_driven_vs_fixed_bin_epsilons(
+        c_matrix=np.eye(2, dtype=np.float64),
+    )
+    assert pair_epsilon == pytest.approx(3.699782020260986, rel=0.0, abs=1e-12)
+    assert fixed_bin_epsilon == pytest.approx(pair_epsilon, rel=0.0, abs=1e-12)
+
+
+def test_one_window_orthogonal_equal_norm_one_hot_family_matches_pair_driven_exact_route() -> None:
+    controls = [
+        (
+            np.array([[0.0, 2.0], [2.0, 0.0]], dtype=np.float64),
+            9.307319169419463,
+        ),
+        (
+            np.array(
+                [
+                    [0.0, 2.0, 0.0],
+                    [2.0, 0.0, 0.0],
+                    [0.0, 0.0, 2.0],
+                ],
+                dtype=np.float64,
+            ),
+            8.901385390575294,
+        ),
+    ]
+
+    for c_matrix, expected_epsilon in controls:
+        pair_epsilon, fixed_bin_epsilon = _one_window_pair_driven_vs_fixed_bin_epsilons(
+            c_matrix=c_matrix,
+        )
+        assert pair_epsilon == pytest.approx(expected_epsilon, rel=0.0, abs=1e-12)
+        assert fixed_bin_epsilon == pytest.approx(expected_epsilon, rel=0.0, abs=1e-12)
+
+
+def test_one_window_overlapping_toeplitz_stays_separate_from_pair_driven_exact_route() -> None:
+    two_window = _toy_lower_toeplitz_c_matrix([1.0, 1.0])
+    three_window = _toy_lower_toeplitz_c_matrix([1.0, 1.0, 0.0])
+
+    pair_two, fixed_two = _one_window_pair_driven_vs_fixed_bin_epsilons(c_matrix=two_window)
+    pair_three, fixed_three = _one_window_pair_driven_vs_fixed_bin_epsilons(c_matrix=three_window)
+
+    assert pair_two == pytest.approx(5.883839981786562, rel=0.0, abs=1e-12)
+    assert fixed_two == pytest.approx(5.712149901082944, rel=0.0, abs=1e-12)
+    assert pair_two - fixed_two > 0.1
+
+    assert pair_three == pytest.approx(5.479830251366031, rel=0.0, abs=1e-12)
+    assert fixed_three == pytest.approx(5.411037801724155, rel=0.0, abs=1e-12)
+    assert pair_three - fixed_three > 0.05
 
 
 def test_fixed_bin_bridge_accepts_logical_horizon_for_padded_identity_control() -> None:

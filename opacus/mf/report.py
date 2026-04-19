@@ -1,5 +1,12 @@
 from __future__ import annotations
 
+"""
+Report-surface helpers for MF provider-layer diagnostics and paper-style summaries.
+
+These helpers assemble lightweight report inputs from the canonical provider
+state, but they do not own the underlying accountant math.
+"""
+
 import math
 from dataclasses import dataclass
 from typing import Literal
@@ -27,6 +34,8 @@ BSRReportMethod = Literal["BSR", "BISR"]
 
 @dataclass(frozen=True)
 class BLTReportSurface:
+    """Compact BLT fixed-batch report payload built from optimized mechanism state."""
+
     computed_noise_multiplier: float
     accounting_noise_multiplier: float
     blt_horizon: int
@@ -40,6 +49,8 @@ class BLTReportSurface:
 
 @dataclass(frozen=True)
 class BSRFamilyReportInputs:
+    """Compact provider-layer report payload for BSR-family methods."""
+
     method: BSRReportMethod
     mechanism: str
     accountant: str
@@ -50,6 +61,7 @@ class BSRFamilyReportInputs:
 
 
 def _l2_norm(values: list[float]) -> float:
+    """Return the Euclidean norm of a coefficient vector."""
     return math.sqrt(sum(float(v) * float(v) for v in values))
 
 
@@ -63,6 +75,9 @@ def compute_blt_fixed_batch_report_surface(
     max_grad_norm: float,
     buffers: int,
 ) -> BLTReportSurface:
+    """
+    Compute the BLT fixed-batch report surface used by local scripts and notes.
+    """
     result = optimize_blt_fixed_batch(
         target_epsilon=float(target_epsilon),
         target_delta=float(target_delta),
@@ -98,6 +113,9 @@ def build_bsr_family_report_inputs(
     weight_decay: float,
     total_steps: int,
 ) -> BSRFamilyReportInputs:
+    """
+    Build the canonical report payload for BSR or BISR on the provider surface.
+    """
     if method == "BSR":
         runtime_coeffs = generate_bsr_coeffs_from_sgd_workload(
             bands=int(bands),
@@ -159,6 +177,7 @@ def resolve_bsr_family_fixed_batch_report_sensitivity(
     max_participations: int,
     min_separation: int,
 ) -> float:
+    """Resolve the fixed-batch report sensitivity for BSR or BISR."""
     if method == "BSR":
         coeffs = generate_bsr_coeffs_from_sgd_workload(
             bands=int(bands),
@@ -200,6 +219,9 @@ def compute_bsr_family_cyclic_report_baseline(
     momentum: float,
     weight_decay: float,
 ) -> tuple[float, dict[str, float | int]]:
+    """
+    Compute the cyclic-poisson sigma baseline and reduced-contract summary for a BSR-family method.
+    """
     inputs = build_bsr_family_report_inputs(
         method=method,
         bands=int(bands),

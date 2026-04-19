@@ -295,6 +295,9 @@ class PrivacyEngine:
         mechanism: str,
         mechanism_state: Dict[str, Any],
     ) -> Dict[str, Any]:
+        """
+        Canonicalize mechanism_state before persisting it on the config surface.
+        """
         entry = get_mf_family_entry(mechanism)
         if entry is not None:
             return entry.family.canonicalize(mechanism_state)
@@ -305,6 +308,9 @@ class PrivacyEngine:
 
     @staticmethod
     def _canonicalize_blt_mechanism_state(*, mechanism_state: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Normalize BLT public/runtime state into the canonical pair payload.
+        """
         return canonicalize_blt_public_or_runtime_state(mechanism_state)
 
     @staticmethod
@@ -322,6 +328,9 @@ class PrivacyEngine:
         phase: str,
         query_runtime_context: Optional[Mapping[str, Any]] = None,
     ) -> tuple[dict[str, Any], Any]:
+        """
+        Ask an MF family for extra query-time terms needed by epsilon solves.
+        """
         entry = self._resolve_mf_family_entry(mechanism_config.mechanism)
         resolver = (
             getattr(entry.family, "resolve_target_epsilon_terms", None)
@@ -353,6 +362,9 @@ class PrivacyEngine:
         optimizer: Optional[optim.Optimizer] = None,
         query_runtime_context: Optional[Mapping[str, Any]] = None,
     ) -> NoiseMechanismConfig:
+        """
+        Let MF families stamp query-only runtime/accountant context onto config.
+        """
         entry = self._resolve_mf_family_entry(mechanism_config.mechanism)
         augmenter = (
             getattr(entry.family, "augment_query_mechanism_config", None)
@@ -393,6 +405,9 @@ class PrivacyEngine:
         kwargs: Dict[str, Any],
         include_random_allocation_state: bool = False,
     ) -> NoiseMechanismConfig:
+        """
+        Assemble the canonical MF runtime state before optimizer/accountant setup.
+        """
         inferred_mf_total_steps = int(total_steps_for_contract)
         if inferred_mf_total_steps <= 0:
             inferred_mf_total_steps = int(max(band_steps_hint, data_loader_len, 0))
@@ -423,6 +438,9 @@ class PrivacyEngine:
             kwargs=coeff_resolution_kwargs,
         )
         if include_random_allocation_state:
+            # Random-allocation accounting needs an explicit accountant-state
+            # bridge even when the runtime noiser stays in the correlated
+            # Gaussian family.
             mechanism_config = self._ensure_random_allocation_state(
                 mechanism_config=mechanism_config,
                 optimizer=optimizer,
@@ -1282,6 +1300,9 @@ class PrivacyEngine:
         mechanism_config: NoiseMechanismConfig,
         distributed: bool,
     ) -> NoiseMechanismConfig:
+        """
+        Record BLT runtime-only distributed metadata on the mechanism state.
+        """
         if mechanism_config.mechanism != "blt":
             return mechanism_config
 
@@ -1296,6 +1317,9 @@ class PrivacyEngine:
 
     @staticmethod
     def _build_noise_mechanism_from_config(config: NoiseMechanismConfig):
+        """
+        Construct the runtime noiser owned by a canonical mechanism config.
+        """
         if config.mechanism == "gaussian":
             return None
 
@@ -1308,6 +1332,8 @@ class PrivacyEngine:
             )
 
         if mechanism_name == "blt":
+            # BLT stores a public/runtime pair, so rebuild the validated paired
+            # Toeplitz parameters before constructing the buffered runtime.
             pair = BLTPairedParams(
                 forward=BLTParams(
                     theta=state["forward"]["theta"],
@@ -1354,6 +1380,9 @@ class PrivacyEngine:
         loss_reduction: str,
         expected_batch_size: int,
     ) -> float:
+        """
+        Resolve the denominator used when mapping sigma_ref to correlated `z_std`.
+        """
         if loss_reduction == "sum":
             return 1.0
 
@@ -1443,11 +1472,20 @@ class PrivacyEngine:
         )
 
     def _sampler_generator(self, data_loader: DataLoader):
+        """
+        Return the RNG source that sampler objects should consume.
+
+        Secure mode swaps in the CSPRNG-backed generator so sampler randomness
+        and noise-generation randomness follow the same secure runtime policy.
+        """
         return self.secure_rng if self.secure_mode else data_loader.generator
 
     def _rebuild_data_loader_with_batch_sampler(
         self, data_loader: DataLoader, sampler
     ) -> DataLoader:
+        """
+        Rebuild a DataLoader around a batch_sampler while preserving worker setup.
+        """
         return DataLoader(
             dataset=data_loader.dataset,
             batch_sampler=sampler,
@@ -1469,6 +1507,9 @@ class PrivacyEngine:
         *,
         batch_size: Optional[int] = None,
     ) -> DataLoader:
+        """
+        Rebuild a DataLoader around a plain sampler while preserving batch policy.
+        """
         return DataLoader(
             dataset=data_loader.dataset,
             batch_size=data_loader.batch_size if batch_size is None else int(batch_size),
@@ -1486,6 +1527,9 @@ class PrivacyEngine:
         )
 
     def _build_distributed_torch_sampler(self, *, data_loader: DataLoader):
+        """
+        Build the fixed distributed sampler used for non-Poisson torch-sampler mode.
+        """
         if isinstance(data_loader.dataset, torch.utils.data.IterableDataset):
             raise ValueError("distributed torch_sampler is not supported for IterableDataset")
 
@@ -1507,11 +1551,17 @@ class PrivacyEngine:
         num_steps: int,
         num_selected: int,
     ):
+        """
+        Build samplers for the explicit `k_out_of_t` random-allocation contract.
+        """
         if isinstance(data_loader.dataset, torch.utils.data.IterableDataset):
             raise ValueError("k_out_of_t sampling is not supported for IterableDataset")
 
         generator = self._sampler_generator(data_loader)
         if distributed:
+            # The distributed sampler owns the shared step schedule itself, so
+            # each rank only receives its local shard from the same global
+            # k-out-of-t selection process.
             return DistributedKOutOfTSampler(
                 total_size=len(data_loader.dataset),
                 num_steps=int(num_steps),
@@ -1657,6 +1707,9 @@ class PrivacyEngine:
         mechanism: str,
         accounting_mode: str,
     ) -> None:
+        """
+        Enforce the narrower BNB sampler-policy contract when BNB accounting is active.
+        """
         if accounting_mode != "bnb_accountant":
             return
         validate_bnb_sampling_policy_helper(
@@ -1674,9 +1727,10 @@ class PrivacyEngine:
     ) -> None:
         """
         Enforce mechanism/sampler compatibility constraints.
-        Math: enforces accountant contracts against runtime sampling law, e.g.
-        cyclic requires ``q = b·p ∈ (0,1]``, fixed-batch BSR uses ``S_{k,b}(C;T)``,
-        and BNB requires b-min-sep/balls-in-bins semantics.
+
+        This is a runtime contract checker, not a proof surface. It keeps the
+        selected runtime noiser, sampling law, and accountant family on a
+        coherent path before any sigma calibration or epsilon query runs.
 
         Source: BandMF (Choquette-Choo et al., 2023, Section 5, Theorems 4 and 5);
         BMinSep (Dong and Ganesh, 2026, Section 4, Section 5,
@@ -1702,6 +1756,9 @@ class PrivacyEngine:
         )
 
         if accounting_mode == "random_allocation_accountant":
+            # RA accounting is only implemented for the explicit k-out-of-t
+            # sampling contract. Rejecting earlier avoids building a runtime
+            # state that later epsilon queries cannot interpret.
             if sampling_semantics is None or sampling_semantics.sampling_mode != "k_out_of_t":
                 raise ValueError(
                     f"{mechanism} mechanism with random_allocation_accountant requires sampling_mode='k_out_of_t'"
@@ -1770,6 +1827,9 @@ class PrivacyEngine:
         batch_size: int,
         dataset_size: int,
     ) -> float:
+        """
+        Resolve the per-step participation rate implied by the active sampler contract.
+        """
         sampling_mode = (
             sampling_semantics.sampling_mode
             if sampling_semantics is not None
@@ -1839,7 +1899,8 @@ class PrivacyEngine:
             usable_size = partition_size * bands
             return float(batch_size) / float(usable_size)
 
-        # For Poisson and cyclic_poisson, q follows the batch-size ratio.
+        # Standard Poisson DP-SGD and the plain torch-sampler fallback both use
+        # the usual batch-size ratio as their effective per-step participation.
         return batch_size / dataset_size
 
     def _resolve_local_sampling_semantics_for_epsilon(
@@ -1851,6 +1912,9 @@ class PrivacyEngine:
         total_steps: Optional[int],
         data_loader: DataLoader,
     ) -> Optional[SamplingSemantics]:
+        """
+        Resolve the sampling semantics that target-epsilon calibration should use.
+        """
         local_sampling_semantics = sampling_semantics
         entry = get_mf_family_entry(mechanism)
         if (
@@ -1863,6 +1927,9 @@ class PrivacyEngine:
             else:
                 local_sample_rate = 1 / len(data_loader)
 
+            # Some MF families have a well-defined local fallback semantics for
+            # epsilon calibration even when the caller did not spell out the
+            # structured sampler explicitly.
             local_sampling_semantics = self._build_sampling_semantics(
                 poisson_sampling=poisson_sampling,
                 sample_rate=local_sample_rate,
@@ -2259,8 +2326,12 @@ class PrivacyEngine:
         kwargs: Dict[str, Any],
     ) -> Tuple[float, float]:
         """
-        Dispatch epsilon->sigma calibration based on mechanism/accountant path.
-        Math: dispatcher picks the correct ε→σ calibration path (BNB Monte Carlo vs non-BNB accountant solve).
+        Dispatch epsilon-to-sigma calibration through the authoritative accountant.
+
+        For the MF surfaces this is the main honesty boundary: BNB routes solve
+        through the structured Monte Carlo/bridge machinery, while the standard
+        and family-local accountants use their own direct epsilon-to-sigma
+        solvers.
         """
         nm_kwargs = dict(kwargs)
         nm_kwargs.pop("bsr_mf_sensitivity", None)
@@ -2309,6 +2380,9 @@ class PrivacyEngine:
         target_delta: float,
         kwargs: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
+        """
+        Build the optional empirical-verification report for BNB calibration.
+        """
         if bnb_c_matrix is None or bnb_bands is None or bnb_cycle_length is None:
             return None
 
@@ -2329,6 +2403,8 @@ class PrivacyEngine:
             sigma=float(noise_multiplier),
             reduce_dimensionality=reduce_dimensionality,
         )
+        # This EVR check is diagnostic metadata around the calibrated BNB sigma,
+        # not a replacement for the underlying accountant solve.
         verification = verify_hockey_stick_delta_hoeffding(
             epsilon=float(target_epsilon),
             llr_samples=llr_samples,
@@ -2363,6 +2439,9 @@ class PrivacyEngine:
         kwargs: Dict[str, Any],
         distributed_dp_runtime: bool,
     ) -> Optional[Dict[str, Any]]:
+        """
+        Extract BNB/RA query knobs that must survive into later epsilon queries.
+        """
         if mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bandinvmf", "blt"):
             return None
 
@@ -2432,6 +2511,9 @@ class PrivacyEngine:
         bnb_calibration_report: Optional[Dict[str, Any]],
         bnb_accounting_kwargs: Optional[Dict[str, Any]] = None,
     ) -> NoiseMechanismConfig:
+        """
+        Stamp calibrated correlated-noise runtime scales onto mechanism state.
+        """
         if mechanism_config.mechanism not in ("bandmf", "bsr", "bisr", "bandinvmf", "bifr", "blt"):
             return mechanism_config
 
@@ -2792,8 +2874,14 @@ class PrivacyEngine:
                 Differentially Private Image Classification through Scale" by De et al. (2022)
                 - https://arxiv.org/pdf/2204.13650.pdf
             total_steps: Instead of stepping through once the dataloader for once expected epoch,
-            we will step through it `total_steps` times. This will set the sample rate to
-            batch_size/data_size. The parameter total_steps is any positive integer.
+                we will step through it `total_steps` times. This will set the sample rate to
+                batch_size/data_size. The parameter total_steps is any positive integer.
+            noise_mechanism_config: Explicit runtime/accountant contract. Leave
+                unset for standard iid Gaussian DP-SGD, or provide it to select
+                MF, BLT, BNB, or random-allocation routing.
+            sampling_semantics: Explicit structured sampling-law contract. This
+                is required for structured MF surfaces such as `cyclic_poisson`,
+                `b_min_sep`, `balls_in_bins`, or `k_out_of_t`.
         Returns:
             Tuple of  (model, optimizer, data_loader) or (model, optimizer, criterion, data_loader).
 
@@ -2852,6 +2940,8 @@ class PrivacyEngine:
         coeff_resolution_kwargs = dict(kwargs)
         if total_steps is not None:
             coeff_resolution_kwargs["total_steps"] = int(total_steps)
+        # Build the family-owned runtime/accountant state before choosing the
+        # active accountant or materializing a correlated-noise runtime object.
         mechanism_config = self._prepare_mf_mechanism_config(
             mechanism_config=mechanism_config,
             optimizer=optimizer,
@@ -2878,6 +2968,8 @@ class PrivacyEngine:
             and mechanism_config.mechanism_state.get("z_std") is None
         ):
             state = copy.deepcopy(mechanism_config.mechanism_state)
+            # `make_private` receives sigma_ref directly, so correlated MF
+            # mechanisms only need the final runtime-scale conversion here.
             state["z_std"] = calibrate_bsr_z_std(
                 noise_multiplier_ref=float(noise_multiplier),
                 max_grad_norm=float(max_grad_norm),
@@ -2904,6 +2996,8 @@ class PrivacyEngine:
             )
         if mechanism_config.accounting_mode == "random_allocation_accountant":
             state = copy.deepcopy(mechanism_config.mechanism_state)
+            # Random-allocation epsilon queries need the same grid/truncation
+            # knobs that were active when the runtime state was prepared.
             state["_random_allocation_accounting_kwargs"] = self._build_random_allocation_accounting_kwargs_for_state(kwargs=kwargs)
             mechanism_config = NoiseMechanismConfig(
                 mechanism=mechanism_config.mechanism,
@@ -3057,8 +3151,13 @@ class PrivacyEngine:
                 :class:`~opacus.grad_sample.gsm_base.AbstractGradSampleModule` for more
                 details
             total_steps: Instead of stepping through once the dataloader for once expected epoch,
-            we will step through it `total_steps` times. This will set the sample rate to
-            batch_size/data_size. The parameter total_steps is any positive integer.
+                we will step through it `total_steps` times. This will set the sample rate to
+                batch_size/data_size. The parameter total_steps is any positive integer.
+            noise_mechanism_config: Explicit runtime/accountant contract to
+                calibrate. Structured MF, BLT, BNB, and random-allocation solves
+                rely on this payload instead of the default iid Gaussian path.
+            sampling_semantics: Explicit structured sampling-law contract used by
+                the target-epsilon solver.
         Returns:
             Tuple of (model, optimizer, data_loader) or (model, optimizer, criterion, data_loader).
 
@@ -3214,6 +3313,8 @@ class PrivacyEngine:
             query_runtime_context=query_runtime_context,
         )
 
+        # Resolve any structured BNB runtime inputs before the epsilon-to-sigma
+        # solve so the dispatcher can choose the correct accountant path.
         bnb_c_matrix, bnb_bands, bnb_cycle_length, bnb_c_matrix_contract = self._resolve_bnb_runtime_inputs_for_epsilon(
             mechanism_config=mechanism_config,
             sampling_semantics=local_sampling_semantics,
@@ -3303,6 +3404,8 @@ class PrivacyEngine:
             query_runtime_context=query_runtime_context,
         )
 
+        # Rebuild the BNB runtime inputs after calibration in case the family
+        # query augmenter stamped additional accountant-facing state.
         bnb_c_matrix, bnb_bands, bnb_cycle_length, _ = self._resolve_bnb_runtime_inputs_for_epsilon(
             mechanism_config=mechanism_config,
             sampling_semantics=local_sampling_semantics,
@@ -3381,13 +3484,19 @@ class PrivacyEngine:
 
     def get_epsilon(self, delta, **kwargs):
         """
-        Computes the (epsilon, delta) privacy budget spent so far.
+        Compute the epsilon value spent so far at the requested delta.
 
         Args:
             delta: The target delta.
 
         Returns:
             Privacy budget (epsilon) expended so far.
+
+        Notes:
+            MF, BNB, and random-allocation accountants are query-context
+            dependent, so this method automatically forwards the persisted
+            mechanism state and sampling semantics unless the caller has already
+            provided overrides.
         """
         accountant_mechanism = self.accountant.mechanism()
         if (
@@ -3402,7 +3511,7 @@ class PrivacyEngine:
 
     def get_accounting_telemetry(self, *, delta: Optional[float] = None) -> Dict[str, Any]:
         """
-        Returns a compact runtime snapshot of accounting configuration and state.
+        Return a compact runtime snapshot of mechanism/accountant state.
         """
         mechanism_config = getattr(self, "noise_mechanism_config", None)
         sampling_semantics = getattr(self, "sampling_semantics", None)

@@ -1,3 +1,22 @@
+"""
+Fixed-batch BLT accountant.
+
+This module owns the current accountant-backed BLT privacy path in Opacus:
+fixed-batch accounting under `sampling_mode='torch_sampler'`. It combines the
+canonical BLT parameter pair with a fixed-batch max-loss term and reduces the
+result to the existing Gaussian fixed-batch accountant surface.
+
+Source: BLT Practice (McMahan et al., 2024) for the buffered Toeplitz runtime
+family; BSR (Kalinin and Lampert, 2024) for the reduced fixed-batch Gaussian
+accountant expression reused here.
+
+Claim-type notes:
+- the BLT parameter/input resolution is an implementation contract
+- `compute_blt_fixed_batch_max_loss` is an accountant-side loss surrogate on
+  the current fixed-batch contract
+- this module does not claim amplified BLT accounting
+"""
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,6 +43,7 @@ from .accountant import IAccountant
 
 
 def _is_nonnegative_decreasing(coeffs: list[float], *, atol: float = 1e-12) -> bool:
+    """Return whether the finite-horizon forward BLT column is nonnegative decreasing."""
     if len(coeffs) == 0:
         return False
     if coeffs[0] < -atol:
@@ -45,6 +65,19 @@ def compute_blt_fixed_batch_max_loss(
     max_participations: int,
     min_separation: int,
 ) -> float:
+    """
+    Compute the fixed-batch BLT max-loss surrogate on the current horizon.
+
+    The loss is the product of:
+    - the fixed-batch factor-side sensitivity induced by the forward BLT column
+    - the prefix RMSE term induced by the inverse BLT column
+
+    Returns:
+        A positive finite surrogate consumed by the current fixed-batch BLT
+        accountant reduction.
+
+    Mapping type: accountant-side implementation contract.
+    """
     if horizon < 1:
         raise ValueError("blt_horizon must be >= 1")
     if max_participations < 1:
@@ -58,12 +91,16 @@ def compute_blt_fixed_batch_max_loss(
             "BLT fixed-batch accounting requires forward coefficients to be nonnegative decreasing on the accounting horizon"
         )
 
+    # Fixed-batch support only allows as many participations as fit into the
+    # finite horizon under the declared minimum separation.
     k_eff = min(int(max_participations), ((int(horizon) - 1) // int(min_separation)) + 1)
     total_sq = 0.0
     for i in range(int(horizon)):
         j_max = min(k_eff - 1, i // int(min_separation))
         row_sum = 0.0
         for j in range(j_max + 1):
+            # Sum the left-packed fixed-batch row contributions that are still
+            # visible on the finite horizon.
             lag = i - j * int(min_separation)
             if lag < len(forward_coeffs):
                 row_sum += forward_coeffs[lag]
@@ -74,6 +111,8 @@ def compute_blt_fixed_batch_max_loss(
     prefix = 0.0
     err_sq = 0.0
     for c in inverse_coeffs:
+        # The inverse-side prefix sums give the BLT prefix-error term on the
+        # same finite horizon.
         prefix += c
         err_sq += prefix * prefix
     maxerr = math.sqrt(err_sq)
@@ -95,6 +134,7 @@ class BLTAccountant(IAccountant):
     """
 
     def __init__(self):
+        """Initialize an empty fixed-batch BLT accountant history."""
         super().__init__()
         self.last_contract = None
 
@@ -106,6 +146,7 @@ class BLTAccountant(IAccountant):
         kwargs: dict,
         total_steps: int,
     ) -> tuple[BLTPairedParams, float, int, int, int]:
+        """Resolve the canonical fixed-batch BLT accountant tuple from state/metadata."""
         return resolve_blt_fixed_batch_accountant_inputs(
             runtime_state=state,
             metadata=metadata,
@@ -114,6 +155,7 @@ class BLTAccountant(IAccountant):
         )
 
     def step(self, *, noise_multiplier: float, sample_rate: float):
+        """Record one BLT fixed-batch event, coalescing consecutive identical entries."""
         if len(self.history) >= 1:
             last_noise_multiplier, last_sample_rate, num_steps = self.history.pop()
             if (
@@ -215,7 +257,9 @@ class BLTAccountant(IAccountant):
 
     @classmethod
     def mechanism(cls) -> str:
+        """Return the accountant mechanism tag used by the privacy-engine router."""
         return "blt"
 
     def __len__(self):
+        """Return the number of coalesced BLT history segments."""
         return len(self.history)

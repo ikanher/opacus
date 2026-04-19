@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+"""
+Optimizer-shape helpers shared by MF provider/accountant surfaces.
+"""
+
 import math
 
 from torch import optim
@@ -9,6 +13,14 @@ def resolve_uniform_sgd_workload_from_optimizer(
     *,
     optimizer: optim.Optimizer,
 ) -> tuple[float, float]:
+    """
+    Extract a uniform SGD workload `(momentum, weight_decay)` from an optimizer.
+
+    MF analytical auto-coefficient generation currently assumes every parameter
+    group shares the same momentum and weight decay. This helper enforces that
+    contract before the family/accountant layers derive coefficients from the
+    optimizer configuration.
+    """
     momenta: list[float] = []
     decays: list[float] = []
 

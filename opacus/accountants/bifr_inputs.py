@@ -16,6 +16,16 @@ from opacus.accountants.analysis.bifr import validate_bifr_frac
 
 
 def canonicalize_bifr_runtime_state(*, runtime_state: Mapping[str, Any]) -> Dict[str, Any]:
+    """
+    Canonicalize a BIFR runtime/accountant state payload.
+
+    This normalizes numeric fields to stable Python scalar/list types, injects
+    the canonical `_noise_mechanism` tag, and supplies the default
+    `bifr_frac = 0.5` when the caller left the interpolation parameter
+    unspecified.
+
+    Mapping type: implementation-contract canonicalization surface.
+    """
     state = copy.deepcopy(dict(runtime_state))
     state["_noise_mechanism"] = "bifr"
 
@@ -34,6 +44,8 @@ def canonicalize_bifr_runtime_state(*, runtime_state: Mapping[str, Any]) -> Dict
         state["bifr_frac"] = 0.5
 
     if state.get("bifr_frac") is not None:
+        # Keep the interpolation parameter normalized eagerly so all downstream
+        # accountant helpers see the same canonical `γ` value.
         state["bifr_frac"] = float(
             validate_bifr_frac(float(state["bifr_frac"]))
         )
@@ -57,6 +69,12 @@ def canonicalize_bifr_runtime_state(*, runtime_state: Mapping[str, Any]) -> Dict
 
 
 def summarize_bifr_runtime_state(runtime_state: Mapping[str, Any]) -> Dict[str, Any]:
+    """
+    Summarize the canonical BIFR runtime/accountant surface for reports.
+
+    The summary is intentionally shallow: it records counts, source tags, and
+    resolved numeric metadata without duplicating the full coefficient payload.
+    """
     state = canonicalize_bifr_runtime_state(runtime_state=runtime_state)
     coeffs = state.get("coeffs")
     return {

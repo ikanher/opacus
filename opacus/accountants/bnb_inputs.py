@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+"""
+Canonical input helpers for the BNB accountant bridge surface.
+
+These helpers normalize the small but important pieces of state that the BNB
+accountant expects from MF and BLT runtime/provider layers: coefficient
+surfaces, canonical band counts, and canonical balls-in-bins cycle lengths.
+"""
+
 import copy
 from typing import Any, Dict, Mapping
 
@@ -12,6 +20,9 @@ def attach_accountant_coeff_surface(
     coeffs: Mapping[str, Any] | list[float] | tuple[float, ...],
     coeff_source: str,
 ) -> Dict[str, Any]:
+    """
+    Persist an accountant-facing coefficient surface onto a runtime-state payload.
+    """
     state = copy.deepcopy(dict(runtime_state))
     state[coeff_key] = [float(c) for c in coeffs]
     state[coeff_source_key] = str(coeff_source)
@@ -25,11 +36,16 @@ def resolve_canonical_bsr_bands(
     kwargs: Mapping[str, Any],
     error_context: str,
 ) -> int:
+    """
+    Resolve the canonical band count shared by MF runtime state and accountant inputs.
+    """
     metadata_bands = metadata.get("bands")
     explicit_bands = kwargs.get("bsr_bands")
     state_bands = runtime_state.get("bsr_bands")
 
     if explicit_bands is not None and metadata_bands is not None:
+        # Reject mixed contracts early so the provider/runtime side and the
+        # accountant side cannot silently disagree about the family bandwidth.
         if int(explicit_bands) != int(metadata_bands):
             raise ValueError(
                 "conflicting canonical inputs: `bsr_bands` must match "
@@ -57,6 +73,9 @@ def resolve_canonical_bnb_cycle_length(
     kwargs: Mapping[str, Any],
     error_context: str,
 ) -> int:
+    """
+    Resolve the canonical balls-in-bins cycle length from runtime, metadata, or kwargs.
+    """
     metadata_bins = metadata.get("bins", metadata.get("b"))
     explicit_cycle_length = kwargs.get(
         "bnb_cycle_length",
@@ -70,6 +89,8 @@ def resolve_canonical_bnb_cycle_length(
         if explicit_cycle_length < 1:
             raise ValueError("balls-in-bins cycle length must be >= 1")
 
+        # `bins`, `b`, `bnb_b`, and `bnb_cycle_length` are all the same contract
+        # under different public/runtime spellings, so keep them equal here.
         if metadata_bins is not None and int(metadata_bins) != explicit_cycle_length:
             raise ValueError(
                 "conflicting canonical inputs: `bnb_cycle_length` must match "

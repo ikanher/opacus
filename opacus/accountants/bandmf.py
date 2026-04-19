@@ -58,6 +58,9 @@ def optimize_cyclic_bandmf_strategy_coeffs(
     steps: int,
     max_optimizer_steps: int = 250,
 ) -> list[float]:
+    """
+    Optimize the cyclic BandMF runtime strategy coefficients for a finite horizon.
+    """
     return optimize_bandmf_strategy_coeffs(
         steps=int(steps),
         bands=int(bands),
@@ -72,6 +75,9 @@ def ensure_bandmf_fixed_analytical_coeffs(
     sampling_semantics,
     kwargs: Dict[str, Any],
 ) -> NoiseMechanismConfig:
+    """
+    Ensure the BandMF runtime state carries analytical coefficients for fixed-batch accounting.
+    """
     if mechanism_config.mechanism != "bandmf":
         return mechanism_config
 
@@ -144,6 +150,9 @@ def resolve_bandmf_mf_sensitivity_for_fixed_batch(
     sample_rate: float | None,
     kwargs: Dict[str, Any],
 ) -> float:
+    """
+    Resolve the fixed-batch BandMF MF sensitivity from runtime state and workload metadata.
+    """
     metadata = (
         sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
     )

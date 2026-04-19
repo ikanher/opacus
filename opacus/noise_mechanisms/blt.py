@@ -7,6 +7,15 @@ This module owns the streamed BLT runtime release mechanism used during
 centralized training. It consumes a canonical BLT parameter pair and emits the
 correlated per-step noise sequence online. It does not own accountant-side
 coefficient algebra or calibration search.
+
+Traceability:
+- BLT runtime parameter pairs and streaming practice follow BLT Practice
+  (McMahan et al., 2024)
+- the paired forward/inverse parameterization reused here is provided by the
+  accountant-side BLT helpers in `opacus.accountants.analysis.blt`
+
+Mapping type: implementation-contract. This module realizes the runtime BLT
+release recurrence; accountant guarantees remain outside this file.
 """
 
 from typing import Any, List, Mapping, Optional
@@ -20,6 +29,7 @@ from .base import NoiseMechanism, NoiseMechanismOptimizer
 
 
 def _pair_signature(pair: BLTPairedParams) -> tuple[tuple[float, ...], ...]:
+    """Return a stable numeric signature for BLT pair-equality checks in checkpoints."""
     forward = pair.forward.canonicalized()
     inverse = pair.inverse.canonicalized()
     return (
@@ -39,6 +49,12 @@ class BufferedToeplitzNoiseMechanism(NoiseMechanism):
     per-step runtime scalar `z_std` is the BLT runtime noise level. This should
     not be confused with amplified BNB accounting surfaces, which work from a
     normalized forward `c_col` instead.
+
+    Source: BLT Practice (McMahan et al., 2024) for the buffered
+    lower-triangular Toeplitz runtime family.
+
+    Mapping type: implementation-contract. The recurrence is exact for the
+    provided BLT pair, while privacy interpretation remains accountant-side.
     """
 
     def __init__(self, *, pair: BLTPairedParams, z_std: float):
@@ -59,15 +75,24 @@ class BufferedToeplitzNoiseMechanism(NoiseMechanism):
 
     @property
     def num_buffers(self) -> int:
+        """Number of streamed BLT state buffers required by the forward side."""
         return len(self._theta)
 
     def reset_state(self) -> None:
+        """Drop the buffered BLT recurrence state and cached debug tensors."""
         self._buffers = []
         self.last_flat_z = None
         self.last_flat_u = None
         self.steps_with_noise = 0
 
     def _pre_scale_noise_std(self, optimizer: NoiseMechanismOptimizer) -> float:
+        """
+        Resolve the per-step iid draw scale consumed by the BLT recurrence.
+
+        Mean-style reductions are rescaled back to the summed-gradient regime so
+        the runtime recurrence acts on the same release object the optimizer is
+        about to update.
+        """
         if optimizer.loss_reduction == "sum":
             return self.z_std
 
@@ -108,8 +133,10 @@ class BufferedToeplitzNoiseMechanism(NoiseMechanism):
         for p, _, _ in specs:
             assert p.summed_grad is not None
             chunks.append(p.summed_grad.reshape(-1))
+
         if not chunks:
             return torch.zeros((0,), dtype=torch.float32)
+
         return torch.cat(chunks, dim=0)
 
     def _assign_noised_grads(
@@ -129,34 +156,61 @@ class BufferedToeplitzNoiseMechanism(NoiseMechanism):
             offset = next_offset
 
     def _ensure_buffer_shape(self, reference: torch.Tensor) -> None:
+        """
+        Materialize or validate the BLT state buffers for the current flat shape.
+
+        The runtime stores one buffer per forward-side `theta` entry. Checkpoint
+        restores therefore need explicit shape/dtype/device validation before
+        the recurrence can continue.
+        """
         if self.num_buffers == 0:
             return
+
         if self._buffers:
             if len(self._buffers) != self.num_buffers:
                 raise ValueError("invalid BLT buffer state")
+
             for buf in self._buffers:
                 if buf.shape != reference.shape:
                     raise ValueError("BLT buffer shape mismatch")
+
                 if buf.dtype != reference.dtype:
                     raise ValueError("BLT buffer dtype mismatch")
+
                 if buf.device != reference.device:
                     raise ValueError("BLT buffer device mismatch")
             return
+
+        # First runtime step (or reset): materialize one zero buffer per BLT
+        # factor so later steps can update the streamed state in place.
         self._buffers = [torch.zeros_like(reference) for _ in range(self.num_buffers)]
 
     def _read_state(self) -> torch.Tensor:
+        """Form the current forward-side BLT state contribution `sum_i omega_i b_i`."""
         assert self._buffers
         result = self._buffers[0] * self._omega[0]
+
         for omega_i, buf_i in zip(self._omega[1:], self._buffers[1:]):
             result = result + omega_i * buf_i
+
         return result
 
     def _apply_inverse_stream(self, z_flat: torch.Tensor) -> torch.Tensor:
+        """
+        Advance one BLT streamed recurrence step.
+
+        The current correlated-noise vector is the iid draw minus the buffered
+        state contribution. The buffers are then updated by the forward-side
+        BLT recurrence driven by `theta`.
+        """
         self._ensure_buffer_shape(z_flat)
         if self.num_buffers == 0:
             u_flat = z_flat.detach().clone()
         else:
+            # The current BLT release is the fresh iid draw minus the buffered
+            # forward-state contribution accumulated from earlier steps.
             u_flat = z_flat - self._read_state()
+            # Then advance each buffer with the same newly solved `u_t`.
             self._buffers = [
                 theta_i * buf_i + u_flat
                 for theta_i, buf_i in zip(self._theta, self._buffers)
@@ -165,19 +219,27 @@ class BufferedToeplitzNoiseMechanism(NoiseMechanism):
         self.last_flat_z = z_flat.detach().clone()
         self.last_flat_u = u_flat.detach().clone()
         self.steps_with_noise += 1
+
         return u_flat
 
     def add_noise(self, optimizer: NoiseMechanismOptimizer) -> None:
+        """Add one BLT-correlated noise step to the optimizer's clipped gradients."""
         std = self._pre_scale_noise_std(optimizer)
         specs, z_flat = self._flatten_generated_z(optimizer, std=std)
         if not specs:
             return
+
         summed_flat = self._flatten_summed_grads(specs)
         u_flat = self._apply_inverse_stream(z_flat)
         self._assign_noised_grads(specs, summed_flat=summed_flat, u_flat=u_flat)
 
     def state_dict(self) -> Mapping[str, Any]:
-        """Serialize the runtime-only BLT recurrence state for checkpointing."""
+        """
+        Serialize the runtime-only BLT recurrence state for checkpointing.
+
+        The payload records the canonical BLT pair signature, the runtime noise
+        scale, and the current streamed buffers. It is not an accountant state.
+        """
         return {
             "pair": {
                 "forward": {
@@ -195,11 +257,17 @@ class BufferedToeplitzNoiseMechanism(NoiseMechanism):
         }
 
     def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
-        """Load a previously serialized runtime-only BLT recurrence state."""
+        """
+        Load a previously serialized runtime-only BLT recurrence state.
+
+        The restore validates both `z_std` and the canonical BLT pair so that a
+        checkpoint cannot silently cross wires between incompatible BLT runs.
+        """
         pair_state = state_dict.get("pair")
         z_std = float(state_dict.get("z_std", self.z_std))
         if z_std != self.z_std:
             raise ValueError("cannot load state with mismatched z_std")
+
         if pair_state is None:
             raise ValueError("missing BLT pair in mechanism state")
 
@@ -212,6 +280,8 @@ class BufferedToeplitzNoiseMechanism(NoiseMechanism):
         if state_signature != _pair_signature(self.pair):
             raise ValueError("cannot load state with mismatched BLT pair")
 
+        # The buffers are the only mutable runtime state; the pair itself is
+        # treated as immutable configuration and must match exactly.
         self._buffers = [
             torch.as_tensor(buf).detach().clone()
             for buf in state_dict.get("buffers", [])

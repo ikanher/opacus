@@ -13,6 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""
+Public configuration contracts for Opacus runtime mechanisms and samplers.
+
+This module does not implement privacy accounting itself. Instead it defines the
+typed configuration surface that `PrivacyEngine` consumes when it chooses a
+runtime noiser, a sampling law, and an accountant family. The MF-specific
+mechanisms here therefore describe implementation contracts rather than theorem
+statements.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -54,7 +64,11 @@ class MechanismStateSerializable(Protocol):
 
 def resolve_accounting_mode_from_accountant(accountant: str) -> AccountingModeName:
     """
-    Normalize user-facing accountant names to internal accounting_mode names.
+    Normalize user-facing accountant names to internal `accounting_mode` values.
+
+    This is a routing helper, not an authority layer. It only translates the
+    external spellings accepted by `PrivacyEngine` into the internal mode names
+    used by `NoiseMechanismConfig`.
     """
     accountant_to_mode = {
         "prv": "standard_step_accountant",
@@ -88,6 +102,19 @@ def resolve_accounting_mode_from_accountant(accountant: str) -> AccountingModeNa
 
 @dataclass(frozen=True)
 class SamplingSemantics:
+    """
+    Explicit sampling-law contract attached to a private training run.
+
+    Attributes:
+        sampling_mode: Canonical runtime sampling family. `poisson` is the
+            standard Opacus Bernoulli/Poisson contract, while the MF surfaces
+            use structured modes such as `cyclic_poisson`, `b_min_sep`,
+            `balls_in_bins`, and `k_out_of_t`.
+        privacy_metadata: Family-specific metadata required to interpret the
+            sampling law, such as `bands`, `bins`, `num_steps`, or
+            `num_selected`.
+    """
+
     sampling_mode: SamplingModeName
     privacy_metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -99,6 +126,8 @@ class SamplingSemantics:
             "balls-in-bins-sampler": "balls_in_bins",
             "k-out-of-t": "k_out_of_t",
         }
+        # Accept a few legacy/public spellings, but canonicalize immediately so
+        # the rest of the runtime only reasons about one sampling-mode name.
         normalized_sampling_mode = alias_map.get(self.sampling_mode, self.sampling_mode)
         object.__setattr__(self, "sampling_mode", normalized_sampling_mode)
 
@@ -132,6 +161,23 @@ class SamplingSemantics:
 
 @dataclass(frozen=True)
 class NoiseMechanismConfig:
+    """
+    Public runtime/accountant configuration for a private mechanism family.
+
+    Attributes:
+        mechanism: Runtime noiser family used by the optimizer. `gaussian`
+            means standard iid Gaussian DP-SGD; the MF families route to
+            correlated-noise implementations in `opacus.noise_mechanisms`.
+        accounting_mode: Accountant family that should interpret the runtime
+            mechanism. Some mechanisms admit multiple authoritative accounting
+            surfaces, such as `bsr_accountant`, `bnb_accountant`, or
+            `random_allocation_accountant`.
+        mechanism_state: Canonicalized family-specific state required to build
+            the runtime noiser and to answer accountant queries, such as
+            coefficients, inverse coefficients, BLT pair parameters, or cached
+            calibration metadata.
+    """
+
     mechanism: NoiseMechanismName = "gaussian"
     accounting_mode: AccountingModeName = "standard_step_accountant"
     mechanism_state: Dict[str, Any] = field(default_factory=dict)
