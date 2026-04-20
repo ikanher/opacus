@@ -2247,8 +2247,21 @@ class PrivacyEngine:
                 calibration_cfg["bnb_distributed_dp_runtime"]
             ),
         }
+        # BLT amplified BNB calibration needs the accountant-facing bridge state
+        # during the sigma search itself, not only on the final runtime config.
+        if bnb_c_matrix is not None:
+            estimator_kwargs["bnb_c_matrix"] = bnb_c_matrix
+        if bnb_bands is not None:
+            estimator_kwargs["bnb_bands"] = int(bnb_bands)
+        if bnb_cycle_length is not None:
+            estimator_kwargs["bnb_cycle_length"] = int(bnb_cycle_length)
         if bnb_c_matrix_contract is not None:
             estimator_kwargs["bnb_c_matrix_contract"] = bnb_c_matrix_contract
+        bnb_accountant_coeffs = mechanism_config.mechanism_state.get(
+            "bnb_accountant_coeffs"
+        )
+        if bnb_accountant_coeffs is not None:
+            estimator_kwargs["bnb_accountant_coeffs"] = bnb_accountant_coeffs
         if "bnb_sigma_reuse_state" in kwargs:
             estimator_kwargs["bnb_sigma_reuse_state"] = kwargs[
                 "bnb_sigma_reuse_state"

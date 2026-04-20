@@ -307,9 +307,16 @@ def test_make_private_with_epsilon_supports_blt_balls_in_bins_bnb_accountant(mon
     assert isinstance(dp_optimizer.noise_mechanism, BufferedToeplitzNoiseMechanism)
     assert pe.accountant.mechanism() == "bnb"
     assert captured["accountant"] == "bnb"
+    assert captured["bnb_c_matrix"] is not None
+    assert captured["bnb_bands"] == 4
+    assert captured["bnb_cycle_length"] == 8
+    assert captured["bnb_accountant_coeffs"] is not None
+    assert captured["bnb_c_matrix_contract"] is not None
     mechanism_state = captured["mechanism_state"]
     assert mechanism_state["blt_min_separation"] == 4
     assert mechanism_state["blt_horizon"] == 12
+    assert mechanism_state["bnb_accountant_coeffs"] is not None
+    assert mechanism_state["bnb_c_matrix_contract"] is not None
     assert captured["sampling_semantics"].sampling_mode == "balls_in_bins"
     final_state = pe.noise_mechanism_config.mechanism_state
     assert final_state["bnb_c_matrix"] is not None

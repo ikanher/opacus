@@ -112,6 +112,7 @@ def _copy_blt_runtime_metadata(
             continue
         if (
             key == "noise_multiplier_ref"
+            or key.startswith("bnb_")
             or key.startswith("blt_")
             or key.startswith("random_allocation_")
             or key.startswith("_")
