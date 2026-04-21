@@ -958,6 +958,129 @@ def test_distributed_bsr_global_noise_scale_rank0_only(monkeypatch) -> None:
     assert torch.allclose(observed, expected, atol=1e-7, rtol=1e-6)
 
 
+def test_distributed_bsr_make_private_autocalibration_matches_single_process_global_batch(
+    monkeypatch,
+) -> None:
+    base_single = nn.Linear(4, 3)
+    base_dist = copy.deepcopy(base_single)
+
+    single = PrivacyEngine()
+    single_model, single_opt, _ = single.make_private(
+        module=base_single,
+        optimizer=torch.optim.SGD(base_single.parameters(), lr=0.05),
+        data_loader=_loader(batch_size=8),
+        noise_multiplier=1.0,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping="flat",
+        grad_sample_mode="hooks",
+        noise_generator=torch.Generator().manual_seed(1729),
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"coeffs": [1.0]},
+        ),
+    )
+
+    monkeypatch.setattr(pe_mod, "DDP", nn.Linear)
+    _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
+    distributed = PrivacyEngine()
+    dist_model, dist_opt, _ = distributed.make_private(
+        module=base_dist,
+        optimizer=torch.optim.SGD(base_dist.parameters(), lr=0.05),
+        data_loader=_loader(batch_size=8),
+        noise_multiplier=1.0,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping="flat",
+        grad_sample_mode="hooks",
+        noise_generator=torch.Generator().manual_seed(1729),
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"coeffs": [1.0]},
+        ),
+    )
+
+    assert single_opt.expected_batch_size == 8
+    assert dist_opt.expected_batch_size == 4
+    assert float(single_opt.noise_mechanism.z_std) == pytest.approx(0.125)
+    assert float(dist_opt.noise_mechanism.z_std) == pytest.approx(0.125)
+
+    single_opt.zero_grad()
+    dist_opt.zero_grad()
+    _set_zero_grad_samples(single_opt, batch_size=8)
+    _set_zero_grad_samples(dist_opt, batch_size=4)
+    single_opt.step()
+    dist_opt.step()
+
+    single_grad = torch.cat([p.grad.reshape(-1) for p in single_opt.params])
+    dist_grad = torch.cat([p.grad.reshape(-1) for p in dist_opt.params])
+    assert torch.allclose(dist_grad, single_grad, atol=1e-7, rtol=1e-6)
+
+
+def test_distributed_bsr_make_private_with_epsilon_autocalibration_uses_global_batch(
+    monkeypatch,
+) -> None:
+    def _fake_get_noise_multiplier(**_kwargs):
+        return 1.0
+
+    monkeypatch.setattr(pe_mod, "get_noise_multiplier", _fake_get_noise_multiplier)
+
+    single = PrivacyEngine()
+    base_single = nn.Linear(4, 3)
+    _, single_opt, single_loader = single.make_private_with_epsilon(
+        module=base_single,
+        optimizer=torch.optim.SGD(base_single.parameters(), lr=0.05),
+        data_loader=_loader(batch_size=8),
+        target_epsilon=4.0,
+        target_delta=1e-5,
+        total_steps=8,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping="flat",
+        grad_sample_mode="hooks",
+        noise_generator=torch.Generator().manual_seed(4242),
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"coeffs": [1.0]},
+        ),
+    )
+
+    monkeypatch.setattr(pe_mod, "DDP", nn.Linear)
+    _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
+    distributed = PrivacyEngine()
+    base_dist = nn.Linear(4, 3)
+    _, dist_opt, dist_loader = distributed.make_private_with_epsilon(
+        module=base_dist,
+        optimizer=torch.optim.SGD(base_dist.parameters(), lr=0.05),
+        data_loader=_loader(batch_size=8),
+        target_epsilon=4.0,
+        target_delta=1e-5,
+        total_steps=8,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        clipping="flat",
+        grad_sample_mode="hooks",
+        noise_generator=torch.Generator().manual_seed(4242),
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bsr",
+            accounting_mode="bsr_accountant",
+            mechanism_state={"coeffs": [1.0]},
+        ),
+    )
+
+    assert single_loader.batch_size == 8
+    assert dist_loader.batch_size == 4
+    assert single_opt.expected_batch_size == 8
+    assert dist_opt.expected_batch_size == 4
+    assert float(single_opt.noise_multiplier) == pytest.approx(1.0)
+    assert float(dist_opt.noise_multiplier) == pytest.approx(1.0)
+    assert float(single_opt.noise_mechanism.z_std) == pytest.approx(0.125)
+    assert float(dist_opt.noise_mechanism.z_std) == pytest.approx(0.125)
+
+
 def test_distributed_bsr_history_progression_and_bounds(monkeypatch) -> None:
     monkeypatch.setattr(pe_mod, "DDP", nn.Linear)
 

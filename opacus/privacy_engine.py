@@ -1393,6 +1393,33 @@ class PrivacyEngine:
         return float(expected_batch_size)
 
     @staticmethod
+    def _correlated_calibration_expected_batch_size(
+        *,
+        expected_batch_size: int,
+        distributed: bool,
+    ) -> int:
+        """
+        Resolve the logical batch size used to calibrate correlated `z_std`.
+
+        In DDP the optimizer keeps a per-rank `expected_batch_size`, but the
+        public MF runtime contract is stated on the global logical batch. The
+        distributed optimizer later averages gradients across ranks, so the
+        correlated-noise calibration path must reconstruct the global logical
+        batch here before mapping `sigma_ref` to `z_std`.
+        """
+        if expected_batch_size <= 0:
+            raise ValueError("correlated calibration requires expected_batch_size > 0")
+
+        if not distributed:
+            return int(expected_batch_size)
+
+        world_size = torch.distributed.get_world_size()
+        if int(world_size) <= 0:
+            raise ValueError("distributed correlated calibration requires world_size > 0")
+
+        return int(expected_batch_size) * int(world_size)
+
+    @staticmethod
     def _resolve_sample_rate_and_expected_batch_size(
         *,
         poisson_sampling: bool,
@@ -2981,12 +3008,23 @@ class PrivacyEngine:
             and mechanism_config.mechanism_state.get("z_std") is None
         ):
             state = copy.deepcopy(mechanism_config.mechanism_state)
+            correlated_expected_batch_size = (
+                self._correlated_calibration_expected_batch_size(
+                    expected_batch_size=int(expected_batch_size),
+                    distributed=bool(distributed),
+                )
+            )
             # `make_private` receives sigma_ref directly, so correlated MF
             # mechanisms only need the final runtime-scale conversion here.
             state["z_std"] = calibrate_bsr_z_std(
                 noise_multiplier_ref=float(noise_multiplier),
                 max_grad_norm=float(max_grad_norm),
-                denominator=float(expected_batch_size),
+                denominator=float(
+                    self._bsr_calibration_denominator(
+                        loss_reduction=loss_reduction,
+                        expected_batch_size=int(correlated_expected_batch_size),
+                    )
+                ),
             )
             mechanism_config = NoiseMechanismConfig(
                 mechanism=mechanism_config.mechanism,
@@ -3286,9 +3324,15 @@ class PrivacyEngine:
                 total_steps=total_steps,
                 distributed=distributed,
             )
+            correlated_expected_batch_size = (
+                self._correlated_calibration_expected_batch_size(
+                    expected_batch_size=int(calibration_expected_batch_size),
+                    distributed=bool(distributed),
+                )
+            )
             correlated_denominator = self._bsr_calibration_denominator(
                 loss_reduction=loss_reduction,
-                expected_batch_size=int(calibration_expected_batch_size),
+                expected_batch_size=int(correlated_expected_batch_size),
             )
             self._log_bsr_trace(
                 stage="make_private_with_epsilon_pre_calibration",
