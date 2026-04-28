@@ -18,6 +18,7 @@ from unittest import mock
 
 import torch
 
+from opacus.accountants.bnb import BNBAccountant
 from opacus.accountants.analysis.bifr import (
     derive_bifr_amplified_accountant_coeffs_from_factor_coeffs,
     resolve_bifr_exact_factor_coeffs_for_accounting,
@@ -64,9 +65,75 @@ from opacus.accountants.analysis.bnb import (
     verify_evr_confidence_split,
     verify_hockey_stick_delta_hoeffding,
 )
+from opacus.accountants.utils import get_noise_multiplier
+from opacus.mechanism_contracts import SamplingSemantics
 
 
 class BNBAnalysisTest(unittest.TestCase):
+    def test_get_noise_multiplier_validates_stable_bnb_contract_once_per_search(
+        self,
+    ) -> None:
+        coeffs = [1.0, 0.5]
+        c_matrix, c_matrix_contract = build_bnb_toeplitz_c_matrix_and_contract(
+            coeffs=coeffs,
+            bands=2,
+            horizon=4,
+        )
+        sampling_semantics = SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 2, "bands": 2},
+        )
+        mechanism_state = {
+            "mechanism": "bsr",
+            "coeffs": coeffs,
+            "bnb_accountant_coeffs": coeffs,
+            "bnb_bands": 2,
+            "bnb_cycle_length": 2,
+            "bnb_c_matrix": c_matrix,
+            "bnb_c_matrix_contract": c_matrix_contract,
+        }
+
+        def _fake_estimator(**kwargs) -> float:
+            return 60.0 / float(kwargs["noise_multiplier"])
+
+        mocked_estimator = mock.Mock(side_effect=_fake_estimator)
+        mocked_estimator.__name__ = (
+            "estimate_balls_in_bins_epsilon_monte_carlo_optimistic"
+        )
+        with mock.patch.object(
+            BNBAccountant,
+            "_validate_builtin_b_min_sep_consistency",
+            side_effect=lambda **_kwargs: None,
+        ) as mocked_validate:
+            with mock.patch(
+                "opacus.accountants.bnb.estimate_balls_in_bins_epsilon_monte_carlo_optimistic",
+                new=mocked_estimator,
+            ):
+                sigma = get_noise_multiplier(
+                    target_epsilon=8.0,
+                    target_delta=1e-5,
+                    sample_rate=0.5,
+                    steps=4,
+                    accountant="bnb",
+                    mechanism_state=mechanism_state,
+                    sampling_semantics=sampling_semantics,
+                    bnb_c_matrix=c_matrix,
+                    bnb_c_matrix_contract=c_matrix_contract,
+                    bnb_bands=2,
+                    bnb_cycle_length=2,
+                    bnb_accountant_coeffs=coeffs,
+                    bnb_calibration_mode="optimistic",
+                    bnb_num_samples=16,
+                    bnb_chunk_size=8,
+                    bnb_backend="cpu",
+                    bnb_device="cpu",
+                )
+
+        self.assertGreater(mocked_estimator.call_count, 1)
+        self.assertEqual(mocked_validate.call_count, 1)
+        self.assertGreaterEqual(float(sigma), 7.5)
+        self.assertLessEqual(float(sigma), 7.51)
+
     def test_build_balls_in_bins_modes_matrix_matches_explicit_periodic_shifts(self) -> None:
         coeffs = [1.0, 0.375, 0.140625, 0.052734375]
         cycle_length = 3

@@ -378,11 +378,8 @@ def build_lower_toeplitz_c_matrix_from_coeffs(
 
     h = int(horizon)
     c_matrix = torch.zeros((h, h), dtype=dtype, device=device)
-    for i in range(h):
-
-        max_lag = min(i, len(coeff_list) - 1)
-        for lag in range(max_lag + 1):
-            c_matrix[i, i - lag] = coeff_list[lag]
+    for lag, coeff in enumerate(coeff_list[:h]):
+        c_matrix.diagonal(offset=-lag).fill_(coeff)
 
     return c_matrix
 

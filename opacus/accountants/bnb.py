@@ -209,6 +209,94 @@ class BNBAccountant(IAccountant):
 
     def __init__(self):
         super().__init__()
+        self._validated_builtin_bnb_contract_keys = set()
+
+    @staticmethod
+    def _sequence_cache_signature(value):
+        if value is None:
+            return None
+        try:
+            return tuple(float(item) for item in value)
+        except (TypeError, ValueError):
+            try:
+                return (len(value), id(value))
+            except TypeError:
+                return id(value)
+
+    @staticmethod
+    def _dict_cache_signature(value):
+        if not isinstance(value, dict):
+            return repr(value)
+        return tuple(sorted((str(key), repr(item)) for key, item in value.items()))
+
+    @classmethod
+    def _builtin_bnb_contract_cache_key(
+        cls,
+        *,
+        mechanism_state,
+        sampling_semantics,
+        c_matrix,
+        bands: int,
+        c_matrix_contract,
+    ) -> Tuple[Any, ...]:
+        state = mechanism_state if isinstance(mechanism_state, dict) else {}
+        metadata = (
+            sampling_semantics.privacy_metadata
+            if sampling_semantics is not None
+            else {}
+        )
+        coeffs = state.get("bnb_accountant_coeffs", state.get("coeffs"))
+        shape = tuple(int(dim) for dim in getattr(c_matrix, "shape", ()))
+        return (
+            str(state.get("mechanism", state.get("name"))),
+            cls._sequence_cache_signature(coeffs),
+            getattr(sampling_semantics, "sampling_mode", None),
+            cls._dict_cache_signature(metadata),
+            int(bands),
+            id(c_matrix),
+            shape,
+            str(getattr(c_matrix, "dtype", None)),
+            str(getattr(c_matrix, "device", None)),
+            getattr(c_matrix, "_version", None),
+            id(c_matrix_contract),
+            cls._dict_cache_signature(c_matrix_contract),
+        )
+
+    def _validate_builtin_b_min_sep_consistency_once(
+        self,
+        *,
+        mechanism_state,
+        sampling_semantics,
+        c_matrix,
+        bands: int,
+        c_matrix_contract,
+    ) -> None:
+        """
+        Validate a stable BNB runtime contract once per accountant instance.
+
+        ``get_noise_multiplier`` reuses one accountant while probing many sigma
+        values. The contract does not depend on sigma, so re-running the full
+        Toeplitz matrix reconstruction on every probe only burns calibration
+        time without adding coverage.
+        """
+        cache_key = self._builtin_bnb_contract_cache_key(
+            mechanism_state=mechanism_state,
+            sampling_semantics=sampling_semantics,
+            c_matrix=c_matrix,
+            bands=int(bands),
+            c_matrix_contract=c_matrix_contract,
+        )
+        if cache_key in self._validated_builtin_bnb_contract_keys:
+            return
+
+        self._validate_builtin_b_min_sep_consistency(
+            mechanism_state=mechanism_state,
+            sampling_semantics=sampling_semantics,
+            c_matrix=c_matrix,
+            bands=int(bands),
+            c_matrix_contract=c_matrix_contract,
+        )
+        self._validated_builtin_bnb_contract_keys.add(cache_key)
 
     @staticmethod
     def _validate_builtin_b_min_sep_consistency(
@@ -394,7 +482,7 @@ class BNBAccountant(IAccountant):
                 cycle_length = bands
 
             with _timed("validate_b_min_sep_consistency"):
-                self._validate_builtin_b_min_sep_consistency(
+                self._validate_builtin_b_min_sep_consistency_once(
                     mechanism_state=state,
                     sampling_semantics=sampling_semantics,
                     c_matrix=c_matrix,
@@ -424,7 +512,7 @@ class BNBAccountant(IAccountant):
                 cycle_length = bands
 
             with _timed("validate_balls_in_bins_consistency"):
-                self._validate_builtin_b_min_sep_consistency(
+                self._validate_builtin_b_min_sep_consistency_once(
                     mechanism_state=state,
                     sampling_semantics=sampling_semantics,
                     c_matrix=c_matrix,
