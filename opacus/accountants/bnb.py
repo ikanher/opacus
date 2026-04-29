@@ -48,8 +48,8 @@ from typing import Any, Dict, Tuple
 
 from opacus.accountants.bnb_inputs import resolve_canonical_bnb_cycle_length
 from opacus.accountants.analysis.bnb import (
-    estimate_balls_in_bins_epsilon_monte_carlo,
-    estimate_balls_in_bins_epsilon_monte_carlo_optimistic,
+    estimate_balls_in_bins_epsilon_reduced_mixture,
+    estimate_balls_in_bins_epsilon_reduced_mixture_optimistic,
     estimate_b_min_sep_epsilon_monte_carlo,
     resolve_bnb_calibration_kwargs,
 )
@@ -453,7 +453,6 @@ class BNBAccountant(IAccountant):
 
         num_samples = int(calibration_cfg["bnb_num_samples"])
         seed = int(calibration_cfg["bnb_seed"])
-        reduce_dimensionality = bool(calibration_cfg["bnb_reduce_dimensionality"])
         tolerance = float(calibration_cfg["bnb_tolerance"])
         max_iterations = int(calibration_cfg["bnb_max_iterations"])
         chunk_size = calibration_cfg["bnb_chunk_size"]
@@ -463,11 +462,17 @@ class BNBAccountant(IAccountant):
         distributed_mode = calibration_cfg["bnb_distributed_mode"]
         distributed_dp_runtime = bool(calibration_cfg["bnb_distributed_dp_runtime"])
         calibration_mode = str(calibration_cfg["bnb_calibration_mode"])
-        sigma_reuse_state = kwargs.get("bnb_sigma_reuse_state")
+        default_accounting_backend = (
+            "reduced_gaussian_mixture"
+            if sampling_mode == "balls_in_bins"
+            else "monte_carlo"
+        )
         accounting_backend = str(
             kwargs.get(
                 "bnb_accounting_backend",
-                persisted_kwargs.get("bnb_accounting_backend", "monte_carlo"),
+                persisted_kwargs.get(
+                    "bnb_accounting_backend", default_accounting_backend
+                ),
             )
         )
         _debug_timing(
@@ -499,7 +504,9 @@ class BNBAccountant(IAccountant):
                         target_delta=float(delta),
                         num_samples=num_samples,
                         seed=seed,
-                        reduce_dimensionality=reduce_dimensionality,
+                        reduce_dimensionality=bool(
+                            calibration_cfg["bnb_reduce_dimensionality"]
+                        ),
                         tolerance=float(tolerance),
                         max_iterations=max_iterations,
                         chunk_size=chunk_size,
@@ -580,15 +587,15 @@ class BNBAccountant(IAccountant):
                             runtime_config=runtime_cfg,
                         )
                     )
-            estimator = estimate_balls_in_bins_epsilon_monte_carlo
+            estimator = estimate_balls_in_bins_epsilon_reduced_mixture
             if calibration_mode == "optimistic":
-                estimator = estimate_balls_in_bins_epsilon_monte_carlo_optimistic
+                estimator = estimate_balls_in_bins_epsilon_reduced_mixture_optimistic
             with _timed(f"{estimator.__name__}"):
                 return float(
                     estimator(
-                        coeffs=accountant_coeffs,
+                        c_matrix=c_matrix,
+                        bands=int(bands),
                         cycle_length=int(cycle_length),
-                        horizon=horizon,
                         noise_multiplier=float(noise_multiplier),
                         target_delta=float(delta),
                         num_samples=num_samples,
@@ -597,11 +604,6 @@ class BNBAccountant(IAccountant):
                         max_iterations=max_iterations,
                         chunk_size=chunk_size,
                         num_workers=num_workers,
-                        backend=backend,
-                        device=device,
-                        distributed_mode=distributed_mode,
-                        distributed_dp_runtime=distributed_dp_runtime,
-                        sigma_reuse_state=sigma_reuse_state,
                     )
                 )
 

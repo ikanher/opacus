@@ -13,11 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+import time
 import unittest
 from unittest import mock
 
 import torch
 
+from opacus.accountants.analysis.bisr import (
+    derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs,
+    generate_bisr_coeffs_from_sgd_workload,
+)
 from opacus.accountants.bnb import BNBAccountant
 from opacus.accountants.analysis.bifr import (
     derive_bifr_amplified_accountant_coeffs_from_factor_coeffs,
@@ -69,6 +75,100 @@ from opacus.accountants.utils import get_noise_multiplier
 from opacus.mechanism_contracts import SamplingSemantics
 
 
+def _legacy_balls_in_bins_epsilon_optimistic_baseline(
+    *,
+    coeffs,
+    cycle_length: int,
+    horizon: int,
+    noise_multiplier: float,
+    target_delta: float,
+    num_samples: int,
+    seed: int = 0,
+    tolerance: float = 1e-4,
+    max_iterations: int = 200,
+    chunk_size: int | None = None,
+    num_workers: int = 0,
+) -> float:
+    positive_chunks = sample_balls_in_bins_llr_chunks(
+        coeffs=coeffs,
+        cycle_length=int(cycle_length),
+        horizon=int(horizon),
+        sigma=float(noise_multiplier),
+        num_samples=int(num_samples),
+        seed=int(seed),
+        chunk_size=chunk_size,
+        num_workers=int(num_workers),
+        positive_sample=True,
+        backend="cpu",
+        device="cpu",
+        distributed_mode="none",
+        distributed_dp_runtime=False,
+    )
+    negative_chunks = sample_balls_in_bins_llr_chunks(
+        coeffs=coeffs,
+        cycle_length=int(cycle_length),
+        horizon=int(horizon),
+        sigma=float(noise_multiplier),
+        num_samples=int(num_samples),
+        seed=int(seed) + 1,
+        chunk_size=chunk_size,
+        num_workers=int(num_workers),
+        positive_sample=False,
+        backend="cpu",
+        device="cpu",
+        distributed_mode="none",
+        distributed_dp_runtime=False,
+    )
+    positive_epsilon = estimate_epsilon_from_llr_chunks(
+        target_delta=float(target_delta),
+        llr_chunks=[torch.as_tensor(chunk, dtype=torch.float64) for chunk in positive_chunks],
+        tolerance=float(tolerance),
+        max_iterations=int(max_iterations),
+    )
+    negative_epsilon = estimate_epsilon_from_llr_chunks(
+        target_delta=float(target_delta),
+        llr_chunks=[torch.as_tensor(chunk, dtype=torch.float64) for chunk in negative_chunks],
+        tolerance=float(tolerance),
+        max_iterations=int(max_iterations),
+    )
+    return float(max(float(positive_epsilon), float(negative_epsilon)))
+
+
+def _representative_high_memory_bisr_proxy():
+    steps_per_epoch = math.ceil(50_000 / 512)
+    horizon = steps_per_epoch * 20
+    bands = 64
+    inverse_coeffs = generate_bisr_coeffs_from_sgd_workload(
+        bands=bands,
+        momentum=0.0,
+        weight_decay=0.0,
+    )
+    accountant_coeffs = derive_bisr_amplified_accountant_coeffs_from_inverse_coeffs(
+        coeffs=inverse_coeffs,
+        steps=horizon,
+    )
+    c_matrix, _ = build_bnb_toeplitz_c_matrix_and_contract(
+        coeffs=accountant_coeffs,
+        bands=bands,
+        horizon=horizon,
+    )
+    return {
+        "cycle_length": steps_per_epoch,
+        "horizon": horizon,
+        "bands": bands,
+        "coeffs": accountant_coeffs,
+        "c_matrix": c_matrix,
+        "num_samples": 20_000,
+        "noise_multiplier": 5.0,
+        "target_delta": 1e-3,
+        "seed": 123,
+        "tolerance": 1e-4,
+        "max_iterations": 80,
+        "chunk_size": 1_000,
+        "num_workers": 0,
+    }
+
+
 class BNBAnalysisTest(unittest.TestCase):
     def test_get_noise_multiplier_validates_stable_bnb_contract_once_per_search(
         self,
@@ -98,7 +198,7 @@ class BNBAnalysisTest(unittest.TestCase):
 
         mocked_estimator = mock.Mock(side_effect=_fake_estimator)
         mocked_estimator.__name__ = (
-            "estimate_balls_in_bins_epsilon_monte_carlo_optimistic"
+            "estimate_balls_in_bins_epsilon_reduced_mixture_optimistic"
         )
         with mock.patch.object(
             BNBAccountant,
@@ -106,7 +206,7 @@ class BNBAnalysisTest(unittest.TestCase):
             side_effect=lambda **_kwargs: None,
         ) as mocked_validate:
             with mock.patch(
-                "opacus.accountants.bnb.estimate_balls_in_bins_epsilon_monte_carlo_optimistic",
+                "opacus.accountants.bnb.estimate_balls_in_bins_epsilon_reduced_mixture_optimistic",
                 new=mocked_estimator,
             ):
                 sigma = get_noise_multiplier(
@@ -1054,6 +1154,50 @@ class BNBAnalysisTest(unittest.TestCase):
             chunk_size=1_000,
         )
         self.assertLess(abs(float(eps_full) - float(eps_chunked)), 0.15)
+
+    def test_estimate_balls_in_bins_epsilon_optimistic_beats_legacy_high_memory_proxy(
+        self,
+    ) -> None:
+        proxy = _representative_high_memory_bisr_proxy()
+
+        t0 = time.perf_counter()
+        legacy_epsilon = _legacy_balls_in_bins_epsilon_optimistic_baseline(
+            coeffs=proxy["coeffs"],
+            cycle_length=proxy["cycle_length"],
+            horizon=proxy["horizon"],
+            noise_multiplier=proxy["noise_multiplier"],
+            target_delta=proxy["target_delta"],
+            num_samples=proxy["num_samples"],
+            seed=proxy["seed"],
+            tolerance=proxy["tolerance"],
+            max_iterations=proxy["max_iterations"],
+            chunk_size=proxy["chunk_size"],
+            num_workers=proxy["num_workers"],
+        )
+        legacy_elapsed = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        fast_epsilon = estimate_balls_in_bins_epsilon_monte_carlo_optimistic(
+            coeffs=proxy["coeffs"],
+            cycle_length=proxy["cycle_length"],
+            horizon=proxy["horizon"],
+            noise_multiplier=proxy["noise_multiplier"],
+            target_delta=proxy["target_delta"],
+            num_samples=proxy["num_samples"],
+            seed=proxy["seed"],
+            tolerance=proxy["tolerance"],
+            max_iterations=proxy["max_iterations"],
+            chunk_size=proxy["chunk_size"],
+            num_workers=proxy["num_workers"],
+            backend="cpu",
+            device="cpu",
+            distributed_mode="none",
+            distributed_dp_runtime=False,
+        )
+        fast_elapsed = time.perf_counter() - t0
+
+        self.assertLess(abs(float(legacy_epsilon) - float(fast_epsilon)), 0.15)
+        self.assertGreater(legacy_elapsed / max(fast_elapsed, 1e-9), 10.0)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required for BnB CUDA parity")
     def test_sample_balls_in_bins_llr_chunks_cuda_matches_cpu_seeded(self) -> None:

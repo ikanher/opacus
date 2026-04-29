@@ -2476,6 +2476,7 @@ class PrivacyEngine:
     def _build_bnb_accounting_kwargs_for_state(
         *,
         mechanism: str,
+        sampling_semantics: Optional[SamplingSemantics],
         kwargs: Dict[str, Any],
         distributed_dp_runtime: bool,
     ) -> Optional[Dict[str, Any]]:
@@ -2488,6 +2489,53 @@ class PrivacyEngine:
         calibration_cfg = resolve_bnb_calibration_kwargs(
             overrides=kwargs,
         )
+        sampling_mode = (
+            sampling_semantics.sampling_mode
+            if sampling_semantics is not None
+            else None
+        )
+        if sampling_mode == "balls_in_bins":
+            return {
+                "bnb_accounting_backend": (
+                    str(kwargs["bnb_accounting_backend"])
+                    if kwargs.get("bnb_accounting_backend") is not None
+                    else "reduced_gaussian_mixture"
+                ),
+                "bnb_calibration_mode": str(calibration_cfg["bnb_calibration_mode"]),
+                "bnb_num_samples": int(calibration_cfg["bnb_num_samples"]),
+                "bnb_seed": int(calibration_cfg["bnb_seed"]),
+                "bnb_reduce_dimensionality": True,
+                "bnb_tolerance": float(calibration_cfg["bnb_tolerance"]),
+                "bnb_max_iterations": int(calibration_cfg["bnb_max_iterations"]),
+                "bnb_chunk_size": calibration_cfg["bnb_chunk_size"],
+                "bnb_num_workers": int(calibration_cfg["bnb_num_workers"]),
+                "random_allocation_loss_discretization": (
+                    float(kwargs["random_allocation_loss_discretization"])
+                    if kwargs.get("random_allocation_loss_discretization") is not None
+                    else None
+                ),
+                "random_allocation_tail_truncation": (
+                    float(kwargs["random_allocation_tail_truncation"])
+                    if kwargs.get("random_allocation_tail_truncation") is not None
+                    else None
+                ),
+                "random_allocation_max_grid_fft": (
+                    int(kwargs["random_allocation_max_grid_fft"])
+                    if kwargs.get("random_allocation_max_grid_fft") is not None
+                    else None
+                ),
+                "random_allocation_max_grid_mult": (
+                    int(kwargs["random_allocation_max_grid_mult"])
+                    if kwargs.get("random_allocation_max_grid_mult") is not None
+                    else None
+                ),
+                "random_allocation_convolution_method": (
+                    str(kwargs["random_allocation_convolution_method"])
+                    if kwargs.get("random_allocation_convolution_method") is not None
+                    else None
+                ),
+            }
+
         explicit_distributed_mode = kwargs.get("bnb_distributed_mode")
         resolved_distributed_mode = (
             explicit_distributed_mode
@@ -3034,6 +3082,7 @@ class PrivacyEngine:
 
         bnb_accounting_kwargs = self._build_bnb_accounting_kwargs_for_state(
             mechanism=mechanism_config.mechanism,
+            sampling_semantics=sampling_semantics,
             kwargs=kwargs,
             distributed_dp_runtime=bool(distributed),
         )
@@ -3482,6 +3531,7 @@ class PrivacyEngine:
 
         bnb_accounting_kwargs = self._build_bnb_accounting_kwargs_for_state(
             mechanism=mechanism_config.mechanism,
+            sampling_semantics=local_sampling_semantics,
             kwargs=kwargs,
             distributed_dp_runtime=bool(distributed),
         )
@@ -3631,6 +3681,9 @@ class PrivacyEngine:
         bnb_accounting_kwargs = mechanism_state.get("_bnb_accounting_kwargs")
         if isinstance(bnb_accounting_kwargs, dict):
             payload["bnb_accounting_kwargs"] = dict(bnb_accounting_kwargs)
+            payload["bnb_accounting_backend"] = bnb_accounting_kwargs.get(
+                "bnb_accounting_backend"
+            )
             payload["bnb_calibration_mode"] = bnb_accounting_kwargs.get(
                 "bnb_calibration_mode"
             )

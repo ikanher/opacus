@@ -52,12 +52,21 @@ def test_optimistic_balls_in_bins_epsilon_does_not_use_base_delta(monkeypatch) -
         del num_samples, target_delta
         raise AssertionError("optimistic estimator should not query base_delta")
 
+    def _fail_sampler(**kwargs):
+        del kwargs
+        raise AssertionError(
+            "fast balls_in_bins estimator should not call sample_balls_in_bins_llr_chunks"
+        )
+
     def _fake_chunks(**kwargs):
         del kwargs
         return [torch.tensor([2.0, 2.0, 2.0], dtype=torch.float64)]
 
     monkeypatch.setattr(bnb_analysis_mod, "get_bnb_base_delta", _fail_base_delta)
-    monkeypatch.setattr(bnb_analysis_mod, "sample_balls_in_bins_llr_chunks", _fake_chunks)
+    monkeypatch.setattr(
+        bnb_analysis_mod, "sample_balls_in_bins_llr_chunks", _fail_sampler
+    )
+    monkeypatch.setattr(bnb_analysis_mod, "compute_llr_sample_chunks", _fake_chunks)
 
     epsilon = estimate_balls_in_bins_epsilon_monte_carlo_optimistic(
         coeffs=[1.0],
@@ -68,6 +77,56 @@ def test_optimistic_balls_in_bins_epsilon_does_not_use_base_delta(monkeypatch) -
         num_samples=10,
     )
     assert float(epsilon) >= 0.0
+
+
+def test_bnb_accountant_balls_in_bins_forces_reduced_dimensionality(
+    monkeypatch,
+) -> None:
+    state, semantics = _bnb_balls_in_bins_state()
+    state["_bnb_accounting_kwargs"] = {
+        "bnb_calibration_mode": "optimistic",
+        "bnb_num_samples": 8,
+        "bnb_seed": 7,
+        "bnb_reduce_dimensionality": False,
+        "bnb_chunk_size": None,
+        "bnb_num_workers": 0,
+        "bnb_backend": "auto",
+        "bnb_device": None,
+        "bnb_distributed_mode": "none",
+        "bnb_distributed_dp_runtime": False,
+    }
+
+    accountant = BNBAccountant()
+    accountant.step(noise_multiplier=1.0, sample_rate=1.0)
+
+    observed_reduce_flags = []
+
+    real_builder = bnb_analysis_mod.build_b_min_sep_gaussian_mixture
+
+    def _record_builder(**kwargs):
+        observed_reduce_flags.append(bool(kwargs["reduce_dimensionality"]))
+        return real_builder(**kwargs)
+
+    def _fake_chunks(**kwargs):
+        del kwargs
+        return [torch.tensor([2.0, 2.0, 2.0], dtype=torch.float64)]
+
+    monkeypatch.setattr(
+        bnb_analysis_mod,
+        "build_b_min_sep_gaussian_mixture",
+        _record_builder,
+    )
+    monkeypatch.setattr(bnb_analysis_mod, "compute_llr_sample_chunks", _fake_chunks)
+
+    epsilon = accountant.get_epsilon(
+        1e-5,
+        mechanism_state=state,
+        sampling_semantics=semantics,
+        bnb_reduce_dimensionality=False,
+    )
+    assert float(epsilon) >= 0.0
+    assert observed_reduce_flags
+    assert all(observed_reduce_flags)
 
 
 def _bnb_balls_in_bins_state() -> tuple[dict, SamplingSemantics]:
@@ -118,12 +177,12 @@ def test_bnb_accountant_get_epsilon_optimistic_uses_optimistic_estimator(monkeyp
 
     monkeypatch.setattr(
         bnb_accountant_mod,
-        "estimate_balls_in_bins_epsilon_monte_carlo",
+        "estimate_balls_in_bins_epsilon_reduced_mixture",
         _fail_evr,
     )
     monkeypatch.setattr(
         bnb_accountant_mod,
-        "estimate_balls_in_bins_epsilon_monte_carlo_optimistic",
+        "estimate_balls_in_bins_epsilon_reduced_mixture_optimistic",
         _optimistic,
     )
 
@@ -163,12 +222,12 @@ def test_bnb_accountant_get_epsilon_evr_uses_base_delta_estimator(monkeypatch) -
 
     monkeypatch.setattr(
         bnb_accountant_mod,
-        "estimate_balls_in_bins_epsilon_monte_carlo",
+        "estimate_balls_in_bins_epsilon_reduced_mixture",
         _evr,
     )
     monkeypatch.setattr(
         bnb_accountant_mod,
-        "estimate_balls_in_bins_epsilon_monte_carlo_optimistic",
+        "estimate_balls_in_bins_epsilon_reduced_mixture_optimistic",
         _fail_optimistic,
     )
 
@@ -206,20 +265,19 @@ def test_bnb_accountant_get_epsilon_direct_overrides_apply_together(monkeypatch)
         assert kwargs["seed"] == 7
         assert kwargs["chunk_size"] == 99
         assert kwargs["num_workers"] == 3
-        assert kwargs["backend"] == "cpu"
-        assert kwargs["device"] == "cpu"
-        assert kwargs["distributed_mode"] == "chunk_shard"
-        assert kwargs["distributed_dp_runtime"] is True
+        assert kwargs["bands"] == 1
+        assert kwargs["cycle_length"] == 1
+        assert tuple(kwargs["c_matrix"].shape) == (4, 4)
         return 3.456
 
     monkeypatch.setattr(
         bnb_accountant_mod,
-        "estimate_balls_in_bins_epsilon_monte_carlo",
+        "estimate_balls_in_bins_epsilon_reduced_mixture",
         _fail_evr,
     )
     monkeypatch.setattr(
         bnb_accountant_mod,
-        "estimate_balls_in_bins_epsilon_monte_carlo_optimistic",
+        "estimate_balls_in_bins_epsilon_reduced_mixture_optimistic",
         _optimistic,
     )
 

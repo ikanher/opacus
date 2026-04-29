@@ -925,6 +925,220 @@ def build_b_min_sep_gaussian_mixture(
     return GaussianMixture(modes=modes, probs=probs)
 
 
+def _build_b_min_sep_gaussian_mixture_pair(
+    *,
+    c_matrix: torch.Tensor,
+    bands: int | None = None,
+    cycle_length: int | None = None,
+    reduce_dimensionality: bool = False,
+) -> tuple[GaussianMixture, GaussianMixture]:
+    up_gm = build_b_min_sep_gaussian_mixture(
+        c_matrix=c_matrix,
+        bands=bands,
+        cycle_length=cycle_length,
+        reduce_dimensionality=reduce_dimensionality,
+    )
+    zero_mode = torch.zeros(
+        1,
+        up_gm.modes.shape[1],
+        dtype=up_gm.modes.dtype,
+        device=up_gm.modes.device,
+    )
+    lo_gm = GaussianMixture(
+        modes=zero_mode,
+        probs=torch.ones(1, dtype=up_gm.modes.dtype, device=up_gm.modes.device),
+    )
+    return up_gm, lo_gm
+
+
+def _build_balls_in_bins_llr_chunks_via_gaussian_mixtures(
+    *,
+    c_matrix: torch.Tensor,
+    bands: int | None = None,
+    cycle_length: int | None = None,
+    sigma: float,
+    num_samples: int,
+    seed: int = 0,
+    positive_sample: bool = True,
+    chunk_size: int | None = None,
+    num_workers: int = 0,
+    reduce_dimensionality: bool = True,
+) -> list[torch.Tensor]:
+    """
+    Compute balls-in-bins LLR chunks through the reduced Gaussian-mixture view.
+
+    This is the canonical fast path for production balls-in-bins accounting.
+    It keeps the same cycle-offset mixture law, but evaluates privacy loss in
+    the reduced mixture representation instead of the legacy full-horizon
+    sampler.
+    """
+    up_gm, lo_gm = _build_b_min_sep_gaussian_mixture_pair(
+        c_matrix=c_matrix,
+        bands=bands,
+        cycle_length=cycle_length,
+        reduce_dimensionality=reduce_dimensionality,
+    )
+    sample_gm = up_gm if positive_sample else lo_gm
+    reference_gm = lo_gm if positive_sample else up_gm
+    return compute_llr_sample_chunks(
+        up_gm=sample_gm,
+        lo_gm=reference_gm,
+        sigma=float(sigma),
+        num_samples=int(num_samples),
+        seed=int(seed),
+        chunk_size=chunk_size,
+        num_workers=int(num_workers),
+    )
+
+
+def _estimate_balls_in_bins_epsilon_from_c_matrix(
+    *,
+    c_matrix: torch.Tensor,
+    bands: int | None = None,
+    cycle_length: int | None = None,
+    noise_multiplier: float,
+    target_delta: float,
+    num_samples: int,
+    seed: int = 0,
+    tolerance: float = 1e-4,
+    max_iterations: int = 200,
+    chunk_size: int | None = None,
+    num_workers: int = 0,
+) -> float:
+    """
+    Estimate balls-in-bins epsilon from the canonical reduced Gaussian mixture.
+
+    Production balls-in-bins accounting uses the cycle-offset Gaussian-mixture
+    representation induced by the accountant-side ``c_matrix`` and always
+    enables dimensionality reduction before sampling.
+    """
+    if noise_multiplier <= 0.0:
+        raise ValueError("noise_multiplier must be > 0")
+
+    if target_delta < 0.0 or target_delta >= 1.0:
+        raise ValueError("target_delta must be in [0, 1)")
+
+    if num_samples <= 0:
+        raise ValueError("num_samples must be > 0")
+
+    if seed < 0:
+        raise ValueError("seed must be >= 0")
+
+    up_gm, lo_gm = _build_b_min_sep_gaussian_mixture_pair(
+        c_matrix=c_matrix,
+        bands=bands,
+        cycle_length=cycle_length,
+        reduce_dimensionality=True,
+    )
+    positive_chunks = compute_llr_sample_chunks(
+        up_gm=up_gm,
+        lo_gm=lo_gm,
+        sigma=float(noise_multiplier),
+        num_samples=int(num_samples),
+        seed=int(seed),
+        chunk_size=chunk_size,
+        num_workers=int(num_workers),
+    )
+    negative_chunks = compute_llr_sample_chunks(
+        up_gm=lo_gm,
+        lo_gm=up_gm,
+        sigma=float(noise_multiplier),
+        num_samples=int(num_samples),
+        seed=int(seed) + 1,
+        chunk_size=chunk_size,
+        num_workers=int(num_workers),
+    )
+
+    positive_epsilon = estimate_epsilon_from_llr_chunks(
+        target_delta=float(target_delta),
+        llr_chunks=[torch.as_tensor(chunk, dtype=torch.float64) for chunk in positive_chunks],
+        tolerance=float(tolerance),
+        max_iterations=int(max_iterations),
+    )
+    negative_epsilon = estimate_epsilon_from_llr_chunks(
+        target_delta=float(target_delta),
+        llr_chunks=[torch.as_tensor(chunk, dtype=torch.float64) for chunk in negative_chunks],
+        tolerance=float(tolerance),
+        max_iterations=int(max_iterations),
+    )
+    return float(max(float(positive_epsilon), float(negative_epsilon)))
+
+
+def estimate_balls_in_bins_epsilon_reduced_mixture(
+    *,
+    c_matrix: torch.Tensor,
+    bands: int | None = None,
+    cycle_length: int | None = None,
+    noise_multiplier: float,
+    target_delta: float,
+    num_samples: int,
+    seed: int = 0,
+    tolerance: float = 1e-4,
+    max_iterations: int = 200,
+    chunk_size: int | None = None,
+    num_workers: int = 0,
+) -> float:
+    """
+    Estimate balls-in-bins epsilon with EVR-style base-delta inversion.
+
+    This is the production reduced-mixture route for the guarded balls-in-bins
+    certification mode. It keeps the existing base-delta semantics while
+    deleting the full-horizon sampler from the execution path.
+    """
+    base_delta = get_bnb_base_delta(
+        num_samples=int(num_samples),
+        target_delta=float(target_delta),
+    )
+    return _estimate_balls_in_bins_epsilon_from_c_matrix(
+        c_matrix=c_matrix,
+        bands=bands,
+        cycle_length=cycle_length,
+        noise_multiplier=float(noise_multiplier),
+        target_delta=float(base_delta),
+        num_samples=int(num_samples),
+        seed=int(seed),
+        tolerance=float(tolerance),
+        max_iterations=int(max_iterations),
+        chunk_size=chunk_size,
+        num_workers=int(num_workers),
+    )
+
+
+def estimate_balls_in_bins_epsilon_reduced_mixture_optimistic(
+    *,
+    c_matrix: torch.Tensor,
+    bands: int | None = None,
+    cycle_length: int | None = None,
+    noise_multiplier: float,
+    target_delta: float,
+    num_samples: int,
+    seed: int = 0,
+    tolerance: float = 1e-4,
+    max_iterations: int = 200,
+    chunk_size: int | None = None,
+    num_workers: int = 0,
+) -> float:
+    """
+    Estimate balls-in-bins epsilon by direct inversion on the reduced mixture.
+
+    This is the optimistic point-estimate surface for production
+    ``sampling_mode='balls_in_bins'`` accounting.
+    """
+    return _estimate_balls_in_bins_epsilon_from_c_matrix(
+        c_matrix=c_matrix,
+        bands=bands,
+        cycle_length=cycle_length,
+        noise_multiplier=float(noise_multiplier),
+        target_delta=float(target_delta),
+        num_samples=int(num_samples),
+        seed=int(seed),
+        tolerance=float(tolerance),
+        max_iterations=int(max_iterations),
+        chunk_size=chunk_size,
+        num_workers=int(num_workers),
+    )
+
+
 def _mixture_logpdf(points: torch.Tensor, gm: GaussianMixture, sigma: float) -> torch.Tensor:
     if sigma <= 0.0:
         raise ValueError("sigma must be > 0")
@@ -936,6 +1150,11 @@ def _mixture_logpdf(points: torch.Tensor, gm: GaussianMixture, sigma: float) -> 
         raise ValueError("points dimension must match mixture modes")
 
     sigma_sq = sigma * sigma
+
+    if gm.modes.shape[0] == 1:
+        diff = points - gm.modes[0].unsqueeze(0)
+        sq_dist = torch.sum(diff * diff, dim=1)
+        return -0.5 * sq_dist / sigma_sq
 
     # Compute squared distances without materializing [n, k, d]:
     # ||x - m||^2 = ||x||^2 + ||m||^2 - 2 x m^T
@@ -965,6 +1184,17 @@ def generate_mixture_samples(
 
     device = gm.modes.device
     dtype = gm.modes.dtype
+    if gm.modes.shape[0] == 1:
+        noise = torch.randn(
+            num_samples,
+            gm.modes.shape[1],
+            generator=generator,
+            device=device,
+            dtype=dtype,
+        )
+        component_ids = torch.zeros(num_samples, dtype=torch.long, device=device)
+        return component_ids, gm.modes[0].unsqueeze(0) + sigma * noise
+
     component_ids = torch.multinomial(
         gm.probs.to(device=device, dtype=torch.float64),
         num_samples=num_samples,
@@ -1769,90 +1999,29 @@ def estimate_balls_in_bins_epsilon_monte_carlo(
     distributed_dp_runtime: bool = False,
     sigma_reuse_state: BallsInBinsSigmaReuseState | None = None,
 ) -> float:
+    del backend, device, distributed_mode, distributed_dp_runtime, sigma_reuse_state
     with _timed(
         "estimate_balls_in_bins_epsilon_monte_carlo "
         f"sigma={float(noise_multiplier):.6g} delta={float(target_delta):.6g} "
         f"num_samples={int(num_samples)}"
     ):
-        if target_delta < 0.0 or target_delta >= 1.0:
-            raise ValueError("target_delta must be in [0, 1)")
-        with _timed("get_bnb_base_delta"):
-            base_delta = get_bnb_base_delta(
-                num_samples=int(num_samples), target_delta=float(target_delta)
-            )
-        _debug_timing(f"base_delta={float(base_delta):.6g}")
-        with _timed("sample_positive_llr_chunks"):
-            positive_chunks = sample_balls_in_bins_llr_chunks(
-                coeffs=coeffs,
-                cycle_length=int(cycle_length),
-                horizon=int(horizon),
-                sigma=float(noise_multiplier),
-                num_samples=int(num_samples),
-                seed=int(seed),
-                chunk_size=chunk_size,
-                num_workers=int(num_workers),
-                positive_sample=True,
-                backend=backend,
-                device=device,
-                distributed_mode=distributed_mode,
-                distributed_dp_runtime=distributed_dp_runtime,
-                sigma_reuse_state=sigma_reuse_state,
-            )
-        with _timed("sample_negative_llr_chunks"):
-            negative_chunks = sample_balls_in_bins_llr_chunks(
-                coeffs=coeffs,
-                cycle_length=int(cycle_length),
-                horizon=int(horizon),
-                sigma=float(noise_multiplier),
-                num_samples=int(num_samples),
-                seed=int(seed) + 1,
-                chunk_size=chunk_size,
-                num_workers=int(num_workers),
-                positive_sample=False,
-                backend=backend,
-                device=device,
-                distributed_mode=distributed_mode,
-                distributed_dp_runtime=distributed_dp_runtime,
-                sigma_reuse_state=sigma_reuse_state,
-            )
-    if distributed_mode == "chunk_shard" and dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
-        result = _make_bnb_broadcast_result_tensor(
-            float("nan"),
-            backend=backend,
-            device=device,
+        c_matrix = build_lower_toeplitz_c_matrix_from_coeffs(
+            coeffs=coeffs,
+            horizon=int(horizon),
         )
-        dist.broadcast(result, src=0)
-        return float(result.item())
-    with _timed("invert_positive_epsilon"):
-        positive_epsilon = estimate_epsilon_from_llr_chunks(
-            target_delta=float(base_delta),
-            llr_chunks=[torch.as_tensor(chunk, dtype=torch.float64) for chunk in positive_chunks],
+        return estimate_balls_in_bins_epsilon_reduced_mixture(
+            c_matrix=c_matrix,
+            bands=int(cycle_length),
+            cycle_length=int(cycle_length),
+            noise_multiplier=float(noise_multiplier),
+            target_delta=float(target_delta),
+            num_samples=int(num_samples),
+            seed=int(seed),
             tolerance=float(tolerance),
             max_iterations=int(max_iterations),
+            chunk_size=chunk_size,
+            num_workers=int(num_workers),
         )
-    with _timed("invert_negative_epsilon"):
-        negative_epsilon = estimate_epsilon_from_llr_chunks(
-            target_delta=float(base_delta),
-            llr_chunks=[torch.as_tensor(chunk, dtype=torch.float64) for chunk in negative_chunks],
-            tolerance=float(tolerance),
-            max_iterations=int(max_iterations),
-        )
-    epsilon = float(max(float(positive_epsilon), float(negative_epsilon)))
-    _debug_timing(
-        f"epsilon_forward={float(positive_epsilon):.6g} "
-        f"epsilon_reverse={float(negative_epsilon):.6g} "
-        f"epsilon={epsilon:.6g}"
-    )
-    if distributed_mode == "chunk_shard" and dist.is_available() and dist.is_initialized():
-        result = _make_bnb_broadcast_result_tensor(
-            epsilon,
-            backend=backend,
-            device=device,
-        )
-        dist.broadcast(result, src=0)
-        return float(result.item())
-
-    return epsilon
 
 
 def estimate_balls_in_bins_epsilon_monte_carlo_optimistic(
@@ -1880,92 +2049,29 @@ def estimate_balls_in_bins_epsilon_monte_carlo_optimistic(
     This is the optimistic point-estimate surface: it inverts `delta(epsilon)`
     directly at the target `delta` without the EVR/base-delta feasibility split.
     """
+    del backend, device, distributed_mode, distributed_dp_runtime, sigma_reuse_state
     with _timed(
         "estimate_balls_in_bins_epsilon_monte_carlo_optimistic "
         f"sigma={float(noise_multiplier):.6g} delta={float(target_delta):.6g} "
         f"num_samples={int(num_samples)}"
     ):
-        if target_delta < 0.0 or target_delta >= 1.0:
-            raise ValueError("target_delta must be in [0, 1)")
-
-        with _timed("sample_positive_llr_chunks"):
-            positive_chunks = sample_balls_in_bins_llr_chunks(
-                coeffs=coeffs,
-                cycle_length=int(cycle_length),
-                horizon=int(horizon),
-                sigma=float(noise_multiplier),
-                num_samples=int(num_samples),
-                seed=int(seed),
-                chunk_size=chunk_size,
-                num_workers=int(num_workers),
-                positive_sample=True,
-                backend=backend,
-                device=device,
-                distributed_mode=distributed_mode,
-                distributed_dp_runtime=distributed_dp_runtime,
-                sigma_reuse_state=sigma_reuse_state,
-            )
-        with _timed("sample_negative_llr_chunks"):
-            negative_chunks = sample_balls_in_bins_llr_chunks(
-                coeffs=coeffs,
-                cycle_length=int(cycle_length),
-                horizon=int(horizon),
-                sigma=float(noise_multiplier),
-                num_samples=int(num_samples),
-                seed=int(seed) + 1,
-                chunk_size=chunk_size,
-                num_workers=int(num_workers),
-                positive_sample=False,
-                backend=backend,
-                device=device,
-                distributed_mode=distributed_mode,
-                distributed_dp_runtime=distributed_dp_runtime,
-                sigma_reuse_state=sigma_reuse_state,
-            )
-    if (
-        distributed_mode == "chunk_shard"
-        and dist.is_available()
-        and dist.is_initialized()
-        and dist.get_rank() != 0
-    ):
-        result = _make_bnb_broadcast_result_tensor(
-            float("nan"),
-            backend=backend,
-            device=device,
+        c_matrix = build_lower_toeplitz_c_matrix_from_coeffs(
+            coeffs=coeffs,
+            horizon=int(horizon),
         )
-        dist.broadcast(result, src=0)
-        return float(result.item())
-
-    with _timed("invert_positive_epsilon"):
-        positive_epsilon = estimate_epsilon_from_llr_chunks(
+        return estimate_balls_in_bins_epsilon_reduced_mixture_optimistic(
+            c_matrix=c_matrix,
+            bands=int(cycle_length),
+            cycle_length=int(cycle_length),
+            noise_multiplier=float(noise_multiplier),
             target_delta=float(target_delta),
-            llr_chunks=[torch.as_tensor(chunk, dtype=torch.float64) for chunk in positive_chunks],
+            num_samples=int(num_samples),
+            seed=int(seed),
             tolerance=float(tolerance),
             max_iterations=int(max_iterations),
+            chunk_size=chunk_size,
+            num_workers=int(num_workers),
         )
-    with _timed("invert_negative_epsilon"):
-        negative_epsilon = estimate_epsilon_from_llr_chunks(
-            target_delta=float(target_delta),
-            llr_chunks=[torch.as_tensor(chunk, dtype=torch.float64) for chunk in negative_chunks],
-            tolerance=float(tolerance),
-            max_iterations=int(max_iterations),
-        )
-    epsilon = float(max(float(positive_epsilon), float(negative_epsilon)))
-    _debug_timing(
-        f"epsilon_forward={float(positive_epsilon):.6g} "
-        f"epsilon_reverse={float(negative_epsilon):.6g} "
-        f"epsilon={epsilon:.6g}"
-    )
-    if distributed_mode == "chunk_shard" and dist.is_available() and dist.is_initialized():
-        result = _make_bnb_broadcast_result_tensor(
-            epsilon,
-            backend=backend,
-            device=device,
-        )
-        dist.broadcast(result, src=0)
-        return float(result.item())
-
-    return epsilon
 
 
 def _compute_llr_samples_chunk(
@@ -2083,23 +2189,12 @@ def sample_b_min_sep_llr(
     if sigma <= 0.0:
         raise ValueError("sigma must be > 0")
 
-    up_gm = build_b_min_sep_gaussian_mixture(
+    up_gm, lo_gm = _build_b_min_sep_gaussian_mixture_pair(
         c_matrix=c_matrix,
         bands=bands,
         cycle_length=cycle_length,
         reduce_dimensionality=reduce_dimensionality,
     )
-    zero_mode = torch.zeros(
-        1,
-        up_gm.modes.shape[1],
-        dtype=up_gm.modes.dtype,
-        device=up_gm.modes.device,
-    )
-    lo_gm = GaussianMixture(
-        modes=zero_mode,
-        probs=torch.ones(1, dtype=up_gm.modes.dtype, device=up_gm.modes.device),
-    )
-
     chunks = compute_llr_sample_chunks(
         up_gm=up_gm,
         lo_gm=lo_gm,
@@ -2529,21 +2624,11 @@ def estimate_b_min_sep_epsilon_monte_carlo(
     if seed < 0:
         raise ValueError("seed must be >= 0")
 
-    up_gm = build_b_min_sep_gaussian_mixture(
+    up_gm, lo_gm = _build_b_min_sep_gaussian_mixture_pair(
         c_matrix=c_matrix,
         bands=bands,
         cycle_length=cycle_length,
         reduce_dimensionality=reduce_dimensionality,
-    )
-    zero_mode = torch.zeros(
-        1,
-        up_gm.modes.shape[1],
-        dtype=up_gm.modes.dtype,
-        device=up_gm.modes.device,
-    )
-    lo_gm = GaussianMixture(
-        modes=zero_mode,
-        probs=torch.ones(1, dtype=up_gm.modes.dtype, device=up_gm.modes.device),
     )
     llr_chunks = compute_llr_sample_chunks(
         up_gm=up_gm,
@@ -2597,21 +2682,11 @@ def estimate_b_min_sep_delta_monte_carlo(
     if seed < 0:
         raise ValueError("seed must be >= 0")
 
-    up_gm = build_b_min_sep_gaussian_mixture(
+    up_gm, lo_gm = _build_b_min_sep_gaussian_mixture_pair(
         c_matrix=c_matrix,
         bands=bands,
         cycle_length=cycle_length,
         reduce_dimensionality=reduce_dimensionality,
-    )
-    zero_mode = torch.zeros(
-        1,
-        up_gm.modes.shape[1],
-        dtype=up_gm.modes.dtype,
-        device=up_gm.modes.device,
-    )
-    lo_gm = GaussianMixture(
-        modes=zero_mode,
-        probs=torch.ones(1, dtype=up_gm.modes.dtype, device=up_gm.modes.device),
     )
     llr_chunks = compute_llr_sample_chunks(
         up_gm=up_gm,

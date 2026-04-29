@@ -333,7 +333,7 @@ def test_make_private_with_epsilon_rejects_unsupported_blt_coefficient_regime() 
 
     with pytest.raises(
         ValueError,
-        match="BLT target-epsilon calibration is only supported for the BLT fixed-batch or supported amplified BNB accountant contracts",
+        match="BLT target-epsilon calibration is only supported for the BLT fixed-batch or supported amplified BNB/random_allocation accountant contracts",
     ):
         pe.make_private_with_epsilon(
             module=model,
@@ -381,7 +381,7 @@ def test_make_private_supports_blt_balls_in_bins_bnb_accountant(monkeypatch) -> 
 
     monkeypatch.setattr(
         bnb_accountant_mod,
-        "estimate_balls_in_bins_epsilon_monte_carlo_optimistic",
+        "estimate_balls_in_bins_epsilon_reduced_mixture_optimistic",
         _fake_estimator,
     )
 
@@ -420,11 +420,11 @@ def test_make_private_supports_blt_balls_in_bins_bnb_accountant(monkeypatch) -> 
     assert state["bnb_cycle_length"] == 8
     assert "bnb_c_matrix" in state
 
-    _run_pre_step(private_model, dp_optimizer, next(iter(private_loader)))
+    pe.accountant.step(noise_multiplier=0.0, sample_rate=1.0)
     eps = pe.get_epsilon(1e-5, bnb_calibration_mode="optimistic", bnb_num_samples=32)
     assert eps == pytest.approx(1.25)
     assert captured["cycle_length"] == 8
-    assert captured["horizon"] == state["bnb_c_matrix_contract"]["horizon"]
+    assert int(captured["c_matrix"].shape[1]) == state["bnb_c_matrix_contract"]["horizon"]
 
 
 def test_make_private_rejects_blt_balls_in_bins_without_accountant_contract_inputs() -> None:
@@ -454,6 +454,43 @@ def test_make_private_rejects_blt_balls_in_bins_without_accountant_contract_inpu
                 },
             ),
         )
+
+
+def test_blt_balls_in_bins_telemetry_reports_reduced_mixture_backend() -> None:
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    pe = PrivacyEngine()
+    pe.make_private(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        noise_multiplier=0.0,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 8},
+        ),
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="blt",
+            accounting_mode="bnb_accountant",
+            mechanism_state={
+                "theta": [0.8],
+                "theta_hat": [0.6],
+                "z_std": 0.03,
+                "blt_min_separation": 4,
+                "blt_horizon": 12,
+            },
+        ),
+    )
+
+    telemetry = pe.get_accounting_telemetry()
+    assert telemetry["bnb_accounting_backend"] == "reduced_gaussian_mixture"
+    kwargs = telemetry["bnb_accounting_kwargs"]
+    assert kwargs["bnb_reduce_dimensionality"] is True
+    assert "bnb_backend" not in kwargs
+    assert "bnb_device" not in kwargs
+    assert "bnb_distributed_mode" not in kwargs
 
 
 def test_blt_pre_step_tracks_runtime_only_events_without_standard_history() -> None:
@@ -678,7 +715,7 @@ def test_make_private_with_epsilon_rejects_poisson_blt() -> None:
 
     with pytest.raises(
         ValueError,
-        match="BLT target-epsilon calibration is only supported for the BLT fixed-batch or supported amplified BNB accountant contracts",
+        match="BLT target-epsilon calibration is only supported for the BLT fixed-batch or supported amplified BNB/random_allocation accountant contracts",
     ):
         pe.make_private_with_epsilon(
             module=model,
@@ -1004,7 +1041,7 @@ def test_distributed_blt_balls_in_bins_bnb_reports_distributed_runtime(monkeypat
     _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
     monkeypatch.setattr(
         bnb_accountant_mod,
-        "estimate_balls_in_bins_epsilon_monte_carlo_optimistic",
+        "estimate_balls_in_bins_epsilon_reduced_mixture_optimistic",
         _fake_estimator,
     )
 
@@ -1042,8 +1079,10 @@ def test_distributed_blt_balls_in_bins_bnb_reports_distributed_runtime(monkeypat
     assert state["_blt_distributed_policy"] == "ddp_flat_only"
     assert state["_blt_distributed_runtime"] is True
 
-    _run_pre_step(private_model, dp_optimizer, next(iter(private_loader)))
+    pe.accountant.step(noise_multiplier=0.0, sample_rate=1.0)
     eps = pe.get_epsilon(1e-5, bnb_calibration_mode="optimistic", bnb_num_samples=32)
     assert eps == pytest.approx(1.25)
-    assert captured["distributed_dp_runtime"] is True
-    assert captured["distributed_mode"] == "chunk_shard"
+    assert captured["cycle_length"] == 8
+    assert int(captured["c_matrix"].shape[1]) == state["bnb_c_matrix_contract"]["horizon"]
+    assert "distributed_dp_runtime" not in captured
+    assert "distributed_mode" not in captured
