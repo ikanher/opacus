@@ -27,10 +27,10 @@ Experiment-surface note:
 
 import math
 import warnings
+from functools import lru_cache
 from typing import Iterable
 
 import numpy as np
-from scipy import optimize as scipy_optimize
 import torch
 
 from opacus.accountants.analysis.bisr import generate_bisr_coeffs_from_sgd_workload
@@ -314,8 +314,8 @@ def compute_bandinvmf_objective_from_inv_coeffs(
 
     The objective is the product of:
     - the mean squared workload error induced by the inverse-band noising path,
-    - and the separated-participation sensitivity upper bound of the implied
-      strategy Toeplitz factor.
+    - and the squared separated-participation sensitivity upper bound of the
+      implied strategy Toeplitz factor.
 
     For the sensitivity term, the implied strategy coefficients are mapped to
     their decreasing nonnegative envelope before applying the closed-form
@@ -360,100 +360,12 @@ def compute_bandinvmf_objective_from_inv_coeffs(
     return float(mean_error * (sensitivity**2))
 
 
-def _objective_value_or_inf(
-    *,
-    candidate: np.ndarray,
-    steps: int,
-    max_participations: int,
-    min_separation: int,
-    momentum: float,
-    weight_decay: float,
-) -> float:
-    try:
-        obj = compute_bandinvmf_objective_from_inv_coeffs(
-            inv_coeffs=candidate.tolist(),
-            steps=steps,
-            max_participations=max_participations,
-            min_separation=min_separation,
-            momentum=momentum,
-            weight_decay=weight_decay,
-        )
-    except (FloatingPointError, OverflowError, ValueError):
-        return math.inf
-
-    if not math.isfinite(obj):
-        return math.inf
-
-    return float(obj)
+def _cache_float(value: float) -> float:
+    normalized = float(value)
+    return 0.0 if normalized == 0.0 else normalized
 
 
-def _powell_refine_candidate(
-    *,
-    candidate: np.ndarray,
-    steps: int,
-    max_participations: int,
-    min_separation: int,
-    momentum: float,
-    weight_decay: float,
-    max_iter: int,
-) -> tuple[np.ndarray, float] | None:
-    if candidate.size <= 1:
-        obj = _objective_value_or_inf(
-            candidate=candidate,
-            steps=steps,
-            max_participations=max_participations,
-            min_separation=min_separation,
-            momentum=momentum,
-            weight_decay=weight_decay,
-        )
-        if math.isfinite(obj):
-            return candidate.copy(), float(obj)
-        return None
-
-    x0 = np.asarray(candidate[1:], dtype=np.float64)
-
-    def _wrapped(v: np.ndarray) -> float:
-        full = np.concatenate(([1.0], np.asarray(v, dtype=np.float64)))
-        obj = _objective_value_or_inf(
-            candidate=full,
-            steps=steps,
-            max_participations=max_participations,
-            min_separation=min_separation,
-            momentum=momentum,
-            weight_decay=weight_decay,
-        )
-        return 1e300 if not math.isfinite(obj) else float(obj)
-
-    try:
-        result = scipy_optimize.minimize(
-            _wrapped,
-            x0,
-            method="Powell",
-            options={
-                "maxiter": int(max_iter),
-                "xtol": 1e-8,
-                "ftol": 1e-12,
-            },
-        )
-    except Exception:
-        return None
-
-    refined = np.concatenate(([1.0], np.asarray(result.x, dtype=np.float64)))
-    refined_obj = _objective_value_or_inf(
-        candidate=refined,
-        steps=steps,
-        max_participations=max_participations,
-        min_separation=min_separation,
-        momentum=momentum,
-        weight_decay=weight_decay,
-    )
-    if not np.all(np.isfinite(refined)) or not math.isfinite(refined_obj):
-        return None
-
-    return refined, float(refined_obj)
-
-
-def optimize_bandinvmf_inv_coeffs_for_sgd_workload(
+def _optimize_bandinvmf_inv_coeffs_for_sgd_workload_uncached(
     *,
     bands: int,
     momentum: float,
@@ -461,7 +373,7 @@ def optimize_bandinvmf_inv_coeffs_for_sgd_workload(
     steps: int,
     max_participations: int,
     min_separation: int,
-    optimizer_steps: int = 20,
+    optimizer_steps: int = 1000,
 ) -> list[float]:
     """
     Optimize BandInvMF inverse-band coefficients for an SGD workload.
@@ -516,6 +428,12 @@ def optimize_bandinvmf_inv_coeffs_for_sgd_workload(
         _workload_coeffs(steps=steps, momentum=beta, weight_decay=alpha),
         dtype=dtype,
     )
+    workload_design = torch.zeros((int(steps), int(bands)), dtype=dtype)
+    for lag in range(int(bands)):
+        if lag >= int(steps):
+            break
+        workload_design[lag:, lag] = workload[: int(steps) - lag]
+
     k_eff = min(max_participations, (steps - 1) // min_separation + 1)
     best_opt = init.copy()
     best_obj = init_obj
@@ -528,25 +446,20 @@ def optimize_bandinvmf_inv_coeffs_for_sgd_workload(
             )
         )
 
-        b_vals: list[torch.Tensor] = []
-        for t in range(int(steps)):
-            acc = torch.zeros((), dtype=v.dtype, device=v.device)
-            max_lag = min(t, inv.numel() - 1)
-            for lag in range(max_lag + 1):
-                acc = acc + inv[lag] * workload[t - lag]
-            b_vals.append(acc)
-
-        b_vec = torch.stack(b_vals)
+        # b_t = sum_lag inv_lag workload_{t-lag}.  The design matrix is fixed
+        # for the workload, so this avoids a scalar autograd node per lag.
+        b_vec = workload_design.to(device=v.device) @ inv
         mean_error = torch.cumsum(b_vec * b_vec, dim=0).mean()
 
         strategy_vals: list[torch.Tensor] = [
             torch.ones((), dtype=v.dtype, device=v.device)
         ]
         for i in range(1, int(steps)):
-            acc = torch.zeros((), dtype=v.dtype, device=v.device)
             max_lag = min(i, inv.numel() - 1)
-            for lag in range(1, max_lag + 1):
-                acc = acc + inv[lag] * strategy_vals[i - lag]
+            previous = torch.stack(
+                [strategy_vals[i - lag] for lag in range(1, max_lag + 1)]
+            )
+            acc = torch.dot(inv[1 : max_lag + 1], previous)
             strategy_vals.append(-acc / inv[0])
 
         strategy = torch.stack(strategy_vals)
@@ -556,14 +469,20 @@ def optimize_bandinvmf_inv_coeffs_for_sgd_workload(
             dims=[0],
         )
 
-        total_sq = torch.zeros((), dtype=v.dtype, device=v.device)
-        for i in range(int(steps)):
-            j_max = min(k_eff - 1, i // min_separation)
-            row_sum = torch.zeros((), dtype=v.dtype, device=v.device)
-            for j in range(j_max + 1):
-                row_sum = row_sum + strategy_envelope[i - j * min_separation]
-
-            total_sq = total_sq + row_sum * row_sum
+        shifted_rows: list[torch.Tensor] = []
+        for j in range(int(k_eff)):
+            shift = int(j) * int(min_separation)
+            if shift >= int(steps):
+                break
+            if shift == 0:
+                shifted_rows.append(strategy_envelope)
+            else:
+                padding = torch.zeros(shift, dtype=v.dtype, device=v.device)
+                shifted_rows.append(
+                    torch.cat((padding, strategy_envelope[: int(steps) - shift]))
+                )
+        row_sums = torch.stack(shifted_rows).sum(dim=0)
+        total_sq = torch.sum(row_sums * row_sums)
 
         loss = mean_error * total_sq
         if not torch.isfinite(loss):
@@ -628,21 +547,6 @@ def optimize_bandinvmf_inv_coeffs_for_sgd_workload(
         current_opt = opt
         current_obj = float(opt_obj)
 
-    refined = _powell_refine_candidate(
-        candidate=current_opt,
-        steps=steps,
-        max_participations=max_participations,
-        min_separation=min_separation,
-        momentum=beta,
-        weight_decay=alpha,
-        max_iter=max(200, 50 * (bands - 1)),
-    )
-    if refined is not None:
-        refined_opt, refined_obj = refined
-        if refined_obj < current_obj - 1e-12:
-            current_opt = refined_opt
-            current_obj = float(refined_obj)
-
     if current_obj >= init_obj - 1e-12:
         if not np.all(np.isfinite(opt)) or not math.isfinite(opt_obj):
             warnings.warn(
@@ -661,14 +565,72 @@ def optimize_bandinvmf_inv_coeffs_for_sgd_workload(
     if not np.all(np.isfinite(opt)) or not math.isfinite(opt_obj):
         warnings.warn(
             "BandInvMF optimization produced a non-finite final candidate; "
-            "returning the best finite refined candidate",
+            "returning the best finite L-BFGS candidate",
             UserWarning,
         )
     elif current_obj < opt_obj - 1e-12:
         warnings.warn(
-            "BandInvMF optimization improved after deterministic Powell refinement; "
-            "returning the refined finite candidate",
+            "BandInvMF optimization found a better finite candidate during L-BFGS "
+            "line search; returning that candidate",
             UserWarning,
         )
 
     return [float(x) for x in current_opt]
+
+
+@lru_cache(maxsize=128)
+def _optimize_bandinvmf_inv_coeffs_for_sgd_workload_cached(
+    *,
+    bands: int,
+    momentum: float,
+    weight_decay: float,
+    steps: int,
+    max_participations: int,
+    min_separation: int,
+    optimizer_steps: int,
+) -> tuple[float, ...]:
+    return tuple(
+        _optimize_bandinvmf_inv_coeffs_for_sgd_workload_uncached(
+            bands=int(bands),
+            momentum=float(momentum),
+            weight_decay=float(weight_decay),
+            steps=int(steps),
+            max_participations=int(max_participations),
+            min_separation=int(min_separation),
+            optimizer_steps=int(optimizer_steps),
+        )
+    )
+
+
+def clear_bandinvmf_optimization_cache() -> None:
+    """Clear deterministic BandInvMF coefficient-optimization cache entries."""
+    _optimize_bandinvmf_inv_coeffs_for_sgd_workload_cached.cache_clear()
+
+
+def optimize_bandinvmf_inv_coeffs_for_sgd_workload(
+    *,
+    bands: int,
+    momentum: float,
+    weight_decay: float,
+    steps: int,
+    max_participations: int,
+    min_separation: int,
+    optimizer_steps: int = 1000,
+) -> list[float]:
+    """
+    Optimize BandInvMF inverse-band coefficients for an SGD workload.
+
+    The public runtime entrypoint is cached because the coefficient line is
+    deterministic and BO trials often change only the learning rate, which does
+    not alter the SGD workload matrix.
+    """
+    coeffs = _optimize_bandinvmf_inv_coeffs_for_sgd_workload_cached(
+        bands=int(bands),
+        momentum=_cache_float(momentum),
+        weight_decay=_cache_float(weight_decay),
+        steps=int(steps),
+        max_participations=int(max_participations),
+        min_separation=int(min_separation),
+        optimizer_steps=int(optimizer_steps),
+    )
+    return [float(x) for x in coeffs]

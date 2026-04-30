@@ -265,7 +265,7 @@ def _resolve_bandinvmf_runtime_contract_inputs(
             "bsr_iterations_number",
             metadata.get(
                 "bsr_iterations_number",
-                mechanism_state.get("bsr_iterations_number", 20),
+                mechanism_state.get("bsr_iterations_number", 1000),
             ),
         )
     )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import math
 
 import pytest
@@ -20,6 +21,13 @@ from opacus.accountants.analysis.bisr import (
     generate_bisr_coeffs_from_sgd_workload,
 )
 from opacus.accountants.analysis.bsr import compute_bsr_mf_sensitivity_from_coeffs
+
+
+@pytest.fixture(autouse=True)
+def _clear_bandinvmf_cache_between_tests():
+    _bandinvmf_module.clear_bandinvmf_optimization_cache()
+    yield
+    _bandinvmf_module.clear_bandinvmf_optimization_cache()
 
 
 def test_bandinvmf_init_matches_analytic_bisr_coeffs() -> None:
@@ -128,7 +136,7 @@ def test_bandinvmf_optimization_handles_cifar_like_search_instability() -> None:
     assert math.isfinite(obj)
 
 
-def test_bandinvmf_optimization_improves_no_momentum_no_decay_cifar_like_row() -> None:
+def test_bandinvmf_optimization_improves_no_momentum_no_decay_fast_proxy_row() -> None:
     init = generate_bandinvmf_init_inv_coeffs_from_sgd_workload(
         bands=4,
         momentum=0.0,
@@ -136,31 +144,82 @@ def test_bandinvmf_optimization_improves_no_momentum_no_decay_cifar_like_row() -
     )
     init_obj = compute_bandinvmf_objective_from_inv_coeffs(
         inv_coeffs=init,
-        steps=980,
-        max_participations=10,
-        min_separation=98,
+        steps=64,
+        max_participations=2,
+        min_separation=6,
         momentum=0.0,
         weight_decay=0.0,
     )
     coeffs = optimize_bandinvmf_inv_coeffs_for_sgd_workload(
         bands=4,
-        steps=980,
-        max_participations=10,
-        min_separation=98,
+        steps=64,
+        max_participations=2,
+        min_separation=6,
         momentum=0.0,
         weight_decay=0.0,
         optimizer_steps=20,
     )
     obj = compute_bandinvmf_objective_from_inv_coeffs(
         inv_coeffs=coeffs,
-        steps=980,
-        max_participations=10,
-        min_separation=98,
+        steps=64,
+        max_participations=2,
+        min_separation=6,
         momentum=0.0,
         weight_decay=0.0,
     )
     assert obj < init_obj - 1e-6
     assert coeffs != pytest.approx(init, rel=0.0, abs=1e-9)
+
+
+def test_bandinvmf_optimization_uses_jax_style_default_and_has_no_powell_hook() -> None:
+    signature = inspect.signature(optimize_bandinvmf_inv_coeffs_for_sgd_workload)
+
+    assert signature.parameters["optimizer_steps"].default == 1000
+    assert "use_powell_refinement" not in signature.parameters
+    assert not hasattr(_bandinvmf_module, "_powell_refine_candidate")
+    assert not hasattr(_bandinvmf_module, "scipy_optimize")
+
+
+def test_bandinvmf_optimization_cache_reuses_result_and_returns_copy(monkeypatch) -> None:
+    _bandinvmf_module.clear_bandinvmf_optimization_cache()
+    calls = {"count": 0}
+
+    def _fake_uncached(**kwargs):
+        del kwargs
+        calls["count"] += 1
+        return [1.0, -0.25]
+
+    monkeypatch.setattr(
+        _bandinvmf_module,
+        "_optimize_bandinvmf_inv_coeffs_for_sgd_workload_uncached",
+        _fake_uncached,
+    )
+
+    try:
+        first = optimize_bandinvmf_inv_coeffs_for_sgd_workload(
+            bands=2,
+            steps=7,
+            max_participations=2,
+            min_separation=3,
+            momentum=0.0,
+            weight_decay=0.0,
+            optimizer_steps=1,
+        )
+        first[1] = -99.0
+        second = optimize_bandinvmf_inv_coeffs_for_sgd_workload(
+            bands=2,
+            steps=7,
+            max_participations=2,
+            min_separation=3,
+            momentum=-0.0,
+            weight_decay=0.0,
+            optimizer_steps=1,
+        )
+    finally:
+        _bandinvmf_module.clear_bandinvmf_optimization_cache()
+
+    assert calls["count"] == 1
+    assert second == pytest.approx([1.0, -0.25], rel=0.0, abs=1e-12)
 
 
 def test_bandinvmf_optimization_handles_pretrained_cifar100_amplified_row() -> None:
