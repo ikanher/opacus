@@ -46,6 +46,42 @@ from opacus.mf.optimizer_utils import resolve_uniform_sgd_workload_from_optimize
 from opacus.mechanism_contracts import NoiseMechanismConfig
 
 
+def _resolve_positive_horizon(
+    *,
+    total_steps: int,
+    state: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+    kwargs: Mapping[str, Any],
+    context: str,
+) -> int:
+    """
+    Resolve the finite visible horizon for BIFR accountant-state construction.
+
+    `PrivacyEngine` may call family augmentation more than once. In epochs-based
+    runs, a later pass can receive `total_steps=0` even though the prepared
+    mechanism state already carries `bifr_horizon`/`bnb_horizon`. Prefer an
+    explicit positive argument when present, then fall back to persisted state
+    and metadata.
+    """
+    candidates = (
+        total_steps,
+        kwargs.get("total_steps"),
+        kwargs.get("steps"),
+        metadata.get("total_steps"),
+        metadata.get("steps"),
+        state.get("bifr_horizon"),
+        state.get("bnb_horizon"),
+        state.get("bsr_iterations_number"),
+    )
+    for value in candidates:
+        if value is None:
+            continue
+        resolved = int(value)
+        if resolved > 0:
+            return resolved
+    raise ValueError(f"{context} requires a positive total_steps/horizon")
+
+
 def ensure_bifr_exact_runtime_coeffs(
     *,
     mechanism_config: NoiseMechanismConfig,
@@ -252,6 +288,13 @@ def resolve_bifr_amplified_accountant_coeffs(
     """
     metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
     state = canonicalize_bifr_runtime_state(runtime_state=mechanism_state)
+    resolved_total_steps = _resolve_positive_horizon(
+        total_steps=int(total_steps),
+        state=state,
+        metadata=metadata,
+        kwargs=kwargs,
+        context="amplified bifr accounting",
+    )
     bands = resolve_canonical_bsr_bands(
         runtime_state=state,
         metadata=metadata,
@@ -278,7 +321,7 @@ def resolve_bifr_amplified_accountant_coeffs(
     factor_coeffs, factor_source = resolve_bifr_exact_factor_coeffs_for_accounting(
         coeffs=state.get("coeffs"),
         inverse_coeffs=state.get("bifr_inv_coeffs"),
-        steps=int(total_steps),
+        steps=int(resolved_total_steps),
         bands=int(bands),
         momentum=None if momentum is None else float(momentum),
         weight_decay=None if weight_decay is None else float(weight_decay),
@@ -290,12 +333,12 @@ def resolve_bifr_amplified_accountant_coeffs(
     inputs = build_bifr_amplified_bnb_inputs_from_factor_coeffs(
         coeffs=factor_coeffs,
         bands=int(bands),
-        horizon=int(total_steps),
+        horizon=int(resolved_total_steps),
     )
     state["coeffs"] = [float(c) for c in factor_coeffs]
     state["bsr_bands"] = int(bands)
     state["bifr_frac"] = float(frac)
-    state["bifr_horizon"] = int(total_steps)
+    state["bifr_horizon"] = int(resolved_total_steps)
 
     if state.get("coeff_source") is None:
         state["coeff_source"] = str(factor_source)
@@ -322,18 +365,26 @@ def resolve_bifr_bnb_accountant_state(
     BNB cycle metadata (`bands`, `horizon`, `cycle_length`, `bins`).
     """
     metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
+    state0 = canonicalize_bifr_runtime_state(runtime_state=mechanism_state)
+    resolved_total_steps = _resolve_positive_horizon(
+        total_steps=int(total_steps),
+        state=state0,
+        metadata=metadata,
+        kwargs=kwargs,
+        context="bifr amplified BNB accountant state",
+    )
     cycle_length = resolve_canonical_bnb_cycle_length(
-        runtime_state=mechanism_state,
+        runtime_state=state0,
         metadata=metadata,
         kwargs=kwargs,
         error_context="bifr amplified accounting requires BNB cycle length or sampling bins metadata",
     )
     accountant_coeffs, accountant_source, state = resolve_bifr_amplified_accountant_coeffs(
-        mechanism_state=mechanism_state,
+        mechanism_state=state0,
         sampling_semantics=sampling_semantics,
         optimizer=optimizer,
         kwargs=kwargs,
-        total_steps=int(total_steps),
+        total_steps=int(resolved_total_steps),
     )
     state = attach_accountant_coeff_surface(
         state,
@@ -343,7 +394,7 @@ def resolve_bifr_bnb_accountant_state(
         coeff_source=accountant_source,
     )
     state["bnb_bands"] = int(state["bnb_bands"])
-    state["bnb_horizon"] = int(total_steps)
+    state["bnb_horizon"] = int(resolved_total_steps)
     state["bnb_cycle_length"] = int(cycle_length)
     state["bnb_bins"] = int(cycle_length)
 

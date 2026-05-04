@@ -28,6 +28,7 @@ from opacus import NoiseMechanismConfig, PrivacyEngine, SamplingSemantics
 from opacus.accountants.analysis.bandmf import generate_bandmf_coeffs_from_sgd_workload
 from opacus.accountants.analysis.bsr import generate_bsr_coeffs_from_sgd_workload
 from opacus.accountants.analysis.bifr import resolve_bifr_exact_factor_coeffs_for_accounting
+from opacus.accountants.bifr import resolve_bifr_bnb_accountant_state
 from opacus.optimizers import (
     CorrelatedNoiseMechanism,
     GaussianNoiseMechanism,
@@ -1944,6 +1945,79 @@ def test_make_private_with_epsilon_balls_in_bins_mf_autocoeff_succeeds(mechanism
     assert list(state["coeffs"])
     assert state["bnb_c_matrix"] is not None
     assert state["bnb_c_matrix_contract"] is not None
+
+
+def test_bifr_bnb_state_reuses_persisted_horizon_on_late_epochs_pass() -> None:
+    optimizer = torch.optim.SGD(
+        nn.Linear(4, 3).parameters(),
+        lr=0.05,
+        momentum=0.0,
+        weight_decay=0.0,
+    )
+    semantics = SamplingSemantics(
+        sampling_mode="balls_in_bins",
+        privacy_metadata={"bins": 4, "bands": 2},
+    )
+
+    prepared = resolve_bifr_bnb_accountant_state(
+        mechanism_state={"bsr_bands": 2, "bifr_frac": 0.95},
+        sampling_semantics=semantics,
+        optimizer=optimizer,
+        kwargs={},
+        total_steps=8,
+    )
+    late_pass = resolve_bifr_bnb_accountant_state(
+        mechanism_state=prepared,
+        sampling_semantics=semantics,
+        optimizer=optimizer,
+        kwargs={},
+        total_steps=0,
+    )
+
+    assert late_pass["bifr_horizon"] == 8
+    assert late_pass["bnb_horizon"] == 8
+    assert late_pass["bnb_c_matrix"].shape[1] == 8
+
+
+def test_make_private_with_epsilon_bifr_bnb_epochs_infers_horizon() -> None:
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=0.05,
+        momentum=0.0,
+        weight_decay=0.0,
+    )
+    pe = PrivacyEngine()
+
+    _private_model, dp_optimizer, _private_loader = pe.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=_loader(),
+        target_epsilon=1.0,
+        target_delta=0.2,
+        epochs=1,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bifr",
+            accounting_mode="bnb_accountant",
+            mechanism_state={"bsr_bands": 2, "bifr_frac": 0.95},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": 4, "bands": 2},
+        ),
+        bnb_num_samples=2_000,
+        bnb_chunk_size=1_000,
+        bnb_require_evr_pass=False,
+        bnb_calibration_mode="optimistic",
+    )
+
+    state = getattr(dp_optimizer, "noise_mechanism_config").mechanism_state
+    assert float(dp_optimizer.noise_multiplier) > 0.0
+    assert state["bifr_horizon"] == len(_loader())
+    assert state["bnb_horizon"] == len(_loader())
+    assert state["bnb_c_matrix"].shape[1] == len(_loader())
 
 
 def test_default_config_uses_gaussian_mechanism() -> None:
