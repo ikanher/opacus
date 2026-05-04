@@ -1486,22 +1486,16 @@ class AccountingTest(unittest.TestCase):
         self.assertIn("bnb_c_matrix", state)
         self.assertIn("bnb_c_matrix_contract", state)
 
-    def test_bifr_balls_in_bins_make_private_resolves_state_from_explicit_factor_coeffs(self) -> None:
-        state = _resolve_bnb_state_via_make_private(
-            mechanism="bifr",
-            mechanism_state={"coeffs": [1.0, 0.3], "bsr_bands": 2, "bifr_frac": 1.0},
-        )
-
-        self.assertEqual(state["bnb_accountant_coeffs_source"], "abs_exact_factor_c_col")
-        self.assertEqual(
-            state["bnb_accountant_coeffs"],
-            derive_bifr_amplified_accountant_coeffs_from_factor_coeffs(
-                coeffs=[1.0, 0.3],
-            ),
-        )
-        self.assertEqual(state["bifr_frac"], 1.0)
-        self.assertIn("bnb_c_matrix", state)
-        self.assertIn("bnb_c_matrix_contract", state)
+    def test_bifr_balls_in_bins_make_private_rejects_explicit_factor_coeffs_only(self) -> None:
+        with self.assertRaisesRegex(ValueError, "coeffs`-only states"):
+            _resolve_bnb_state_via_make_private(
+                mechanism="bifr",
+                mechanism_state={
+                    "coeffs": [1.0, 0.3],
+                    "bsr_bands": 2,
+                    "bifr_frac": 1.0,
+                },
+            )
 
     def test_bifr_balls_in_bins_make_private_resolves_state_from_auto_coeffs(self) -> None:
         state = _resolve_bnb_state_via_make_private(

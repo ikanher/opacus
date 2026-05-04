@@ -491,8 +491,9 @@ def test_distributed_bnb_rejects_b_min_sep_for_unsupported_family(monkeypatch) -
             noise_mechanism_config=NoiseMechanismConfig(
                 mechanism="bifr",
                 accounting_mode="bsr_accountant",
-                mechanism_state={"coeffs": [1.0], "z_std": 0.01, "bifr_frac": 0.5},
+                mechanism_state={"bsr_bands": 2, "z_std": 0.01, "bifr_frac": 0.5},
             ),
+            total_steps=8,
         )
 
 

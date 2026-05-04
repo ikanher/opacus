@@ -54,13 +54,13 @@ def ensure_bifr_exact_runtime_coeffs(
     kwargs: Dict[str, Any],
 ) -> NoiseMechanismConfig:
     """
-    Ensure a BIFR mechanism state carries exact finite-horizon factor coeffs.
+    Ensure a BIFR mechanism state carries inverse-side runtime coefficients and
+    exact finite-horizon factor coefficients.
 
-    If explicit factor coefficients are already present, the payload is returned
-    unchanged apart from normal `NoiseMechanismConfig` reconstruction. Otherwise
-    this helper derives inverse-side coefficients from the optimizer workload
-    and resolves the exact finite-horizon factor column used by the runtime and
-    accountant surfaces.
+    BIFR runtime noising is inverse-side. A `coeffs`-only BIFR state is
+    ambiguous because `coeffs` are factor-side/accountant coefficients in the
+    canonical contract, so it is rejected rather than treated as a legacy
+    factor-side runtime.
 
     Mapping type: implementation-contract.
     """
@@ -68,13 +68,15 @@ def ensure_bifr_exact_runtime_coeffs(
         return mechanism_config
 
     state = copy.deepcopy(mechanism_config.mechanism_state)
-    coeffs = state.get("coeffs")
-    if isinstance(coeffs, (list, tuple)) and len(coeffs) > 0:
-        return NoiseMechanismConfig(
-            mechanism=mechanism_config.mechanism,
-            accounting_mode=mechanism_config.accounting_mode,
-            mechanism_state=state,
-        )
+    inverse_coeffs = state.get("bifr_inv_coeffs")
+    if not (isinstance(inverse_coeffs, (list, tuple)) and len(inverse_coeffs) > 0):
+        coeffs = state.get("coeffs")
+        if isinstance(coeffs, (list, tuple)) and len(coeffs) > 0:
+            raise ValueError(
+                "bifr mechanism no longer accepts `coeffs`-only states; "
+                "provide `bifr_inv_coeffs` or canonical inputs `bsr_bands`, "
+                "`bifr_frac`, and `total_steps`"
+            )
 
     metadata = sampling_semantics.privacy_metadata if sampling_semantics is not None else {}
     bands = resolve_canonical_bsr_bands(
@@ -95,17 +97,20 @@ def ensure_bifr_exact_runtime_coeffs(
             f"bifr exact finite-horizon coeff generation requires steps >= bands; got steps={int(steps_hint)}, bands={int(bands)}"
         )
 
-    # The exact finite-horizon BIFR runtime is parameterized by the SGD
-    # workload, so auto-resolution starts from the optimizer-side `(momentum,
-    # weight_decay)` pair.
-    momentum, weight_decay = resolve_uniform_sgd_workload_from_optimizer(optimizer=optimizer)
     frac = validate_bifr_frac(float(kwargs.get("bifr_frac", state.get("bifr_frac", metadata.get("bifr_frac", 0.5)))))
-    inv_coeffs = generate_bifr_inverse_coeffs_from_sgd_workload(
-        bands=int(bands),
-        momentum=momentum,
-        weight_decay=weight_decay,
-        frac=float(frac),
-    )
+    if isinstance(inverse_coeffs, (list, tuple)) and len(inverse_coeffs) > 0:
+        inv_coeffs = [float(c) for c in inverse_coeffs]
+    else:
+        # The exact finite-horizon BIFR runtime is parameterized by the SGD
+        # workload, so auto-resolution starts from the optimizer-side `(momentum,
+        # weight_decay)` pair.
+        momentum, weight_decay = resolve_uniform_sgd_workload_from_optimizer(optimizer=optimizer)
+        inv_coeffs = generate_bifr_inverse_coeffs_from_sgd_workload(
+            bands=int(bands),
+            momentum=momentum,
+            weight_decay=weight_decay,
+            frac=float(frac),
+        )
     factor_coeffs, factor_source = resolve_bifr_exact_factor_coeffs_for_accounting(
         inverse_coeffs=inv_coeffs,
         steps=int(steps_hint),

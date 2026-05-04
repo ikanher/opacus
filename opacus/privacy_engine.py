@@ -1363,6 +1363,21 @@ class PrivacyEngine:
                     z_std=float(z_std),
                 )
 
+        if mechanism_name == "bifr":
+            inverse_coeffs = state.get("bifr_inv_coeffs")
+            if isinstance(inverse_coeffs, (list, tuple)) and len(inverse_coeffs) > 0:
+                # BIFR training uses the short inverse-side filter
+                # `(C^{-1})z`; the exact finite-horizon factor `C` stays in
+                # state for accountant/RMSE surfaces.
+                return InverseBandNoiseMechanism(
+                    inverse_coeffs=inverse_coeffs,
+                    z_std=float(z_std),
+                )
+            raise ValueError(
+                "bifr mechanism requires nonempty `mechanism_state['bifr_inv_coeffs']`; "
+                "`coeffs`-only BIFR states are not supported"
+            )
+
         coeffs = state.get("coeffs")
         if coeffs is None:
             raise ValueError(
@@ -2293,6 +2308,13 @@ class PrivacyEngine:
             estimator_kwargs["bnb_sigma_reuse_state"] = kwargs[
                 "bnb_sigma_reuse_state"
             ]
+        if (
+            sampling_semantics is not None
+            and sampling_semantics.sampling_mode == "balls_in_bins"
+        ):
+            estimator_kwargs["bnb_accounting_backend"] = str(
+                kwargs.get("bnb_accounting_backend", "reduced_gaussian_mixture")
+            )
         if total_steps:
             noise_multiplier = get_noise_multiplier(
                 target_epsilon=float(target_epsilon),
@@ -2483,7 +2505,15 @@ class PrivacyEngine:
         """
         Extract BNB/RA query knobs that must survive into later epsilon queries.
         """
-        if mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bandinvmf", "blt"):
+        if mechanism not in (
+            "gaussian",
+            "bandmf",
+            "bsr",
+            "bisr",
+            "bandinvmf",
+            "bifr",
+            "blt",
+        ):
             return None
 
         calibration_cfg = resolve_bnb_calibration_kwargs(
