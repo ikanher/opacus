@@ -82,6 +82,18 @@ def _resolve_positive_horizon(
     raise ValueError(f"{context} requires a positive total_steps/horizon")
 
 
+def _max_positive_int(*values: Any) -> int | None:
+    best: int | None = None
+    for value in values:
+        if value is None:
+            continue
+        resolved = int(value)
+        if resolved <= 0:
+            continue
+        best = resolved if best is None else max(best, resolved)
+    return best
+
+
 def ensure_bifr_exact_runtime_coeffs(
     *,
     mechanism_config: NoiseMechanismConfig,
@@ -124,7 +136,14 @@ def ensure_bifr_exact_runtime_coeffs(
             "`sampling_semantics.privacy_metadata['bands']`, or `bsr_bands`"
         ),
     )
-    steps_hint = kwargs.get("total_steps", metadata.get("total_steps"))
+    prepared_horizon = _max_positive_int(
+        state.get("bifr_horizon"),
+        state.get("bnb_horizon"),
+        state.get("bsr_iterations_number"),
+    )
+    steps_hint = prepared_horizon
+    if steps_hint is None:
+        steps_hint = kwargs.get("total_steps", metadata.get("total_steps"))
     if steps_hint is None:
         raise ValueError("bifr exact finite-horizon coeff generation requires `total_steps`")
 

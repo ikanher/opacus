@@ -408,9 +408,27 @@ class PrivacyEngine:
         """
         Assemble the canonical MF runtime state before optimizer/accountant setup.
         """
+        mechanism_state = mechanism_config.mechanism_state or {}
+        prepared_horizon_candidates = [
+            mechanism_state.get("bifr_horizon"),
+            mechanism_state.get("bnb_horizon"),
+            mechanism_state.get("bsr_iterations_number"),
+            coeff_resolution_kwargs.get("total_steps"),
+            coeff_resolution_kwargs.get("steps"),
+        ]
+        prepared_horizon = max(
+            (
+                int(value)
+                for value in prepared_horizon_candidates
+                if value is not None and int(value) > 0
+            ),
+            default=0,
+        )
         inferred_mf_total_steps = int(total_steps_for_contract)
         if inferred_mf_total_steps <= 0:
-            inferred_mf_total_steps = int(max(band_steps_hint, data_loader_len, 0))
+            inferred_mf_total_steps = int(
+                max(prepared_horizon, band_steps_hint, data_loader_len, 0)
+            )
 
         coeff_resolution_kwargs.setdefault("total_steps", inferred_mf_total_steps)
         mechanism_config = ensure_bsr_family_fixed_analytical_coeffs_helper(

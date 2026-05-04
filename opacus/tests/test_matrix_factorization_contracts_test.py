@@ -2020,6 +2020,49 @@ def test_make_private_with_epsilon_bifr_bnb_epochs_infers_horizon() -> None:
     assert state["bnb_c_matrix"].shape[1] == len(_loader())
 
 
+def test_make_private_with_epsilon_bifr_bnb_epochs_allows_bands_above_epoch_len() -> None:
+    model = nn.Linear(4, 3)
+    optimizer = torch.optim.SGD(
+        model.parameters(),
+        lr=0.05,
+        momentum=0.0,
+        weight_decay=0.0,
+    )
+    pe = PrivacyEngine()
+    loader = _loader()
+
+    _private_model, dp_optimizer, _private_loader = pe.make_private_with_epsilon(
+        module=model,
+        optimizer=optimizer,
+        data_loader=loader,
+        target_epsilon=1.0,
+        target_delta=0.2,
+        epochs=3,
+        max_grad_norm=1.0,
+        poisson_sampling=False,
+        noise_mechanism_config=NoiseMechanismConfig(
+            mechanism="bifr",
+            accounting_mode="bnb_accountant",
+            mechanism_state={"bsr_bands": 16, "bifr_frac": 0.95},
+        ),
+        sampling_semantics=SamplingSemantics(
+            sampling_mode="balls_in_bins",
+            privacy_metadata={"bins": len(loader), "bands": 16},
+        ),
+        bnb_num_samples=2_000,
+        bnb_chunk_size=1_000,
+        bnb_require_evr_pass=False,
+        bnb_calibration_mode="optimistic",
+    )
+
+    state = getattr(dp_optimizer, "noise_mechanism_config").mechanism_state
+    assert float(dp_optimizer.noise_multiplier) > 0.0
+    assert state["bifr_horizon"] == 3 * len(loader)
+    assert state["bnb_horizon"] == 3 * len(loader)
+    assert state["bnb_c_matrix"].shape[1] >= 3 * len(loader)
+    assert len(state["coeffs"]) == 3 * len(loader)
+
+
 def test_default_config_uses_gaussian_mechanism() -> None:
     model = nn.Linear(4, 3)
     _, dp_optimizer, _ = _make_private(
