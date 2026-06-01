@@ -26,7 +26,7 @@ statements.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Literal, Mapping, Protocol
+from typing import Any, Dict, Literal, Mapping, Optional, Protocol
 
 
 NoiseMechanismName = Literal["gaussian", "bandmf", "bsr", "bisr", "bandinvmf", "bifr", "blt"]
@@ -46,6 +46,9 @@ SamplingModeName = Literal[
     "balls_in_bins",
     "k_out_of_t",
 ]
+FourierLayoutName = Literal["layer_matrix_columns", "parameter_blockwise"]
+FourierTransformName = Literal["dct"]
+FourierModeName = Literal["fixed_lowpass", "adaptive_topk_leaky"]
 
 
 class MechanismStateSerializable(Protocol):
@@ -186,7 +189,8 @@ class NoiseMechanismConfig:
         mechanism = self.mechanism
         if mechanism not in ("gaussian", "bandmf", "bsr", "bisr", "bandinvmf", "bifr", "blt"):
             raise ValueError(
-                "mechanism must be one of {'gaussian', 'bandmf', 'bsr', 'bisr', 'bandinvmf', 'bifr', 'blt'}"
+                "mechanism must be one of {'gaussian', 'bandmf', 'bsr', 'bisr', 'bandinvmf', 'bifr', 'blt'}; "
+                "use clipping='fourier' with FourierClippingConfig for Fourier experiments"
             )
 
         accounting_mode = self.accounting_mode
@@ -254,3 +258,117 @@ class NoiseMechanismConfig:
             raise ValueError(
                 "blt mechanism requires blt_accountant, bnb_accountant, or random_allocation_accountant routing"
             )
+
+
+@dataclass(frozen=True)
+class FourierClippingConfig:
+    """
+    Experimental Fourier/DCT compressed-space clipping configuration.
+
+    This config is deliberately separate from `NoiseMechanismConfig`: Fourier is
+    a clipping/release-space transform, while `NoiseMechanismConfig` still owns
+    the base temporal noiser/accountant family. The pivot is feasibility-first,
+    so every Fourier run is marked nonclaiming and any epsilon reported by the
+    selected base accountant is nominal calibration metadata only.
+    """
+
+    layout: FourierLayoutName = "layer_matrix_columns"
+    transform: FourierTransformName = "dct"
+    mode: FourierModeName = "fixed_lowpass"
+    block_size: int = 1024
+    retain_frac: Optional[float] = None
+    retain_count: Optional[int] = None
+    allow_unaccounted_selection: bool = False
+    max_block_size: int = 8192
+    privacy_claim_valid: bool = False
+    reported_epsilon_is_nominal: bool = True
+    reported_epsilon_excludes_selection: bool = False
+
+    def __post_init__(self) -> None:
+        if self.layout not in ("layer_matrix_columns", "parameter_blockwise"):
+            raise ValueError(
+                "fourier layout must be one of {'layer_matrix_columns', 'parameter_blockwise'}"
+            )
+        if self.transform != "dct":
+            raise ValueError("fourier transform must be 'dct'")
+        if self.mode not in ("fixed_lowpass", "adaptive_topk_leaky"):
+            raise ValueError(
+                "fourier mode must be one of {'fixed_lowpass', 'adaptive_topk_leaky'}"
+            )
+        if int(self.block_size) < 1:
+            raise ValueError("fourier block_size must be >= 1")
+        if int(self.max_block_size) < 1:
+            raise ValueError("fourier max_block_size must be >= 1")
+        if int(self.block_size) > int(self.max_block_size):
+            raise ValueError(
+                f"fourier block_size must be <= max_block_size ({self.max_block_size})"
+            )
+        if (self.retain_frac is None) == (self.retain_count is None):
+            raise ValueError(
+                "fourier clipping requires exactly one of retain_frac or retain_count"
+            )
+        if self.retain_frac is not None and not (0.0 < float(self.retain_frac) <= 1.0):
+            raise ValueError("fourier retain_frac must satisfy 0 < retain_frac <= 1")
+        if self.retain_count is not None and int(self.retain_count) < 1:
+            raise ValueError("fourier retain_count must be >= 1")
+        if self.mode == "adaptive_topk_leaky" and not self.allow_unaccounted_selection:
+            raise ValueError(
+                "adaptive_topk_leaky requires allow_unaccounted_selection=True; "
+                "this mode is a leaky feasibility-only diagnostic"
+            )
+        if self.privacy_claim_valid:
+            raise ValueError("Fourier clipping is experimental and must be nonclaiming")
+        if not self.reported_epsilon_is_nominal:
+            raise ValueError("Fourier clipping epsilon metadata must be nominal")
+
+        object.__setattr__(self, "block_size", int(self.block_size))
+        object.__setattr__(self, "max_block_size", int(self.max_block_size))
+        if self.retain_frac is not None:
+            object.__setattr__(self, "retain_frac", float(self.retain_frac))
+        if self.retain_count is not None:
+            object.__setattr__(self, "retain_count", int(self.retain_count))
+        object.__setattr__(
+            self,
+            "reported_epsilon_excludes_selection",
+            bool(self.reported_epsilon_excludes_selection)
+            or self.mode == "adaptive_topk_leaky",
+        )
+
+    @classmethod
+    def from_state_dict(cls, state: Mapping[str, Any]) -> "FourierClippingConfig":
+        return cls(
+            layout=str(state.get("layout", "layer_matrix_columns")),
+            transform=str(state.get("transform", "dct")),
+            mode=str(state.get("mode", "fixed_lowpass")),
+            block_size=int(state.get("block_size", 1024)),
+            retain_frac=state.get("retain_frac"),
+            retain_count=state.get("retain_count"),
+            allow_unaccounted_selection=bool(
+                state.get("allow_unaccounted_selection", False)
+            ),
+            max_block_size=int(state.get("max_block_size", 8192)),
+            privacy_claim_valid=bool(state.get("privacy_claim_valid", False)),
+            reported_epsilon_is_nominal=bool(
+                state.get("reported_epsilon_is_nominal", True)
+            ),
+            reported_epsilon_excludes_selection=bool(
+                state.get("reported_epsilon_excludes_selection", False)
+            ),
+        )
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "layout": self.layout,
+            "transform": self.transform,
+            "mode": self.mode,
+            "block_size": int(self.block_size),
+            "retain_frac": self.retain_frac,
+            "retain_count": self.retain_count,
+            "allow_unaccounted_selection": bool(self.allow_unaccounted_selection),
+            "max_block_size": int(self.max_block_size),
+            "privacy_claim_valid": False,
+            "reported_epsilon_is_nominal": True,
+            "reported_epsilon_excludes_selection": bool(
+                self.reported_epsilon_excludes_selection
+            ),
+        }

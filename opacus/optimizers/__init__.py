@@ -26,6 +26,7 @@ from opacus.noise_mechanisms import (
     InverseBandNoiseMechanism,
     NoiseMechanism,
 )
+from .fourieroptimizer import DistributedFourierDPOptimizer, FourierDPOptimizer
 from .optimizer import (
     DPOptimizer,
 )
@@ -40,7 +41,9 @@ __all__ = [
     "DPOptimizer",
     "DPOptimizerFastGradientClipping",
     "DistributedDPOptimizerFastGradientlipping",
+    "DistributedFourierDPOptimizer",
     "FSDPOptimizerFastGradientClipping",
+    "FourierDPOptimizer",
     "DPPerLayerOptimizer",
     "SimpleDistributedPerLayerOptimizer",
     "NoiseMechanism",
@@ -73,6 +76,14 @@ def get_optimizer_class(clipping: str, distributed: bool, grad_sample_mode: str 
 
     if clipping == "flat":
         return DistributedDPOptimizer if distributed else DPOptimizer
+
+    if clipping == "fourier":
+        if grad_sample_mode not in ("hooks", "ew", None):
+            raise ValueError(
+                "Fourier clipping supports grad_sample_mode in {'hooks', 'ew'} only; "
+                f"got grad_sample_mode={grad_sample_mode!r}"
+            )
+        return DistributedFourierDPOptimizer if distributed else FourierDPOptimizer
 
     if clipping == "per_layer":
         if not distributed:

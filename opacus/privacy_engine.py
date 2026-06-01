@@ -52,7 +52,11 @@ from opacus.mf.bsr_family import (
     canonicalize_bsr_family_runtime_state,
     summarize_bsr_runtime_state,
 )
-from opacus.mechanism_contracts import NoiseMechanismConfig, SamplingSemantics
+from opacus.mechanism_contracts import (
+    FourierClippingConfig,
+    NoiseMechanismConfig,
+    SamplingSemantics,
+)
 from opacus.mf import (
     BLTFamilyState,
     get_mf_family_entry,
@@ -551,6 +555,7 @@ class PrivacyEngine:
         sampling_semantics: Optional[SamplingSemantics],
         total_steps: Optional[int],
         mechanism_config: NoiseMechanismConfig,
+        fourier_clipping_config: Optional[FourierClippingConfig],
         kwargs: Dict[str, Any],
         clipping: str,
     ) -> tuple[nn.Module, DataLoader, bool, SamplingSemantics, float, int, int]:
@@ -570,6 +575,15 @@ class PrivacyEngine:
                 is_fsdp=is_fsdp,
                 clipping=clipping,
                 grad_sample_mode=grad_sample_mode,
+            )
+        if (
+            distributed
+            and clipping == "fourier"
+            and fourier_clipping_config is not None
+            and fourier_clipping_config.mode == "adaptive_topk_leaky"
+        ):
+            raise ValueError(
+                "adaptive_topk_leaky Fourier clipping is not supported with distributed training"
             )
         if distributed and (
             mechanism_config.mechanism in ("bandmf", "bsr", "bisr", "bandinvmf", "bifr")
@@ -649,12 +663,15 @@ class PrivacyEngine:
         grad_sample_mode: str,
         loss_reduction: str,
         kwargs: Dict[str, Any],
+        fourier_clipping_config: Optional[FourierClippingConfig] = None,
     ):
         self.noise_mechanism_config = mechanism_config
+        self.fourier_clipping_config = fourier_clipping_config
         self.sampling_semantics = semantics
         self.accountant = active_accountant
         setattr(optimizer, "accounting_mode", mechanism_config.accounting_mode)
         setattr(optimizer, "noise_mechanism_config", mechanism_config)
+        setattr(optimizer, "fourier_clipping_config", fourier_clipping_config)
         setattr(optimizer, "sampling_semantics", semantics)
         optimizer.attach_step_hook(
             active_accountant.get_optimizer_hook_fn(sample_rate=sample_rate)
@@ -1152,6 +1169,7 @@ class PrivacyEngine:
         self.accountant = self.default_accountant
         self.secure_mode = secure_mode
         self.noise_mechanism_config = NoiseMechanismConfig()
+        self.fourier_clipping_config: Optional[FourierClippingConfig] = None
         self.sampling_semantics = SamplingSemantics(sampling_mode="poisson")
         self.secure_rng = None
         self.dataset = None  # only used to detect switching to a different dataset
@@ -1219,6 +1237,41 @@ class PrivacyEngine:
             },
         )
 
+    @staticmethod
+    def _canonical_fourier_clipping_config(
+        config: Optional[Union[FourierClippingConfig, Mapping[str, Any]]],
+    ) -> Optional[FourierClippingConfig]:
+        if config is None:
+            return None
+        if isinstance(config, FourierClippingConfig):
+            return config
+        if isinstance(config, Mapping):
+            return FourierClippingConfig.from_state_dict(config)
+        raise TypeError(
+            "fourier_clipping_config must be a FourierClippingConfig, a mapping, or None"
+        )
+
+    @staticmethod
+    def _validate_fourier_clipping_config_for_runtime(
+        *,
+        clipping: str,
+        fourier_clipping_config: Optional[FourierClippingConfig],
+        max_grad_norm: Optional[Union[float, List[float]]] = None,
+    ) -> None:
+        if clipping == "fourier" and fourier_clipping_config is None:
+            raise ValueError(
+                "clipping='fourier' requires a FourierClippingConfig via fourier_clipping_config"
+            )
+        if clipping == "fourier" and isinstance(max_grad_norm, list):
+            raise ValueError(
+                "Fourier clipping uses a single global encoded-space clipping norm; "
+                "pass scalar max_grad_norm when clipping='fourier'"
+            )
+        if clipping != "fourier" and fourier_clipping_config is not None:
+            raise ValueError(
+                "fourier_clipping_config is only valid when clipping='fourier'"
+            )
+
     def _prepare_optimizer(
         self,
         *,
@@ -1232,10 +1285,17 @@ class PrivacyEngine:
         noise_generator=None,
         grad_sample_mode="hooks",
         normalize_clipping: bool = False,
+        fourier_clipping_config: Optional[FourierClippingConfig] = None,
         **kwargs,
     ) -> DPOptimizer:
         if isinstance(optimizer, DPOptimizer):
             optimizer = optimizer.original_optimizer
+
+        self._validate_fourier_clipping_config_for_runtime(
+            clipping=clipping,
+            fourier_clipping_config=fourier_clipping_config,
+            max_grad_norm=max_grad_norm,
+        )
 
         generator = None
         if self.secure_mode:
@@ -1249,6 +1309,10 @@ class PrivacyEngine:
             grad_sample_mode=grad_sample_mode,
         )
 
+        optimizer_kwargs = dict(kwargs)
+        if clipping == "fourier":
+            optimizer_kwargs["fourier_clipping_config"] = fourier_clipping_config
+
         return optim_class(
             optimizer=optimizer,
             noise_multiplier=noise_multiplier,
@@ -1258,7 +1322,7 @@ class PrivacyEngine:
             generator=generator,
             secure_mode=self.secure_mode,
             normalize_clipping=normalize_clipping,
-            **kwargs,
+            **optimizer_kwargs,
         )
 
     @staticmethod
@@ -1272,12 +1336,12 @@ class PrivacyEngine:
         if is_fsdp:
             raise ValueError(
                 f"{mechanism} noise mechanism is not yet supported with FSDP; "
-                "supported distributed mode is DDP/DPDDP with flat clipping"
+                "supported distributed mode is DDP/DPDDP with flat or Fourier clipping"
             )
 
-        if clipping != "flat":
+        if clipping not in ("flat", "fourier"):
             raise ValueError(
-                f"{mechanism} noise mechanism supports only distributed flat clipping; "
+                f"{mechanism} noise mechanism supports only distributed flat or Fourier clipping; "
                 f"got clipping={clipping!r}"
             )
 
@@ -1298,11 +1362,11 @@ class PrivacyEngine:
         if is_fsdp:
             raise ValueError(
                 "blt noise mechanism is not yet supported with FSDP; "
-                "supported distributed mode is DDP/DPDDP with flat clipping"
+                "supported distributed mode is DDP/DPDDP with flat or Fourier clipping"
             )
-        if clipping != "flat":
+        if clipping not in ("flat", "fourier"):
             raise ValueError(
-                "blt noise mechanism supports only distributed flat clipping; "
+                "blt noise mechanism supports only distributed flat or Fourier clipping; "
                 f"got clipping={clipping!r}"
             )
         if grad_sample_mode not in ("hooks", "ew"):
@@ -2951,6 +3015,9 @@ class PrivacyEngine:
         normalize_clipping: bool = False,
         total_steps: int = None,
         noise_mechanism_config: Optional[NoiseMechanismConfig] = None,
+        fourier_clipping_config: Optional[
+            Union[FourierClippingConfig, Mapping[str, Any]]
+        ] = None,
         sampling_semantics: Optional[SamplingSemantics] = None,
         **kwargs,
     ) -> Union[
@@ -3035,6 +3102,14 @@ class PrivacyEngine:
             raise ValueError("Passing seed is prohibited in secure mode")
 
         mechanism_config = noise_mechanism_config or NoiseMechanismConfig()
+        fourier_clipping_config = self._canonical_fourier_clipping_config(
+            fourier_clipping_config
+        )
+        self._validate_fourier_clipping_config_for_runtime(
+            clipping=clipping,
+            fourier_clipping_config=fourier_clipping_config,
+            max_grad_norm=max_grad_norm,
+        )
         self._validate_mechanism_sampling_compatibility(
             mechanism_config=mechanism_config,
             poisson_sampling=poisson_sampling,
@@ -3068,6 +3143,7 @@ class PrivacyEngine:
                 sampling_semantics=sampling_semantics,
                 total_steps=total_steps,
                 mechanism_config=mechanism_config,
+                fourier_clipping_config=fourier_clipping_config,
                 kwargs=kwargs,
                 clipping=clipping,
             )
@@ -3199,6 +3275,7 @@ class PrivacyEngine:
             clipping=clipping,
             grad_sample_mode=grad_sample_mode,
             normalize_clipping=normalize_clipping,
+            fourier_clipping_config=fourier_clipping_config,
             **optimizer_prepare_kwargs,
         )
 
@@ -3229,6 +3306,7 @@ class PrivacyEngine:
             grad_sample_mode=grad_sample_mode,
             loss_reduction=loss_reduction,
             kwargs=kwargs,
+            fourier_clipping_config=fourier_clipping_config,
         )
 
     def make_private_with_epsilon(
@@ -3251,6 +3329,9 @@ class PrivacyEngine:
         normalize_clipping: bool = False,
         total_steps: int = None,
         noise_mechanism_config: Optional[NoiseMechanismConfig] = None,
+        fourier_clipping_config: Optional[
+            Union[FourierClippingConfig, Mapping[str, Any]]
+        ] = None,
         sampling_semantics: Optional[SamplingSemantics] = None,
         **kwargs,
     ) -> Union[
@@ -3320,6 +3401,14 @@ class PrivacyEngine:
                 sampling mechanism. Points to the same dataset object.
         """
         mechanism_config = noise_mechanism_config or NoiseMechanismConfig()
+        fourier_clipping_config = self._canonical_fourier_clipping_config(
+            fourier_clipping_config
+        )
+        self._validate_fourier_clipping_config_for_runtime(
+            clipping=clipping,
+            fourier_clipping_config=fourier_clipping_config,
+            max_grad_norm=max_grad_norm,
+        )
         if total_steps is None and epochs is None:
             raise ValueError(
                 "make_private_with_epsilon requires either `epochs` or `total_steps`"
@@ -3407,6 +3496,15 @@ class PrivacyEngine:
                 is_fsdp=is_fsdp,
                 clipping=clipping,
                 grad_sample_mode=grad_sample_mode,
+            )
+        if (
+            distributed
+            and clipping == "fourier"
+            and fourier_clipping_config is not None
+            and fourier_clipping_config.mode == "adaptive_topk_leaky"
+        ):
+            raise ValueError(
+                "adaptive_topk_leaky Fourier clipping is not supported with distributed training"
             )
 
         correlated_denominator = None
@@ -3633,6 +3731,7 @@ class PrivacyEngine:
             normalize_clipping=normalize_clipping,
             total_steps=total_steps,
             noise_mechanism_config=mechanism_config,
+            fourier_clipping_config=fourier_clipping_config,
             sampling_semantics=local_sampling_semantics,
             **kwargs,
         )
@@ -3746,6 +3845,9 @@ class PrivacyEngine:
                 payload["distributed_runtime"] = bool(
                     mechanism_state.get("_blt_distributed_runtime", False)
                 )
+        fourier_clipping_config = getattr(self, "fourier_clipping_config", None)
+        if fourier_clipping_config is not None:
+            payload["fourier_clipping"] = fourier_clipping_config.state_dict()
 
         if delta is not None and accountant is not None:
             payload["target_delta"] = float(delta)
@@ -3828,14 +3930,21 @@ class PrivacyEngine:
             rank = getattr(optimizer, "rank", None)
             world_size = getattr(optimizer, "world_size", None)
             if (
-                isinstance(mech, CorrelatedNoiseMechanism)
+                isinstance(
+                    mech,
+                    (
+                        BufferedToeplitzNoiseMechanism,
+                        CorrelatedNoiseMechanism,
+                        InverseBandNoiseMechanism,
+                    ),
+                )
                 and rank is not None
                 and world_size is not None
                 and int(world_size) > 1
                 and int(rank) != 0
             ):
                 raise ValueError(
-                    "distributed correlated-noise checkpoint save is supported only on rank 0"
+                    "distributed stateful-noise checkpoint save is supported only on rank 0"
                 )
 
         checkpoint_dict = checkpoint_dict or {}
@@ -3850,6 +3959,10 @@ class PrivacyEngine:
             "accounting_mode": self.noise_mechanism_config.accounting_mode,
             "mechanism_state": copy.deepcopy(self.noise_mechanism_config.mechanism_state),
         }
+        if self.fourier_clipping_config is not None:
+            checkpoint_dict["fourier_clipping_config"] = (
+                self.fourier_clipping_config.state_dict()
+            )
         checkpoint_dict["sampling_semantics"] = {
             "sampling_mode": self.sampling_semantics.sampling_mode,
             "privacy_metadata": copy.deepcopy(self.sampling_semantics.privacy_metadata),
@@ -3904,6 +4017,14 @@ class PrivacyEngine:
                 ),
                 mechanism_state=mechanism_state,
             )
+
+        fourier_cfg_payload = checkpoint.get("fourier_clipping_config")
+        if isinstance(fourier_cfg_payload, dict):
+            self.fourier_clipping_config = FourierClippingConfig.from_state_dict(
+                fourier_cfg_payload
+            )
+        else:
+            self.fourier_clipping_config = None
 
         sampling_payload = checkpoint.get("sampling_semantics")
         if isinstance(sampling_payload, dict):

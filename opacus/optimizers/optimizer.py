@@ -461,6 +461,7 @@ class DPOptimizer(Optimizer):
             if not k.startswith("_dp_noise_mechanism_")
             and k != "_dp_noise_generator_state"
             and not k.startswith("_dp_distributed_")
+            and not k.startswith("_dp_fourier_")
         }
         self.original_optimizer.load_state_dict(optimizer_state)
         if mechanism_state is None and type(self.noise_mechanism) in (
