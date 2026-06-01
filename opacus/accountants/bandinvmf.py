@@ -240,7 +240,21 @@ def _resolve_bandinvmf_runtime_contract_inputs(
     if sample_rate_hint is not None:
         default_k = max(1, int(math.ceil(float(sample_rate_hint) * float(steps_hint))))
 
-    default_min_separation = metadata.get("bins", 1)
+    default_min_separation = metadata.get("bins")
+    sampling_mode = (
+        sampling_semantics.sampling_mode
+        if sampling_semantics is not None
+        else None
+    )
+    if default_min_separation is None and sampling_mode in (None, "torch_sampler"):
+        if sample_rate_hint is not None:
+            sample_rate = float(sample_rate_hint)
+            if math.isfinite(sample_rate) and sample_rate > 0.0:
+                default_min_separation = max(
+                    1, int(math.ceil((1.0 / sample_rate) - 1e-12))
+                )
+    if default_min_separation is None:
+        default_min_separation = 1
 
     max_participations = int(
         kwargs.get(

@@ -31,7 +31,7 @@ def test_blt_family_supports_only_relevant_capabilities() -> None:
     assert isinstance(family, SupportsFixedBatch)
     assert isinstance(family, SupportsOptimization)
     assert not isinstance(family, SupportsCyclic)
-    assert not isinstance(family, SupportsBallsInBins)
+    assert isinstance(family, SupportsBallsInBins)
 
 
 def test_bsr_family_supports_banded_accounting_capabilities() -> None:
@@ -119,7 +119,7 @@ def test_bisr_report_inputs_are_family_facing_and_canonical() -> None:
     assert inputs.method == "BISR"
     assert inputs.mechanism == "bisr"
     assert inputs.accountant == "bsr"
-    assert inputs.accountant_source == "abs_factor_c_col"
+    assert inputs.accountant_source == "abs_exact_factor_c_col"
     assert "bisr_inv_coeffs" in inputs.mechanism_state
     assert "coeffs" in inputs.mechanism_state
     assert inputs.sensitivity > 0.0

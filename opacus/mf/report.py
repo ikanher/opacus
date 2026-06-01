@@ -149,7 +149,7 @@ def build_bsr_family_report_inputs(
                 steps=int(total_steps),
             )
         ]
-        accountant_source = "abs_factor_c_col"
+        accountant_source = "abs_exact_factor_c_col"
 
     entry = get_mf_family_entry(mechanism)
     if entry is None:

@@ -214,7 +214,7 @@ def _build_bisr_random_allocation_accountant_coeffs(*, state: Dict[str, Any], ho
         coeffs=list(state.get("bisr_inv_coeffs", state["coeffs"])),
         steps=int(horizon),
     )
-    return list(coeffs), "abs_factor_c_col"
+    return list(coeffs), "abs_exact_factor_c_col"
 
 
 def _build_bandmf_random_allocation_accountant_coeffs(*, state: Dict[str, Any], horizon: int) -> tuple[list[float], str]:
@@ -229,7 +229,7 @@ def _build_bandinvmf_random_allocation_accountant_coeffs(*, state: Dict[str, Any
         inv_coeffs=list(state["bandinvmf_inv_coeffs"]),
         steps=int(horizon),
     )
-    return list(coeffs), "abs_factor_c_col"
+    return list(coeffs), "abs_exact_factor_c_col"
 
 
 def _build_bifr_random_allocation_accountant_coeffs(*, state: Dict[str, Any], horizon: int) -> tuple[list[float], str]:

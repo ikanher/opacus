@@ -432,8 +432,17 @@ def augment_bsr_family_balls_in_bins_query_state(
         momentum, weight_decay = resolve_uniform_sgd_workload_from_optimizer(
             optimizer=optimizer
         )
+        resolved_total_steps = int(total_steps) if int(total_steps) > 0 else None
         steps_hint = int(
-            kwargs.get("total_steps", metadata.get("total_steps", state.get("bnb_horizon", bins)))
+            kwargs.get(
+                "total_steps",
+                metadata.get(
+                    "total_steps",
+                    resolved_total_steps
+                    if resolved_total_steps is not None
+                    else state.get("bnb_horizon", bins),
+                ),
+            )
         )
         if mechanism == "bisr":
             state["bisr_inv_coeffs"] = generate_bisr_coeffs_from_sgd_workload(
@@ -466,7 +475,18 @@ def augment_bsr_family_balls_in_bins_query_state(
             )
         state["coeff_source"] = "analytical_auto"
 
-    horizon = int(state.get("bnb_horizon", kwargs.get("total_steps", kwargs.get("steps", bins))))
+    resolved_total_steps = int(total_steps) if int(total_steps) > 0 else None
+    horizon = int(
+        kwargs.get(
+            "total_steps",
+            metadata.get(
+                "total_steps",
+                resolved_total_steps
+                if resolved_total_steps is not None
+                else state.get("bnb_horizon", kwargs.get("steps", bins)),
+            ),
+        )
+    )
     if mechanism == "bsr":
         accountant_coeffs, accountant_source = list(state["coeffs"]), "raw_c_col"
     elif mechanism == "bisr":
@@ -474,7 +494,7 @@ def augment_bsr_family_balls_in_bins_query_state(
             coeffs=list(state.get("bisr_inv_coeffs", state["coeffs"])),
             steps=horizon,
         )
-        accountant_source = "abs_factor_c_col"
+        accountant_source = "abs_exact_factor_c_col"
     elif mechanism == "bandmf":
         accountant_coeffs = derive_bandmf_amplified_accountant_coeffs_from_runtime_coeffs(
             coeffs=list(state["coeffs"])
@@ -485,7 +505,7 @@ def augment_bsr_family_balls_in_bins_query_state(
             inv_coeffs=list(state["bandinvmf_inv_coeffs"]),
             steps=horizon,
         )
-        accountant_source = "abs_factor_c_col"
+        accountant_source = "abs_exact_factor_c_col"
 
     state["bsr_bands"] = int(bands)
     state["bnb_bands"] = int(bands)
