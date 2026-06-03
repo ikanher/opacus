@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
@@ -130,9 +131,27 @@ class FourierDPOptimizer(DPOptimizer):
 
     def _build_fourier_metadata(self) -> dict:
         metadata = dict(self.fourier_clipping_config.state_dict())
-        metadata["fallbacks"] = list(self._last_fourier_fallbacks)
-        metadata["encoded_numel"] = (
+        original_trainable_numel = sum(int(p.numel()) for p in self.params if p.requires_grad)
+        encoded_numel = (
             int(self._encoded_param.numel()) if self._encoded_param is not None else 0
+        )
+        kind_counts = Counter(entry.kind for entry in self._encoded_plan)
+        fallback_counts = Counter(self._last_fourier_fallbacks)
+        metadata["fallbacks"] = list(self._last_fourier_fallbacks)
+        metadata["fallback_counts"] = dict(fallback_counts)
+        metadata["plan_kind_counts"] = dict(kind_counts)
+        metadata["plan_entry_count"] = int(len(self._encoded_plan))
+        metadata["original_trainable_numel"] = int(original_trainable_numel)
+        metadata["encoded_numel"] = int(encoded_numel)
+        metadata["encoded_fraction_of_original"] = (
+            float(encoded_numel) / float(original_trainable_numel)
+            if original_trainable_numel > 0 and encoded_numel > 0
+            else None
+        )
+        metadata["compression_ratio_vs_original"] = (
+            float(original_trainable_numel) / float(encoded_numel)
+            if original_trainable_numel > 0 and encoded_numel > 0
+            else None
         )
         return metadata
 

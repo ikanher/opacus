@@ -368,6 +368,14 @@ def test_empty_fourier_batch_handles_fallback_blockwise_and_conv(
     assert torch.allclose(parameter.grad, torch.zeros_like(parameter))
     metadata = optimizer.state_dict()["_dp_fourier_clipping_metadata"]
     assert metadata["fallbacks"] == expected_fallbacks
+    assert metadata["original_trainable_numel"] == parameter.numel()
+    assert metadata["encoded_numel"] == expected_encoded_numel
+    assert metadata["encoded_fraction_of_original"] == pytest.approx(
+        expected_encoded_numel / parameter.numel()
+    )
+    assert metadata["compression_ratio_vs_original"] == pytest.approx(
+        parameter.numel() / expected_encoded_numel
+    )
 
 
 def test_matrix_layout_records_blockwise_fallback_metadata() -> None:
@@ -384,7 +392,13 @@ def test_matrix_layout_records_blockwise_fallback_metadata() -> None:
     metadata = optimizer.state_dict()["_dp_fourier_clipping_metadata"]
     assert metadata["layout"] == "layer_matrix_columns"
     assert metadata["fallbacks"] == ["parameter_blockwise"]
+    assert metadata["fallback_counts"] == {"parameter_blockwise": 1}
+    assert metadata["plan_kind_counts"] == {"blockwise": 1}
+    assert metadata["plan_entry_count"] == 1
+    assert metadata["original_trainable_numel"] == 5
     assert metadata["encoded_numel"] == 8
+    assert metadata["encoded_fraction_of_original"] == pytest.approx(8 / 5)
+    assert metadata["compression_ratio_vs_original"] == pytest.approx(5 / 8)
 
 
 def test_convolution_reshape_roundtrip_preserves_shape_dtype_and_values() -> None:
