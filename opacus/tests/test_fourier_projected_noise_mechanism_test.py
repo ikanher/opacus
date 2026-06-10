@@ -445,6 +445,177 @@ def test_existing_noisers_operate_over_encoded_buffers(noise_mechanism) -> None:
     assert decoded.shape == parameter.shape
     assert torch.isfinite(decoded).all()
 
+def _manual_fourier_indices_for_matrix(optimizer, grad_sample: torch.Tensor, rank: int) -> torch.Tensor:
+    matrix, _, _ = optimizer._matrix_view(grad_sample)
+    matrix = matrix.to(optimizer._working_dtype(matrix.dtype))
+    _, rows, cols = matrix.shape
+    right = rows >= cols
+    size = cols if right else rows
+    dct = optimizer._dct_matrix(size=size, device=matrix.device, dtype=matrix.dtype)
+    basis = dct.t()
+    full_coeffs = matrix @ basis if right else torch.matmul(basis.t(), matrix)
+    dim = 2 if right else 1
+    reduce_dims = tuple(i for i in range(full_coeffs.ndim) if i != dim)
+    scores = full_coeffs.detach().abs().sum(dim=reduce_dims)
+    return torch.topk(scores, k=rank, largest=True, sorted=False).indices.sort().values
+
+
+def _make_gradient_from_dct_coeffs(optimizer, coeffs: torch.Tensor, *, right: bool) -> torch.Tensor:
+    size = coeffs.shape[-1] if right else coeffs.shape[-2]
+    dct = optimizer._dct_matrix(size=size, device=coeffs.device, dtype=coeffs.dtype)
+    basis = dct.t()
+    if right:
+        return coeffs @ basis.t()
+    return torch.matmul(basis, coeffs)
+
+
+def test_adaptive_topk_matrix_right_selects_scored_non_lowpass_indices() -> None:
+    parameter = nn.Parameter(torch.zeros(4, 3))
+    config = FourierClippingConfig(
+        layout="layer_matrix_columns",
+        mode="adaptive_topk_leaky",
+        retain_count=2,
+        allow_unaccounted_selection=True,
+    )
+    optimizer = _make_fourier_optimizer(parameter, config=config)
+    coeffs = torch.zeros(2, 4, 3)
+    coeffs[:, :, 1] = 10.0
+    coeffs[:, :, 2] = -7.0
+    coeffs[:, :, 0] = 0.25
+    grad_sample = _make_gradient_from_dct_coeffs(optimizer, coeffs, right=True)
+
+    _, optimizer = _clip_decode(parameter, grad_sample, config=config)
+
+    entry = optimizer._encoded_plan[0]
+    expected = _manual_fourier_indices_for_matrix(optimizer, grad_sample, rank=2)
+    assert entry.kind == "matrix_right"
+    assert entry.indices.cpu().tolist() == [1, 2]
+    assert torch.equal(entry.indices.cpu(), expected.cpu())
+    metadata = optimizer.state_dict()["_dp_fourier_clipping_metadata"]
+    assert metadata["selected_indices"] == [
+        {"kind": "matrix_right", "shape": [2], "numel": 2, "indices": [1, 2]}
+    ]
+
+
+def test_adaptive_topk_matrix_left_selects_scored_non_lowpass_indices() -> None:
+    parameter = nn.Parameter(torch.zeros(3, 5))
+    config = FourierClippingConfig(
+        layout="layer_matrix_columns",
+        mode="adaptive_topk_leaky",
+        retain_count=1,
+        allow_unaccounted_selection=True,
+    )
+    optimizer = _make_fourier_optimizer(parameter, config=config)
+    coeffs = torch.zeros(2, 3, 5)
+    coeffs[:, 2, :] = 9.0
+    coeffs[:, 0, :] = 0.5
+    grad_sample = _make_gradient_from_dct_coeffs(optimizer, coeffs, right=False)
+
+    _, optimizer = _clip_decode(parameter, grad_sample, config=config)
+
+    entry = optimizer._encoded_plan[0]
+    expected = _manual_fourier_indices_for_matrix(optimizer, grad_sample, rank=1)
+    assert entry.kind == "matrix_left"
+    assert entry.indices.cpu().tolist() == [2]
+    assert torch.equal(entry.indices.cpu(), expected.cpu())
+
+
+def test_adaptive_topk_convolution_reshape_scores_matrix_view_and_preserves_shape() -> None:
+    parameter = nn.Parameter(torch.zeros(6, 1, 1, 2))
+    config = FourierClippingConfig(
+        layout="layer_matrix_columns",
+        mode="adaptive_topk_leaky",
+        retain_count=1,
+        allow_unaccounted_selection=True,
+    )
+    optimizer = _make_fourier_optimizer(parameter, config=config)
+    coeffs = torch.zeros(2, 6, 2)
+    coeffs[:, :, 1] = 11.0
+    coeffs[:, :, 0] = 0.25
+    matrix_grad = _make_gradient_from_dct_coeffs(optimizer, coeffs, right=True)
+    grad_sample = matrix_grad.reshape(2, 6, 1, 1, 2)
+
+    decoded, optimizer = _clip_decode(parameter, grad_sample, config=config)
+
+    entry = optimizer._encoded_plan[0]
+    expected = _manual_fourier_indices_for_matrix(optimizer, grad_sample, rank=1)
+    assert entry.kind == "matrix_right"
+    assert entry.conv_shape == torch.Size([6, 1, 1, 2])
+    assert entry.indices.cpu().tolist() == [1]
+    assert torch.equal(entry.indices.cpu(), expected.cpu())
+    assert decoded.shape == parameter.shape
+
+
+def test_adaptive_topk_blockwise_selects_indices_per_block() -> None:
+    parameter = nn.Parameter(torch.zeros(8))
+    config = FourierClippingConfig(
+        layout="parameter_blockwise",
+        mode="adaptive_topk_leaky",
+        retain_count=1,
+        block_size=4,
+        allow_unaccounted_selection=True,
+    )
+    optimizer = _make_fourier_optimizer(parameter, config=config)
+    dct = optimizer._dct_matrix(size=4, device=parameter.device, dtype=parameter.dtype)
+    coeffs = torch.zeros(2, 2, 4)
+    coeffs[:, 0, 3] = 8.0
+    coeffs[:, 0, 0] = 0.5
+    coeffs[:, 1, 2] = 6.0
+    coeffs[:, 1, 1] = 0.25
+    blocks = coeffs @ dct
+    grad_sample = blocks.reshape(2, 8)
+
+    _, optimizer = _clip_decode(parameter, grad_sample, config=config)
+
+    entry = optimizer._encoded_plan[0]
+    assert entry.kind == "blockwise"
+    assert entry.indices.cpu().tolist() == [[3], [2]]
+    metadata = optimizer.state_dict()["_dp_fourier_clipping_metadata"]
+    assert metadata["selected_indices"] == [
+        {"kind": "blockwise", "shape": [2, 1], "numel": 2, "indices": [[3], [2]]}
+    ]
+
+
+def test_adaptive_topk_metadata_marks_private_selection_and_leakage() -> None:
+    parameter = nn.Parameter(torch.zeros(3, 4))
+    grad_sample = torch.randn(2, 3, 4, generator=torch.Generator().manual_seed(3))
+    config = FourierClippingConfig(
+        layout="layer_matrix_columns",
+        mode="adaptive_topk_leaky",
+        retain_count=2,
+        allow_unaccounted_selection=True,
+    )
+
+    _, optimizer = _clip_decode(parameter, grad_sample, config=config)
+
+    metadata = optimizer.state_dict()["_dp_fourier_clipping_metadata"]
+    assert metadata["privacy_claim_valid"] is False
+    assert metadata["reported_epsilon_is_nominal"] is True
+    assert metadata["reported_epsilon_excludes_selection"] is True
+    assert metadata["fourier_selection_is_private"] is True
+    assert metadata["allow_unaccounted_selection"] is True
+    assert metadata["selection_metadata_includes_indices"] is True
+    assert metadata["selected_indices"]
+
+
+def test_fixed_lowpass_metadata_marks_public_selection() -> None:
+    parameter = nn.Parameter(torch.zeros(3, 4))
+    grad_sample = torch.randn(2, 3, 4, generator=torch.Generator().manual_seed(4))
+    config = FourierClippingConfig(
+        layout="layer_matrix_columns",
+        mode="fixed_lowpass",
+        retain_count=2,
+    )
+
+    _, optimizer = _clip_decode(parameter, grad_sample, config=config)
+
+    metadata = optimizer.state_dict()["_dp_fourier_clipping_metadata"]
+    assert metadata["reported_epsilon_excludes_selection"] is False
+    assert metadata["fourier_selection_is_private"] is False
+    assert metadata["selected_indices"] == [
+        {"kind": "matrix_left", "shape": [2], "numel": 2, "indices": [0, 1]}
+    ]
+
 
 def test_zero_grad_clears_fourier_encoded_buffers() -> None:
     parameter = nn.Parameter(torch.zeros(2, 3))

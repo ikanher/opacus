@@ -371,4 +371,5 @@ class FourierClippingConfig:
             "reported_epsilon_excludes_selection": bool(
                 self.reported_epsilon_excludes_selection
             ),
+            "fourier_selection_is_private": self.mode == "adaptive_topk_leaky",
         }

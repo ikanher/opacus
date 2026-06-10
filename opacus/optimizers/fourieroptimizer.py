@@ -137,10 +137,18 @@ class FourierDPOptimizer(DPOptimizer):
         )
         kind_counts = Counter(entry.kind for entry in self._encoded_plan)
         fallback_counts = Counter(self._last_fourier_fallbacks)
+        selected_indices, selected_total, selected_truncated = self._selected_indices_metadata()
         metadata["fallbacks"] = list(self._last_fourier_fallbacks)
         metadata["fallback_counts"] = dict(fallback_counts)
         metadata["plan_kind_counts"] = dict(kind_counts)
         metadata["plan_entry_count"] = int(len(self._encoded_plan))
+        metadata["selected_indices"] = selected_indices
+        metadata["selected_indices_total_numel"] = int(selected_total)
+        metadata["selected_indices_truncated"] = bool(selected_truncated)
+        metadata["selection_metadata_includes_indices"] = not bool(selected_truncated)
+        metadata["fourier_selection_is_private"] = (
+            self.fourier_clipping_config.mode == "adaptive_topk_leaky"
+        )
         metadata["original_trainable_numel"] = int(original_trainable_numel)
         metadata["encoded_numel"] = int(encoded_numel)
         metadata["encoded_fraction_of_original"] = (
@@ -154,6 +162,21 @@ class FourierDPOptimizer(DPOptimizer):
             else None
         )
         return metadata
+
+    def _selected_indices_metadata(self, *, max_indices: int = 4096) -> tuple[list[dict], int, bool]:
+        total = sum(int(entry.indices.numel()) for entry in self._encoded_plan)
+        truncated = total > int(max_indices)
+        payload = []
+        for entry in self._encoded_plan:
+            item = {
+                "kind": entry.kind,
+                "shape": list(entry.indices.shape),
+                "numel": int(entry.indices.numel()),
+            }
+            if not truncated:
+                item["indices"] = entry.indices.detach().cpu().tolist()
+            payload.append(item)
+        return payload, int(total), bool(truncated)
 
     @staticmethod
     def _working_dtype(dtype: torch.dtype) -> torch.dtype:
