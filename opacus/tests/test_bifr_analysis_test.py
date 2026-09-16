@@ -28,7 +28,7 @@ def test_bifr_frac_zero_is_identity_factor_side() -> None:
     coeffs = derive_bifr_factor_coeffs_from_inverse_coeffs(
         coeffs=generate_bifr_inverse_coeffs_from_sgd_workload(
             bands=5,
-            momentum=0.3,
+            momentum=0.0,
             weight_decay=0.9,
             frac=0.0,
         ),
@@ -41,7 +41,7 @@ def test_bifr_frac_half_matches_bsr_square_root_slice() -> None:
     got = derive_bifr_factor_coeffs_from_inverse_coeffs(
         coeffs=generate_bifr_inverse_coeffs_from_sgd_workload(
             bands=6,
-            momentum=0.3,
+            momentum=0.0,
             weight_decay=0.9,
             frac=0.5,
         ),
@@ -49,7 +49,7 @@ def test_bifr_frac_half_matches_bsr_square_root_slice() -> None:
     )
     expected = generate_bsr_coeffs_from_sgd_workload(
         bands=6,
-        momentum=0.3,
+        momentum=0.0,
         weight_decay=0.9,
     )
     assert got == pytest.approx(expected, abs=1e-12)
@@ -57,7 +57,7 @@ def test_bifr_frac_half_matches_bsr_square_root_slice() -> None:
 
 def test_bifr_frac_one_matches_full_workload_endpoint() -> None:
     alpha = 0.9
-    beta = 0.3
+    beta = 0.0
     got = derive_bifr_factor_coeffs_from_inverse_coeffs(
         coeffs=generate_bifr_inverse_coeffs_from_sgd_workload(
             bands=6,
@@ -77,7 +77,7 @@ def test_bifr_fixed_batch_sensitivity_supports_endpoint_with_disjoint_fallback()
         steps=4,
         max_participations=10,
         min_separation=98,
-        momentum=0.9,
+        momentum=0.0,
         weight_decay=0.9999,
         frac=1.0,
         allow_disjoint_fallback=True,
@@ -89,7 +89,7 @@ def test_bifr_family_keeps_exact_finite_horizon_boundary_explicit() -> None:
     family = build_bifr_exact_factor_family_from_sgd_workload(
         bands=4,
         steps=980,
-        momentum=0.9,
+        momentum=0.0,
         weight_decay=0.9999,
         frac=0.5,
     )
@@ -128,7 +128,7 @@ def test_bifr_exact_factor_recovery_matches_dense_inverse_reference_on_represent
         for frac in (0.0, 0.25, 0.5):
             inv_coeffs = generate_bifr_inverse_coeffs_from_sgd_workload(
                 bands=bands,
-                momentum=0.9,
+                momentum=0.0,
                 weight_decay=0.9999,
                 frac=frac,
             )
@@ -148,13 +148,9 @@ def test_bifr_exact_factor_recovery_matches_dense_inverse_reference_on_represent
             )
 
 
-def test_bifr_exact_factor_recurrence_radius_detects_unstable_p2_upper_half_slice() -> None:
-    inv_coeffs = generate_bifr_inverse_coeffs_from_sgd_workload(
-        bands=2,
-        momentum=0.9,
-        weight_decay=0.9999,
-        frac=0.625,
-    )
+def test_bifr_exact_factor_recurrence_radius_detects_unstable_explicit_coefficients() -> None:
+    # Explicit unsupported coefficients still need a structural safety check.
+    inv_coeffs = [1.0, -1.2]
     radius = bifr_exact_factor_recurrence_spectral_radius_from_inverse_coeffs(
         coeffs=inv_coeffs,
     )
@@ -162,14 +158,19 @@ def test_bifr_exact_factor_recurrence_radius_detects_unstable_p2_upper_half_slic
 
 
 def test_bifr_exact_factor_recovery_rejects_structurally_unstable_long_horizon_slice() -> None:
-    inv_coeffs = generate_bifr_inverse_coeffs_from_sgd_workload(
-        bands=2,
-        momentum=0.9,
-        weight_decay=0.9999,
-        frac=0.625,
-    )
+    # Explicit unsupported coefficients still need a structural safety check.
+    inv_coeffs = [1.0, -1.2]
     with pytest.raises(ValueError, match="unstable_exact_bifr_slice"):
         derive_bifr_factor_coeffs_from_inverse_coeffs(
             coeffs=inv_coeffs,
             steps=980,
+        )
+
+
+@pytest.mark.parametrize("momentum", [0.3, 0.95, -0.1, float("nan"), float("inf")])
+@pytest.mark.parametrize("frac", [0.0, 0.5, 0.95, 1.0])
+def test_bifr_inverse_generation_rejects_nonzero_or_nonfinite_momentum(momentum, frac):
+    with pytest.raises(ValueError, match="BIFR coefficient generation requires momentum=0"):
+        generate_bifr_inverse_coeffs_from_sgd_workload(
+            bands=4, momentum=momentum, weight_decay=0.0, frac=frac
         )

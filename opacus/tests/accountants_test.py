@@ -1509,7 +1509,7 @@ class AccountingTest(unittest.TestCase):
         expected_coeffs, _source = resolve_bifr_exact_factor_coeffs_for_accounting(
             bands=2,
             steps=16,
-            momentum=0.9,
+            momentum=0.0,
             weight_decay=0.9999,
             frac=0.25,
         )

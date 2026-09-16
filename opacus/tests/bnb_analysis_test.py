@@ -267,7 +267,7 @@ class BNBAnalysisTest(unittest.TestCase):
         factor_coeffs, _source = resolve_bifr_exact_factor_coeffs_for_accounting(
             bands=4,
             steps=16,
-            momentum=0.9,
+            momentum=0.0,
             weight_decay=0.9999,
             frac=0.25,
         )

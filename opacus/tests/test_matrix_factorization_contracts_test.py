@@ -2171,11 +2171,12 @@ def test_make_private_bifr_autoresolves_exact_finite_horizon_coeffs_from_bands_o
     expected_coeffs, _source = resolve_bifr_exact_factor_coeffs_for_accounting(
         bands=4,
         steps=int(state["bifr_horizon"]),
-        momentum=0.3,
+        momentum=0.0,
         weight_decay=0.9,
         frac=0.25,
     )
     assert state["coeffs"] == pytest.approx(expected_coeffs)
+    assert optimizer.param_groups[0]["momentum"] == 0.3
     assert int(state["bsr_bands"]) == 4
     assert isinstance(dp_optimizer.noise_mechanism, InverseBandNoiseMechanism)
     assert dp_optimizer.noise_mechanism.inverse_coeffs == pytest.approx(

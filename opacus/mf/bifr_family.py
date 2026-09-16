@@ -56,7 +56,7 @@ def augment_bifr_family_fixed_batch_query_state(
 
 
 class BIFRFamily(SupportsBallsInBins):
-    """Registry-facing BIFR family provider."""
+    """BIFR provider; automatic coefficients exclude optimizer momentum."""
     name = "bifr"
 
     def validate_sampling_compatibility(

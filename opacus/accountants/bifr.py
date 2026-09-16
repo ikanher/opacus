@@ -8,6 +8,10 @@ three kinds of quantities:
 - fixed-batch sensitivity terms on the factor side
 - amplified non-negative accountant coefficients and attached BNB state
 
+Automatic BIFR coefficients exclude optimizer momentum: momentum is applied by
+the optimizer to privatized gradients, not incorporated into the BIFR workload.
+Explicit coefficient states remain authoritative.
+
 Source: BIFR (Kalinin et al., 2026) for the `γ`-indexed inverse/factor family.
 
 Claim-type notes:
@@ -156,13 +160,12 @@ def ensure_bifr_exact_runtime_coeffs(
     if isinstance(inverse_coeffs, (list, tuple)) and len(inverse_coeffs) > 0:
         inv_coeffs = [float(c) for c in inverse_coeffs]
     else:
-        # The exact finite-horizon BIFR runtime is parameterized by the SGD
-        # workload, so auto-resolution starts from the optimizer-side `(momentum,
-        # weight_decay)` pair.
-        momentum, weight_decay = resolve_uniform_sgd_workload_from_optimizer(optimizer=optimizer)
+        # SGD momentum acts on privatized gradients. Including it here would
+        # select a different, unstudied BIFR correlation matrix.
+        _, weight_decay = resolve_uniform_sgd_workload_from_optimizer(optimizer=optimizer)
         inv_coeffs = generate_bifr_inverse_coeffs_from_sgd_workload(
             bands=int(bands),
-            momentum=momentum,
+            momentum=0.0,
             weight_decay=weight_decay,
             frac=float(frac),
         )
@@ -199,7 +202,7 @@ def resolve_bifr_mf_sensitivity_for_fixed_batch(
     Resolution order:
     - explicit `bsr_mf_sensitivity`
     - explicit exact factor coefficients already stored in the mechanism state
-    - exact workload parameters `(bands, steps, momentum, weight_decay, frac)`
+    - workload parameters `(bands, steps, weight_decay, frac)`, excluding momentum
 
     Returns:
         The fixed-batch sensitivity on the factor-side release object consumed
@@ -261,9 +264,8 @@ def resolve_bifr_mf_sensitivity_for_fixed_batch(
             )
         )
 
-    momentum = kwargs.get("momentum")
     weight_decay = kwargs.get("weight_decay")
-    if momentum is None or weight_decay is None:
+    if weight_decay is None:
         raise ValueError(
             "fixed-batch bifr accounting requires exact factor coefficients or exact workload parameters"
         )
@@ -276,7 +278,7 @@ def resolve_bifr_mf_sensitivity_for_fixed_batch(
             steps=int(sensitivity_steps),
             max_participations=int(max_participations),
             min_separation=int(min_separation),
-            momentum=float(momentum),
+            momentum=0.0,
             weight_decay=float(weight_decay),
             frac=float(frac),
             allow_disjoint_fallback=True,
@@ -327,13 +329,12 @@ def resolve_bifr_amplified_accountant_coeffs(
     frac = validate_bifr_frac(
         float(kwargs.get("bifr_frac", state.get("bifr_frac", metadata.get("bifr_frac", 0.5))))
     )
-    momentum = kwargs.get("momentum", state.get("momentum", metadata.get("momentum")))
     weight_decay = kwargs.get(
         "weight_decay",
         state.get("weight_decay", metadata.get("weight_decay")),
     )
-    if optimizer is not None and (momentum is None or weight_decay is None):
-        momentum, weight_decay = resolve_uniform_sgd_workload_from_optimizer(
+    if optimizer is not None and weight_decay is None:
+        _, weight_decay = resolve_uniform_sgd_workload_from_optimizer(
             optimizer=optimizer
         )
 
@@ -342,7 +343,7 @@ def resolve_bifr_amplified_accountant_coeffs(
         inverse_coeffs=state.get("bifr_inv_coeffs"),
         steps=int(resolved_total_steps),
         bands=int(bands),
-        momentum=None if momentum is None else float(momentum),
+        momentum=0.0,
         weight_decay=None if weight_decay is None else float(weight_decay),
         frac=float(frac),
     )

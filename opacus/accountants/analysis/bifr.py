@@ -104,7 +104,15 @@ def generate_bifr_inverse_coeffs_from_sgd_workload(
     Generate BIFR inverse-side Toeplitz coefficients from the SGD workload.
 
     The returned list is the band-truncated first column of `C^{-1}`.
+
+    BIFR coefficient generation requires momentum=0. Optimizer momentum may
+    still be applied to the privatized gradients independently.
     """
+    if float(momentum) != 0.0:
+        raise ValueError(
+            "BIFR coefficient generation requires momentum=0; apply optimizer "
+            "momentum to privatized gradients instead of the BIFR workload"
+        )
     alpha, beta = _effective_sgd_alpha_beta(
         momentum=float(momentum),
         weight_decay=float(weight_decay),
