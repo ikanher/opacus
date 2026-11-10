@@ -17,10 +17,10 @@ from __future__ import annotations
 from typing import Callable, Optional
 
 import torch
+from opacus.noise_mechanisms.blt import BufferedToeplitzNoiseMechanism
 from torch.optim import Optimizer
 
-from .optimizer import CorrelatedNoiseMechanism, DPOptimizer
-from opacus.noise_mechanisms.blt import BufferedToeplitzNoiseMechanism
+from .optimizer import CorrelatedNoiseMechanism, DPOptimizer, InverseBandNoiseMechanism
 
 
 class DistributedDPOptimizer(DPOptimizer):
@@ -76,6 +76,10 @@ class DistributedDPOptimizer(DPOptimizer):
                 p.grad = p.summed_grad.view_as(p)
 
     def state_dict(self):
+        """Add saving rank/world size; correlated-noise resumes require rank 0.
+
+        Save on rank 0 and distribute that payload to all restoring workers.
+        """
         state = dict(super().state_dict())
         state["_dp_distributed_saved_rank"] = int(self.rank)
         state["_dp_distributed_world_size"] = int(self.world_size)
@@ -83,17 +87,40 @@ class DistributedDPOptimizer(DPOptimizer):
         return state
 
     def load_state_dict(self, state_dict) -> None:
+        """Restore a rank-zero checkpoint without duplicating inverse history.
+
+        Inverse noisers reject a changed recorded world size: rank-zero noise
+        scales include world-size compensation before gradient reduction.
+        Non-owners load optimizer state only and clear their noiser. This method
+        performs no broadcast; the caller supplies the owner payload on all ranks.
+        """
         saved_rank = state_dict.get("_dp_distributed_saved_rank")
 
         if saved_rank is not None and int(saved_rank) != 0:
             if isinstance(self.noise_mechanism, BufferedToeplitzNoiseMechanism):
-                raise ValueError(
-                    "distributed BLT checkpoint must be saved on rank 0"
-                )
+                raise ValueError("distributed BLT checkpoint must be saved on rank 0")
             if isinstance(self.noise_mechanism, CorrelatedNoiseMechanism):
                 raise ValueError(
                     "distributed correlated-noise checkpoint must be saved on rank 0"
                 )
+
+        if isinstance(self.noise_mechanism, InverseBandNoiseMechanism):
+            saved_world = state_dict.get("_dp_distributed_world_size")
+            if saved_world is not None and saved_world != self.world_size:
+                raise ValueError("incompatible distributed checkpoint world size")
+
+            if self.rank != 0:
+                # Validate the owner payload but never install its history/RNG
+                # on a worker that will not generate correlated noise.
+                self.noise_mechanism.validate_state_dict(
+                    state_dict["_dp_noise_mechanism_state"]
+                )
+                plain = {
+                    k: v for k, v in state_dict.items() if not k.startswith("_dp_")
+                }
+                self.original_optimizer.load_state_dict(plain)
+                self.noise_mechanism.reset_state()
+                return
 
         super().load_state_dict(state_dict)
 

@@ -152,7 +152,7 @@ def test_bisr_inverse_band_resume_matches_uninterrupted_next_step() -> None:
             noise_mechanism_config=NoiseMechanismConfig(
                 mechanism="bisr",
                 accounting_mode="bsr_accountant",
-                mechanism_state={"bsr_bands": 3},
+                mechanism_state={"bsr_bands": 3, "record_noise_diagnostics": True},
             ),
         )
         return private_model, dp_optimizer, private_loader, pe
@@ -238,7 +238,9 @@ def test_checkpoint_load_preserves_bnb_report_and_sampling_metadata() -> None:
             checkpoint_dict=checkpoint_dict,
         )
         bio.seek(0)
-        loaded = pe.load_checkpoint(path=bio, module=private_model, optimizer=dp_optimizer)
+        loaded = pe.load_checkpoint(
+            path=bio, module=private_model, optimizer=dp_optimizer
+        )
 
     report = pe.noise_mechanism_config.mechanism_state["_bnb_calibration_report"]
     assert report["version"] == 2

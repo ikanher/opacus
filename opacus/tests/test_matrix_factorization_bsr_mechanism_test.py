@@ -300,8 +300,12 @@ def test_inverse_band_streaming_matches_materialized_product() -> None:
 
 def test_inverse_band_state_roundtrip_replays_future_sequence() -> None:
     inverse_coeffs = [1.0, -0.4, 0.09]
-    mech_a = InverseBandNoiseMechanism(inverse_coeffs=inverse_coeffs, z_std=0.0)
-    mech_b = InverseBandNoiseMechanism(inverse_coeffs=inverse_coeffs, z_std=0.0)
+    mech_a = InverseBandNoiseMechanism(
+        inverse_coeffs=inverse_coeffs, z_std=0.0, noise_history_mode="stored"
+    )
+    mech_b = InverseBandNoiseMechanism(
+        inverse_coeffs=inverse_coeffs, z_std=0.0, noise_history_mode="stored"
+    )
 
     gen = torch.Generator().manual_seed(20260325)
     z_seq = [torch.randn(6, generator=gen, dtype=torch.float64) for _ in range(9)]
@@ -346,7 +350,9 @@ def test_solver_fail_fast_on_non_finite_runtime_input_records_origin() -> None:
     )
     z = torch.tensor([1.0, float("nan"), 2.0], dtype=torch.float64)
 
-    with pytest.raises(ValueError, match="non-finite correlated-noise tensor detected: z_flat"):
+    with pytest.raises(
+        ValueError, match="non-finite correlated-noise tensor detected: z_flat"
+    ):
         mechanism._solve_correlated_noise(z)
 
     assert mechanism.first_non_finite_event is not None
@@ -375,5 +381,7 @@ def test_add_noise_fail_fast_on_non_finite_summed_grad(monkeypatch) -> None:
         lambda _specs: torch.tensor([float("nan")], dtype=torch.float64),
     )
 
-    with pytest.raises(ValueError, match="non-finite correlated-noise tensor detected: summed_flat"):
+    with pytest.raises(
+        ValueError, match="non-finite correlated-noise tensor detected: summed_flat"
+    ):
         dp_optimizer.pre_step()

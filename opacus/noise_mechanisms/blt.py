@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 BLT runtime noising mechanism.
 
@@ -18,10 +16,11 @@ Mapping type: implementation-contract. This module realizes the runtime BLT
 release recurrence; accountant guarantees remain outside this file.
 """
 
+from __future__ import annotations
+
 from typing import Any, List, Mapping, Optional
 
 import torch
-
 from opacus.accountants.analysis.blt import BLTPairedParams
 
 from ._utils import check_processed_flag, generate_noise, mark_as_processed
@@ -55,12 +54,25 @@ class BufferedToeplitzNoiseMechanism(NoiseMechanism):
 
     Mapping type: implementation-contract. The recurrence is exact for the
     provided BLT pair, while privacy interpretation remains accountant-side.
+
+    `record_noise_diagnostics` defaults to false. Enable it explicitly to retain
+    copies of the latest raw and correlated noise in last_flat_z and last_flat_u
+    for debugging. This adds two full noise-vector copies and their per-step
+    copy work; it does not change the noise or recurrence. Required recurrence
+    buffers are counted separately by noise_state_inventory().
     """
 
-    def __init__(self, *, pair: BLTPairedParams, z_std: float):
+    def __init__(
+        self,
+        *,
+        pair: BLTPairedParams,
+        z_std: float,
+        record_noise_diagnostics: bool = False,
+    ):
         if float(z_std) < 0.0:
             raise ValueError("z_std must be >= 0")
 
+        self.record_noise_diagnostics = bool(record_noise_diagnostics)
         self.pair = pair.canonicalized()
         self.pair.validate()
         self.z_std = float(z_std)
@@ -77,6 +89,19 @@ class BufferedToeplitzNoiseMechanism(NoiseMechanism):
     def num_buffers(self) -> int:
         """Number of streamed BLT state buffers required by the forward side."""
         return len(self._theta)
+
+    def noise_state_inventory(self):
+        """Return how many bytes BLT buffers and diagnostic tensors retain.
+
+        Returns category -> memory location -> integer byte count. History counts
+        recurrence buffers; diagnostics counts optional last_flat_z/last_flat_u
+        copies; scratch is empty. Shared backing allocations are counted once,
+        including the whole allocation for a view. Excludes within-step
+        temporaries and model/gradient memory. Does not clone or synchronize.
+        """
+        from ._utils import storage_inventory
+
+        return storage_inventory(self._buffers, [self.last_flat_z, self.last_flat_u])
 
     def reset_state(self) -> None:
         """Drop the buffered BLT recurrence state and cached debug tensors."""
@@ -216,8 +241,12 @@ class BufferedToeplitzNoiseMechanism(NoiseMechanism):
                 for theta_i, buf_i in zip(self._theta, self._buffers)
             ]
 
-        self.last_flat_z = z_flat.detach().clone()
-        self.last_flat_u = u_flat.detach().clone()
+        self.last_flat_z = (
+            z_flat.detach().clone() if self.record_noise_diagnostics else None
+        )
+        self.last_flat_u = (
+            u_flat.detach().clone() if self.record_noise_diagnostics else None
+        )
         self.steps_with_noise += 1
 
         return u_flat

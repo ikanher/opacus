@@ -64,6 +64,19 @@ class NoiseMechanism:
         """Populate `p.grad` for each parameter using the mechanism's runtime rule."""
         raise NotImplementedError
 
+    def noise_state_inventory(self):
+        """Return how many bytes of tensor storage the noiser retains between steps.
+
+        The result maps category -> memory location -> integer byte count.
+        Categories are history, diagnostics and scratch. Locations describe the
+        actual tensor storage (e.g. cpu or cuda:0). The stateless base/Gaussian
+        mechanism returns empty maps. Stateful implementations count unique
+        backing storage without cloning tensors or synchronizing devices.
+        This excludes transient workspace, model/gradient memory, Python objects
+        and opaque live generators; it is neither allocator usage nor host RSS.
+        """
+        return {"history": {}, "diagnostics": {}, "scratch": {}}
+
     def state_dict(self) -> Mapping[str, Any]:
         """Return runtime-only checkpoint state for the mechanism."""
         return {}

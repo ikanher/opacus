@@ -123,3 +123,41 @@ def generate_noise(
         generator=generator,
         dtype=reference.dtype,
     )
+
+
+def storage_inventory(history=(), diagnostics=(), scratch=()):
+    """Return how many bytes the supplied retained tensors occupy by location.
+
+    Inputs are iterables of tensors; None entries are ignored. The result maps
+    category -> location -> integer byte count. Count whole backing allocations
+    even for views, once across categories: history takes priority over diagnostics,
+    then scratch. Locations describe actual storage, e.g. cpu or cuda:0.
+
+    This counts tensor payload only, excluding Python objects, opaque live
+    generators and any tensors not supplied. It is not allocator usage or RSS.
+    Reads metadata without cloning tensors or synchronizing devices.
+    """
+    result, seen = {}, set()
+    for category, tensors in (
+        ("history", history),
+        ("diagnostics", diagnostics),
+        ("scratch", scratch),
+    ):
+        result[category] = {}
+        for tensor in tensors:
+            if tensor is None:
+                continue
+
+            storage = tensor.untyped_storage()
+            location = str(tensor.device)
+            key = (location, storage.data_ptr())
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            result[category][location] = (
+                result[category].get(location, 0) + storage.nbytes()
+            )
+
+    return result

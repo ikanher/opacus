@@ -22,6 +22,7 @@ privacy bound.
 
 from __future__ import annotations
 
+import copy
 import math
 import os
 from collections import deque
@@ -31,7 +32,6 @@ import torch
 
 from ._utils import check_processed_flag, generate_noise, mark_as_processed
 from .base import NoiseMechanism, NoiseMechanismOptimizer
-
 
 MIN_C0 = 1e-12
 
@@ -76,9 +76,7 @@ class CorrelatedNoiseMechanism(NoiseMechanism):
             raise ValueError(f"coeffs[0] must be > {MIN_C0:g}")
 
         self.z_std = float(z_std)
-        self._history: Deque[torch.Tensor] = deque(
-            maxlen=max(0, len(self.coeffs) - 1)
-        )
+        self._history: Deque[torch.Tensor] = deque(maxlen=max(0, len(self.coeffs) - 1))
         self.last_flat_z: Optional[torch.Tensor] = None
         self.last_flat_u: Optional[torch.Tensor] = None
         self.steps_with_noise: int = 0
@@ -107,6 +105,20 @@ class CorrelatedNoiseMechanism(NoiseMechanism):
     def max_state_depth(self) -> int:
         """Maximum cached history length required by the configured bandwidth."""
         return max(0, self.bandwidth - 1)
+
+    def noise_state_inventory(self):
+        """Return how many bytes historical noise and diagnostic tensors retain.
+
+        Returns category → memory location → integer byte count. History counts
+        cached correlated noise vectors; diagnostics counts last_flat_z and
+        last_flat_u copies; scratch is empty. Shared backing allocations are
+        counted once, including the whole allocation for a view. Excludes
+        within-step temporaries and model/gradient memory. Does not clone or
+        synchronize devices.
+        """
+        from ._utils import storage_inventory
+
+        return storage_inventory(self._history, [self.last_flat_z, self.last_flat_u])
 
     def reset_state(self) -> None:
         """Drop the streamed recurrence history and cached debug tensors."""
@@ -261,7 +273,7 @@ class CorrelatedNoiseMechanism(NoiseMechanism):
             # the optimizer sees the same layout it would under iid Gaussian noise.
             summed_chunk = summed_flat[offset:next_offset].reshape(shape)
             noise_chunk = u_flat[offset:next_offset].reshape(shape)
-            p.grad = (summed_chunk + noise_chunk).view_as(p)
+            p.grad = (summed_chunk + noise_chunk).to(dtype=p.dtype).view_as(p)
 
             mark_as_processed(p.summed_grad)
             offset = next_offset
@@ -323,7 +335,7 @@ class CorrelatedNoiseMechanism(NoiseMechanism):
 
 class InverseBandNoiseMechanism(CorrelatedNoiseMechanism):
     """
-    Streamed inverse-side banded runtime used by BISR / BandInvMF-style paths.
+    Apply the finite inverse filter for BIFR, BISR and BandInvMF.
 
     Here the public runtime object is the inverse-side coefficient list
     `inverse_coeffs`. Instead of solving `C u = z` by forward substitution, the
@@ -332,7 +344,33 @@ class InverseBandNoiseMechanism(CorrelatedNoiseMechanism):
         `u_t = sum_i (C^{-1})_i z_{t-i}`
 
     online. This is the inverse-family implementation contract used by
-    BISR (Kalinin et al., 2026) and BandInvMF-style runtime surfaces.
+    BISR (Kalinin et al., 2026 draft), Algorithm 1, “Differentially Private SGD
+    with Banded Inverse Matrix Factorization”, and BIFR (Kalinin et al., 2026
+    draft, ICLR version), Algorithm 1, “Differentially Private Model Training
+    with γ-BIFR”, and Section 3's “Noise Regeneration” paragraph.
+
+    Mapping type: implementation-contract. For supplied inverse coefficients
+    a_j, this evaluates u_t = ∑ a_j z_{t-j}, with missing startup lags zero.
+    It does not derive coefficients or certify a privacy bound. Exactness is
+    algebraic; floating-point releases are compared with dtype tolerances.
+
+    Args:
+        inverse_coeffs: Finite first column of C⁻¹; its length p is bandwidth,
+            including the current draw. Coefficients must be finite, with
+            a_0 > MIN_C0. At most p-1 historical descriptors/vectors are kept.
+        z_std: Finite nonnegative iid noise standard deviation in the caller's
+            reduction convention, not a dimensionless DP noise multiplier.
+            Mean reduction multiplies it by expected_batch_size and
+            accumulated_iterations before drawing on the summed-gradient scale.
+        debug_non_finite: Include tensor summaries in non-finite diagnostics.
+        noise_history_mode: "regenerate" (default) keeps PRNG snapshots and
+            original draw scales; "stored" keeps full historical iid vectors.
+        record_noise_diagnostics: Retain last_flat_z and last_flat_u copies
+            when true; defaults to false. Their storage is inventoried separately.
+
+    One device per noiser is required. Layout/order must stay fixed until reset;
+    secure replay is rejected. Ordinary CPU replay is validated locally;
+    CUDA/ROCm replay has separate accelerator acceptance tests pending execution.
     """
 
     def __init__(
@@ -341,12 +379,231 @@ class InverseBandNoiseMechanism(CorrelatedNoiseMechanism):
         inverse_coeffs: Sequence[float],
         z_std: float,
         debug_non_finite: bool = False,
+        noise_history_mode: str = "regenerate",
+        record_noise_diagnostics: bool = False,
     ):
         super().__init__(
             coeffs=inverse_coeffs,
             z_std=z_std,
             debug_non_finite=debug_non_finite,
         )
+
+        if noise_history_mode not in ("regenerate", "stored"):
+            raise ValueError("noise_history_mode must be regenerate or stored")
+
+        self.noise_history_mode = noise_history_mode
+        self.record_noise_diagnostics = bool(record_noise_diagnostics)
+        self._replay_history = deque(maxlen=self.max_state_depth)
+        self._layout = None
+        self._parameter_ids = None
+        self._live_generator = None
+        self._default_generator = False
+
+    @property
+    def state_depth(self):
+        """Number of retained prior draws, in [0, p-1], excluding the fresh draw."""
+        history = (
+            self._replay_history
+            if self.noise_history_mode == "regenerate"
+            else self._history
+        )
+        return len(history)
+
+    def reset_state(self):
+        """Clear history, layout and counters without rewinding any generator."""
+        super().reset_state()
+
+        self._replay_history = deque(maxlen=self.max_state_depth)
+        self._layout = self._parameter_ids = None
+        self._live_generator = None
+        self._default_generator = False
+
+    @staticmethod
+    def _draw(params, std, generator, secure_mode=False):
+        # Parameter-wise shapes and order affect RNG consumption; one flat draw
+        # is not an interchangeable replay of these calls. Zero scale consumes no RNG.
+        return torch.cat(
+            [
+                generate_noise(
+                    std=std,
+                    reference=p.summed_grad,
+                    generator=generator,
+                    secure_mode=secure_mode,
+                ).reshape(-1)
+                for p in params
+            ]
+        )
+
+    def _validate_parameters(self, params):
+        """Check layout and gradient availability before any RNG advancement."""
+        layout = tuple((tuple(p.shape), str(p.dtype), str(p.device)) for p in params)
+        identities = tuple(id(p) for p in params)
+        if len({entry[2] for entry in layout}) != 1:
+            raise ValueError("inverse noise requires a single-device parameter layout")
+
+        if self._layout is not None and (
+            layout != self._layout
+            or (self._parameter_ids is not None and identities != self._parameter_ids)
+        ):
+            raise ValueError("inverse noise parameter layout changed with live state")
+
+        for p in params:
+            if p.summed_grad is None:
+                raise ValueError("missing summed gradient")
+            check_processed_flag(p.summed_grad)
+
+        return layout, identities
+
+    def add_noise(self, optimizer):
+        """Apply the finite inverse filter using PRNG replay or stored draws.
+
+        Adaptation of BIFR (Kalinin et al., 2026 draft, ICLR version), Algorithm 1,
+        “Differentially Private Model Training with γ-BIFR”. Consumes
+        optimizer.summed_grad and writes optimizer.grad.
+        The paper replays sequentially before drawing fresh noise; here a private
+        stream restores each prior snapshot after the one fresh draw. This also
+        handles external draws on a shared default stream and historical scales.
+        Replay leaves that live stream untouched. Skipped microbatches must be
+        filtered by the optimizer before calling this method.
+        The finite filter is unchanged; no accountant guarantee is added.
+        """
+        params = list(optimizer.params)
+        if not params:
+            return
+
+        if optimizer.secure_mode and self.noise_history_mode == "regenerate":
+            raise ValueError(
+                "secure generator replay is not supported; use stored history mode"
+            )
+
+        layout, identities = self._validate_parameters(params)
+
+        device = params[0].device
+        generator = optimizer.generator
+        default = generator is None
+        if default:
+            generator = (
+                torch.default_generator
+                if device.type == "cpu"
+                else torch.cuda.default_generators[device.index or 0]
+            )
+
+        if not isinstance(generator, torch.Generator) or generator.device != device:
+            raise ValueError("unsupported noise generator/device for inverse replay")
+
+        std = self._pre_scale_noise_std(optimizer)
+        if not math.isfinite(std) or std < 0:
+            raise ValueError("noise scale must be finite and nonnegative")
+
+        # Keep snapshots only for history; the opaque live generator is borrowed.
+        before = (
+            generator.get_state() if self.noise_history_mode == "regenerate" else None
+        )
+        z_flat = self._draw(params, std, generator, optimizer.secure_mode)
+        self._assert_finite(name="z_flat", tensor=z_flat, step=self.steps_with_noise)
+
+        if self.noise_history_mode == "stored":
+            u_flat = self._solve_correlated_noise(z_flat)
+        else:
+            u_flat = self.inverse_coeffs[0] * z_flat
+            # BIFR (Algorithm 1) replays past draws in sequence, then draws fresh.
+            # Here we draw fresh first and replay each past draw with a private
+            # generator. Each entry saves the state before that draw and its std;
+            # restoring both reproduces the draw without advancing the live RNG.
+            # History is newest first: inverse_coeffs[1] weights the previous
+            # draw, inverse_coeffs[2] the one before that, and so on.
+            replay = torch.Generator(device=device)
+            for lag, (state, historical_std) in enumerate(self._replay_history, 1):
+                replay.set_state(state)
+                previous = self._draw(params, historical_std, replay)
+                u_flat = u_flat + self.inverse_coeffs[lag] * previous
+
+            if self.max_state_depth:
+                self._replay_history.appendleft((before, std))
+
+        summed_flat = torch.cat([p.summed_grad.reshape(-1) for p in params])
+        self._assert_finite(
+            name="summed_flat", tensor=summed_flat, step=self.steps_with_noise
+        )
+        self._assert_finite(name="u_flat", tensor=u_flat, step=self.steps_with_noise)
+        self._assign_noised_grads(
+            [(p, p.shape, p.numel()) for p in params],
+            summed_flat=summed_flat,
+            u_flat=u_flat,
+        )
+        self._layout, self._parameter_ids = layout, identities
+        self._live_generator, self._default_generator = generator, default
+        self.last_flat_z = (
+            z_flat.detach().clone() if self.record_noise_diagnostics else None
+        )
+        self.last_flat_u = (
+            u_flat.detach().clone() if self.record_noise_diagnostics else None
+        )
+        self.steps_with_noise += 1
+
+    def validate_state_dict(self, state):
+        """Preflight mode, coefficients, layout and replay RNG compatibility.
+
+        Uses an isolated probe generator, without restoring the live stream.
+        DPOptimizer additionally checks current parameters and RNG ownership.
+        Legacy vector history is accepted only in explicit stored mode.
+        This is compatibility checking, not a general untrusted-payload validator.
+        """
+        version = state.get("schema_version")
+        if version is None and self.noise_history_mode != "stored":
+            raise ValueError("legacy vector history requires explicit stored mode")
+        if version is not None and version != 1:
+            raise ValueError("incompatible inverse replay schema version")
+        if state.get("noise_history_mode", "stored") != self.noise_history_mode:
+            raise ValueError("incompatible noise history mode")
+
+        coeffs = tuple(
+            state.get("inverse_coeffs", state.get("coeffs", self.inverse_coeffs))
+        )
+        if (
+            coeffs != self.inverse_coeffs
+            or state.get("z_std", self.z_std) != self.z_std
+        ):
+            raise ValueError("incompatible inverse coefficients or noise scale")
+
+        layout = state.get("layout_signature")
+        if layout is not None:
+            if not isinstance(layout, (tuple, list)) or not all(
+                isinstance(x, (tuple, list)) and len(x) == 3 for x in layout
+            ):
+                raise ValueError("incompatible parameter layout signature")
+            layout = tuple(tuple(x) for x in layout)
+            if self._layout is not None and layout != self._layout:
+                raise ValueError("incompatible parameter layout")
+
+        history = (
+            state.get("replay_history", [])
+            if self.noise_history_mode == "regenerate"
+            else state.get("history", [])
+        )
+        if len(history) > self.max_state_depth:
+            raise ValueError("incompatible history length")
+
+        if self.noise_history_mode == "regenerate":
+            self._validate_replay_history(state, history, layout)
+
+    @staticmethod
+    def _validate_replay_history(state, history, layout):
+        """Check saved draw scales and RNG states with an isolated generator."""
+        if history and not layout:
+            raise ValueError("replay history requires layout")
+
+        device = torch.device(layout[0][2]) if layout else torch.device("cpu")
+        probe = torch.Generator(device=device)
+        try:
+            for rng, std in history:
+                if not math.isfinite(std) or std < 0:
+                    raise ValueError("invalid historical scale")
+                probe.set_state(rng.cpu())
+            if state.get("default_generator_state") is not None:
+                probe.set_state(state["default_generator_state"].cpu())
+        except (TypeError, RuntimeError) as exc:
+            raise ValueError("incompatible replay generator state/backend") from exc
 
     @property
     def inverse_coeffs(self) -> tuple[float, ...]:
@@ -385,38 +642,84 @@ class InverseBandNoiseMechanism(CorrelatedNoiseMechanism):
 
         return u_flat
 
-    def state_dict(self) -> Mapping[str, Any]:
-        """Serialize runtime-only inverse-side recurrence state for checkpointing."""
-        return {
+    def state_dict(self):
+        """Copy versioned history, layout and completed-noise-step count.
+
+        Also saves default-stream continuation when used. Dedicated-generator
+        continuation belongs to DPOptimizer.state_dict; a mechanism-only save
+        requires the caller to checkpoint that generator separately. RNG state
+        is private training state and must not be written to telemetry.
+        """
+        state = {
+            "schema_version": 1,
+            "noise_history_mode": self.noise_history_mode,
             "inverse_coeffs": self.inverse_coeffs,
-            "coeffs": self.inverse_coeffs,
+            "coeffs": self.coeffs,
             "z_std": self.z_std,
-            "history": [h.detach().clone() for h in self._history],
             "steps_with_noise": self.steps_with_noise,
+            "layout_signature": self._layout,
         }
+        if self.noise_history_mode == "regenerate":
+            state["replay_history"] = [
+                (rng.clone(), std) for rng, std in self._replay_history
+            ]
+        else:
+            state["history"] = [h.detach().clone() for h in self._history]
+        if self._default_generator and self._live_generator is not None:
+            state["default_generator_state"] = self._live_generator.get_state()
+        return state
 
-    def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
-        """Restore runtime-only inverse-side recurrence state from checkpoint data."""
-        coeffs = tuple(
-            float(c)
-            for c in state_dict.get(
-                "inverse_coeffs",
-                state_dict.get("coeffs", self.inverse_coeffs),
+    def load_state_dict(self, state):
+        """Restore compatible history and, if present, the device's default RNG.
+
+        This can rewind global randomness. Dedicated RNG continuation is restored
+        by DPOptimizer. Cross-device/version bitwise portability is not promised.
+        """
+        self.validate_state_dict(state)
+        self.reset_state()
+        self._layout = copy.deepcopy(state.get("layout_signature"))
+        self.steps_with_noise = int(state.get("steps_with_noise", 0))
+
+        if self.noise_history_mode == "regenerate":
+            self._replay_history.extend(
+                (rng.cpu().clone(), float(std))
+                for rng, std in state.get("replay_history", [])
             )
+        else:
+            self._history.extend(h.detach().clone() for h in state.get("history", []))
+
+        default = state.get("default_generator_state")
+        if default is not None:
+            device = torch.device(self._layout[0][2])
+            generator = (
+                torch.default_generator
+                if device.type == "cpu"
+                else torch.cuda.default_generators[device.index or 0]
+            )
+
+            generator.set_state(default.cpu())
+            self._live_generator, self._default_generator = generator, True
+
+    def noise_state_inventory(self):
+        """Return how many bytes replay history and diagnostic tensors retain.
+
+        Returns category → memory location → integer byte count. History counts
+        saved RNG-state tensors in regenerate mode, or past iid noise vectors
+        in stored mode; diagnostics counts optional last_flat_z/last_flat_u
+        copies; scratch is empty. Locations are actual storage locations, so
+        RNG snapshots kept on CPU are reported under cpu even for GPU training.
+
+        Shared backing allocations are counted once, including the whole
+        allocation for a view. Excludes within-step temporaries, model/gradient
+        memory, Python objects and opaque live generators. Reads metadata only:
+        no tensor copies, noise regeneration or device synchronization.
+        """
+        from ._utils import storage_inventory
+
+        history = (
+            [rng for rng, _ in self._replay_history]
+            if self.noise_history_mode == "regenerate"
+            else list(self._history)
         )
-        z_std = float(state_dict.get("z_std", self.z_std))
-        history = state_dict.get("history", [])
-        steps_with_noise = int(state_dict.get("steps_with_noise", 0))
 
-        if coeffs != self.inverse_coeffs:
-            raise ValueError("cannot load state with mismatched inverse-band coefficients")
-        if z_std != self.z_std:
-            raise ValueError("cannot load state with mismatched z_std")
-
-        self._history = deque(maxlen=self.max_state_depth)
-        for h in history:
-            self._history.append(torch.as_tensor(h).detach().clone())
-
-        self.steps_with_noise = steps_with_noise
-        self.last_flat_z = None
-        self.last_flat_u = None
+        return storage_inventory(history, [self.last_flat_z, self.last_flat_u])

@@ -16,17 +16,18 @@
 import copy
 import io
 
+import opacus.privacy_engine as pe_mod
 import pytest
 import torch
 import torch.nn.functional as F
 from opacus import NoiseMechanismConfig, PrivacyEngine
+from opacus.mechanism_contracts import SamplingSemantics
 from opacus.optimizers import (
     CorrelatedNoiseMechanism,
-    DPOptimizer,
     DistributedDPOptimizer,
+    DPOptimizer,
     InverseBandNoiseMechanism,
 )
-from opacus.mechanism_contracts import SamplingSemantics
 from opacus.utils.uniform_sampler import (
     DistributedBMinSepSampler,
     DistributedCyclicPoissonSampler,
@@ -34,8 +35,6 @@ from opacus.utils.uniform_sampler import (
 )
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
-
-import opacus.privacy_engine as pe_mod
 
 
 def _loader(
@@ -63,13 +62,17 @@ def _index_loader(*, n_samples: int = 64, batch_size: int = 8) -> DataLoader:
     )
 
 
-def _patch_distributed_primitives(monkeypatch, *, rank: int, world_size: int = 2) -> None:
+def _patch_distributed_primitives(
+    monkeypatch, *, rank: int, world_size: int = 2
+) -> None:
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: world_size)
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, op=None: None)
 
 
-def _one_step(private_model: nn.Module, dp_optimizer, private_loader: DataLoader) -> None:
+def _one_step(
+    private_model: nn.Module, dp_optimizer, private_loader: DataLoader
+) -> None:
     x, y = next(iter(private_loader))
     dp_optimizer.zero_grad()
     loss = F.cross_entropy(private_model(x), y)
@@ -122,7 +125,8 @@ def test_noise_mechanism_config_blt_canonicalizes_legacy_accounting_mode() -> No
 
 def test_noise_mechanism_config_blt_rejects_non_blt_accountant() -> None:
     with pytest.raises(
-        ValueError, match="blt mechanism requires blt_accountant, bnb_accountant, or random_allocation_accountant routing"
+        ValueError,
+        match="blt mechanism requires blt_accountant, bnb_accountant, or random_allocation_accountant routing",
     ):
         NoiseMechanismConfig(
             mechanism="blt",
@@ -201,7 +205,9 @@ def test_make_private_bsr_requires_torch_sampler() -> None:
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
-    with pytest.raises(ValueError, match="bsr mechanism requires fixed-batch semantics"):
+    with pytest.raises(
+        ValueError, match="bsr mechanism requires fixed-batch semantics"
+    ):
         pe.make_private(
             module=model,
             optimizer=optimizer,
@@ -474,7 +480,9 @@ def test_distributed_bnb_rejects_b_min_sep_for_unsupported_family(monkeypatch) -
     model = nn.Linear(4, 3)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
-    with pytest.raises(ValueError, match="supports sampling_mode in \\{None, 'torch_sampler'\\} only"):
+    with pytest.raises(
+        ValueError, match="supports sampling_mode in \\{None, 'torch_sampler'\\} only"
+    ):
         pe.make_private(
             module=model,
             optimizer=optimizer,
@@ -714,7 +722,9 @@ def test_distributed_bsr_rejects_fsdp(monkeypatch) -> None:
         )
 
 
-def test_explicit_distributed_correlated_runtime_matches_single_process(monkeypatch) -> None:
+def test_explicit_distributed_correlated_runtime_matches_single_process(
+    monkeypatch,
+) -> None:
     _patch_distributed_primitives(monkeypatch, rank=0, world_size=2)
 
     base_a = nn.Linear(4, 3)
@@ -766,7 +776,9 @@ def test_explicit_distributed_inverse_band_runtime_matches_single_process(
         expected_batch_size=8,
         loss_reduction="mean",
         generator=torch.Generator().manual_seed(1730),
-        noise_mechanism=InverseBandNoiseMechanism(inverse_coeffs=[1.0, 0.25], z_std=0.4),
+        noise_mechanism=InverseBandNoiseMechanism(
+            inverse_coeffs=[1.0, 0.25], z_std=0.4
+        ),
     )
     distributed = DistributedDPOptimizer(
         optimizer=torch.optim.SGD(base_b.parameters(), lr=0.05),
@@ -775,7 +787,9 @@ def test_explicit_distributed_inverse_band_runtime_matches_single_process(
         expected_batch_size=8,
         loss_reduction="mean",
         generator=torch.Generator().manual_seed(1730),
-        noise_mechanism=InverseBandNoiseMechanism(inverse_coeffs=[1.0, 0.25], z_std=0.4),
+        noise_mechanism=InverseBandNoiseMechanism(
+            inverse_coeffs=[1.0, 0.25], z_std=0.4
+        ),
     )
 
     single.zero_grad()
@@ -834,7 +848,7 @@ def test_distributed_bandinvmf_supports_explicit_runtime_mechanism(monkeypatch) 
         clipping="flat",
         grad_sample_mode="hooks",
         noise_mechanism=InverseBandNoiseMechanism(
-            inverse_coeffs=[1.0, 0.2], z_std=0.01
+            inverse_coeffs=[1.0, 0.2], z_std=0.01, record_noise_diagnostics=True
         ),
     )
     _one_step(private_model, dp_optimizer, private_loader)
@@ -1113,7 +1127,11 @@ def test_distributed_bsr_history_progression_and_bounds(monkeypatch) -> None:
             dp_optimizer.zero_grad()
             _set_zero_grad_samples(dp_optimizer, batch_size=8)
             dp_optimizer.step()
-        return mechanism.steps_with_noise, mechanism.state_depth, mechanism.max_state_depth
+        return (
+            mechanism.steps_with_noise,
+            mechanism.state_depth,
+            mechanism.max_state_depth,
+        )
 
     steps_rank0, depth_rank0, max_depth_rank0 = _run_steps_for_rank(0)
     steps_rank1, depth_rank1, max_depth_rank1 = _run_steps_for_rank(1)

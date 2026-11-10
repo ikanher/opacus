@@ -26,16 +26,14 @@ from opacus.noise_mechanisms import (
     InverseBandNoiseMechanism,
     NoiseMechanism,
 )
-from opacus.noise_mechanisms._utils import (
-    check_processed_flag as _check_processed_flag,
-    generate_noise as _generate_noise,
-    mark_as_processed as _mark_as_processed,
-)
+from opacus.noise_mechanisms._utils import check_processed_flag as _check_processed_flag
+from opacus.noise_mechanisms._utils import generate_noise as _generate_noise  # noqa
+from opacus.noise_mechanisms._utils import mark_as_processed as _mark_as_processed
 from opacus.optimizers.utils import params
 from torch import nn
 from torch.optim import Optimizer
 
-
+# _generate_noise remains a compatibility re-export for existing callers.
 logger = logging.getLogger(__name__)
 logger.disabled = True
 
@@ -445,14 +443,30 @@ class DPOptimizer(Optimizer):
         return self.original_optimizer.__repr__()
 
     def state_dict(self):
+        """Save optimizer state, runtime noiser state and noise RNG continuation.
+
+        Includes default/dedicated RNG ownership. Dedicated state is saved here;
+        inverse noisers save default-stream state in their mechanism payload.
+        Save model weights and other training RNG/sampler state separately.
+        """
         state = dict(self.original_optimizer.state_dict())
         state["_dp_noise_mechanism_name"] = type(self.noise_mechanism).__name__
         state["_dp_noise_mechanism_state"] = dict(self.noise_mechanism.state_dict())
+        state["_dp_noise_generator_kind"] = (
+            "default" if self.generator is None else "dedicated"
+        )
         if self.generator is not None and hasattr(self.generator, "get_state"):
             state["_dp_noise_generator_state"] = self.generator.get_state()
         return state
 
     def load_state_dict(self, state_dict) -> None:
+        """Restore optimizer and runtime noise state on a compatible setup.
+
+        Inverse checkpoints preflight mode, coefficients, parameter layout and
+        RNG ownership before loading the underlying optimizer. Preserve parameter
+        ordering: shape/dtype/device signatures cannot identify a permutation of
+        otherwise identical blocks. Legacy vector history requires stored mode.
+        """
         mechanism_state = state_dict.get("_dp_noise_mechanism_state")
         generator_state = state_dict.get("_dp_noise_generator_state")
         optimizer_state = {
@@ -460,9 +474,45 @@ class DPOptimizer(Optimizer):
             for k, v in state_dict.items()
             if not k.startswith("_dp_noise_mechanism_")
             and k != "_dp_noise_generator_state"
+            and k != "_dp_noise_generator_kind"
             and not k.startswith("_dp_distributed_")
         }
-        self.original_optimizer.load_state_dict(optimizer_state)
+        # Preflight must precede optimizer load: rejection must preserve moments,
+        # parameter-group settings and fresh randomness as well as noise history.
+        if isinstance(self.noise_mechanism, InverseBandNoiseMechanism):
+            saved_kind = state_dict.get("_dp_noise_generator_kind")
+
+            # Older checkpoints identify the stream by where continuation lives.
+            if saved_kind is None:
+                if generator_state is not None:
+                    saved_kind = "dedicated"
+                elif (
+                    mechanism_state
+                    and mechanism_state.get("default_generator_state") is not None
+                ):
+                    saved_kind = "default"
+
+            current_kind = "default" if self.generator is None else "dedicated"
+            if saved_kind is not None and saved_kind != current_kind:
+                raise ValueError(
+                    "incompatible noise generator ownership; restore with the same default/dedicated generator configuration"
+                )
+
+        if mechanism_state is not None and hasattr(
+            self.noise_mechanism, "validate_state_dict"
+        ):
+            self.noise_mechanism.validate_state_dict(mechanism_state)
+            layout = mechanism_state.get("layout_signature")
+            current = tuple(
+                (tuple(p.shape), str(p.dtype), str(p.device)) for p in self.params
+            )
+            if layout is not None and tuple(layout) != current:
+                raise ValueError("incompatible optimizer parameter layout")
+
+        if generator_state is not None and self.generator is not None:
+            probe = torch.Generator(device=self.generator.device)
+            probe.set_state(generator_state.cpu())
+
         if mechanism_state is None and type(self.noise_mechanism) in (
             BufferedToeplitzNoiseMechanism,
             CorrelatedNoiseMechanism,
@@ -471,14 +521,16 @@ class DPOptimizer(Optimizer):
             missing_kind = (
                 "blt"
                 if isinstance(self.noise_mechanism, BufferedToeplitzNoiseMechanism)
-                else
-                "inverse-band"
-                if isinstance(self.noise_mechanism, InverseBandNoiseMechanism)
-                else "correlated"
+                else (
+                    "inverse-band"
+                    if isinstance(self.noise_mechanism, InverseBandNoiseMechanism)
+                    else "correlated"
+                )
             )
             raise ValueError(
                 f"missing {missing_kind} noise mechanism state in optimizer checkpoint"
             )
+        self.original_optimizer.load_state_dict(optimizer_state)
         if mechanism_state is not None:
             self.noise_mechanism.load_state_dict(mechanism_state)
         if (
