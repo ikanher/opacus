@@ -499,38 +499,41 @@ class InverseBandNoiseMechanism(CorrelatedNoiseMechanism):
         before = (
             generator.get_state() if self.noise_history_mode == "regenerate" else None
         )
-        z_flat = self._draw(params, std, generator, optimizer.secure_mode)
-        self._assert_finite(name="z_flat", tensor=z_flat, step=self.steps_with_noise)
-
         if self.noise_history_mode == "stored":
+            z_flat = self._draw(params, std, generator, optimizer.secure_mode)
+            self._assert_finite(
+                name="z_flat", tensor=z_flat, step=self.steps_with_noise
+            )
             u_flat = self._solve_correlated_noise(z_flat)
+            summed_flat = torch.cat([p.summed_grad.reshape(-1) for p in params])
+            self._assert_finite(
+                name="summed_flat", tensor=summed_flat, step=self.steps_with_noise
+            )
+            self._assert_finite(
+                name="u_flat", tensor=u_flat, step=self.steps_with_noise
+            )
+            self._assign_noised_grads(
+                [(p, p.shape, p.numel()) for p in params],
+                summed_flat=summed_flat,
+                u_flat=u_flat,
+            )
         else:
-            u_flat = self.inverse_coeffs[0] * z_flat
-            # BIFR (Algorithm 1) replays past draws in sequence, then draws fresh.
-            # Here we draw fresh first and replay each past draw with a private
-            # generator. Each entry saves the state before that draw and its std;
-            # restoring both reproduces the draw without advancing the live RNG.
-            # History is newest first: inverse_coeffs[1] weights the previous
-            # draw, inverse_coeffs[2] the one before that, and so on.
-            replay = torch.Generator(device=device)
-            for lag, (state, historical_std) in enumerate(self._replay_history, 1):
-                replay.set_state(state)
-                previous = self._draw(params, historical_std, replay)
-                u_flat = u_flat + self.inverse_coeffs[lag] * previous
-
+            z_flat, u_flat = self._regenerate_noise(params, std, generator)
             if self.max_state_depth:
                 self._replay_history.appendleft((before, std))
+            offset = 0
+            for p in params:
+                noise = u_flat[offset : offset + p.numel()].view_as(p)
+                self._assert_finite(
+                    name="summed_flat", tensor=p.summed_grad, step=self.steps_with_noise
+                )
+                self._assert_finite(
+                    name="u_flat", tensor=noise, step=self.steps_with_noise
+                )
+                p.grad = (p.summed_grad + noise).to(dtype=p.dtype)
+                mark_as_processed(p.summed_grad)
+                offset += p.numel()
 
-        summed_flat = torch.cat([p.summed_grad.reshape(-1) for p in params])
-        self._assert_finite(
-            name="summed_flat", tensor=summed_flat, step=self.steps_with_noise
-        )
-        self._assert_finite(name="u_flat", tensor=u_flat, step=self.steps_with_noise)
-        self._assign_noised_grads(
-            [(p, p.shape, p.numel()) for p in params],
-            summed_flat=summed_flat,
-            u_flat=u_flat,
-        )
         self._layout, self._parameter_ids = layout, identities
         self._live_generator, self._default_generator = generator, default
         self.last_flat_z = (
@@ -540,6 +543,62 @@ class InverseBandNoiseMechanism(CorrelatedNoiseMechanism):
             u_flat.detach().clone() if self.record_noise_diagnostics else None
         )
         self.steps_with_noise += 1
+
+    def _regenerate_noise(self, params, std, generator):
+        """Replay lag-major into one accumulator without full-vector draw copies.
+
+        Parameter-shaped calls and their order must match the original stream.
+        Keep multiplication separate from addition to preserve its rounding.
+        Temporary payload is one full accumulator plus parameter-sized sampling
+        and conversion workspace; diagnostic raw-noise capture is opt-in.
+        """
+        dtype = params[0].dtype
+        for p in params[1:]:
+            dtype = torch.promote_types(dtype, p.dtype)
+
+        u_flat = torch.empty(
+            sum(p.numel() for p in params), device=params[0].device, dtype=dtype
+        )
+
+        z_flat = torch.empty_like(u_flat) if self.record_noise_diagnostics else None
+
+        def accumulate(scale, stream, coefficient, fresh=False):
+            offset = 0
+            for p in params:
+                block = generate_noise(
+                    std=scale, reference=p.summed_grad, generator=stream
+                ).to(dtype=dtype)
+
+                if fresh:
+                    self._assert_finite(
+                        name="z_flat", tensor=block, step=self.steps_with_noise
+                    )
+                    if z_flat is not None:
+                        z_flat[offset : offset + p.numel()].copy_(block.reshape(-1))
+
+                block.mul_(coefficient)
+                target = u_flat[offset : offset + p.numel()]
+
+                if fresh:
+                    target.copy_(block.reshape(-1))
+                else:
+                    target.add_(block.reshape(-1))
+
+                offset += p.numel()
+
+                # Make sure temporary memory allocations are freed
+                del block
+
+        accumulate(std, generator, self.inverse_coeffs[0], fresh=True)
+
+        # Draw fresh once, then restore each historical snapshot privately.
+        # A complete parameter traversal per lag preserves RNG consumption.
+        replay = torch.Generator(device=params[0].device)
+        for lag, (state, historical_std) in enumerate(self._replay_history, 1):
+            replay.set_state(state)
+            accumulate(historical_std, replay, self.inverse_coeffs[lag])
+
+        return z_flat, u_flat
 
     def validate_state_dict(self, state):
         """Preflight mode, coefficients, layout and replay RNG compatibility.

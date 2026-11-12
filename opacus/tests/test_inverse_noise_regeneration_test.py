@@ -40,7 +40,11 @@ def context(device="cpu", generator=True, shapes=((3, 2), (3,))):
         expected_batch_size=4,
         accumulated_iterations=1,
         secure_mode=False,
-        generator=torch.Generator(device=device).manual_seed(19) if generator else None,
+        generator=(
+            torch.Generator(device=params[0].device).manual_seed(19)
+            if generator
+            else None
+        ),
     )
 
 
@@ -252,7 +256,9 @@ def optimizer(p=4, default_rng=False, device="cpu", seed=31):
         max_grad_norm=1.0,
         expected_batch_size=4,
         generator=(
-            None if default_rng else torch.Generator(device=device).manual_seed(seed)
+            None
+            if default_rng
+            else torch.Generator(device=param.device).manual_seed(seed)
         ),
         noise_mechanism=mechanism(p),
     )
