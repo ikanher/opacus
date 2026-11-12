@@ -140,3 +140,62 @@ def test_noncontiguous_summed_gradients_match_stored():
             assert not ctx.params[0].summed_grad.is_contiguous()
             noiser.add_noise(ctx)
         assert torch.equal(a.params[0].grad, b.params[0].grad)
+
+
+@pytest.mark.parametrize("blocks", [1, 16])
+def test_finite_checks_have_constant_scalar_reads(blocks):
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class ScalarReads(TorchDispatchMode):
+        count = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func == torch.ops.aten._local_scalar_dense.default:
+                self.count += 1
+            return func(*args, **(kwargs or {}))
+
+    noiser = mechanism(p=4)
+    ctx = context(shapes=((8,),) * blocks)
+    for _ in range(5):
+        release(noiser, ctx)
+    with ScalarReads() as reads:
+        release(noiser, ctx)
+    assert reads.count <= 3
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_nonfinite_late_gradient_rejects_before_assigning_outputs(bad):
+    noiser = mechanism(p=4)
+    ctx = context()
+    for p in ctx.params:
+        p.summed_grad = torch.zeros_like(p)
+    ctx.params[-1].summed_grad[0] = bad
+    with pytest.raises(ValueError, match="summed_flat"):
+        noiser.add_noise(ctx)
+    assert all(p.grad is None for p in ctx.params)
+    assert noiser.first_non_finite_event["tensor"] == "summed_flat"
+
+
+def test_nonfinite_fresh_noise_keeps_live_rng_continuation(monkeypatch):
+    from opacus.noise_mechanisms import correlated
+
+    original = correlated.generate_noise
+
+    def bad_draw(**kwargs):
+        block = original(**kwargs)
+        if block.shape == (3,):
+            block[0] = float("nan")
+        return block
+
+    ctx, oracle = context(), context()
+    reference.reference_draw(oracle, 0.2)
+    noiser = mechanism(p=4)
+    for p in ctx.params:
+        p.summed_grad = torch.zeros_like(p)
+    monkeypatch.setattr(correlated, "generate_noise", bad_draw)
+    with pytest.raises(ValueError, match="z_flat"):
+        noiser.add_noise(ctx)
+    assert torch.equal(ctx.generator.get_state(), oracle.generator.get_state())
+    assert noiser.first_non_finite_event["non_finite"] == 1
+    assert noiser.state_depth == 0
+    assert all(p.grad is None for p in ctx.params)

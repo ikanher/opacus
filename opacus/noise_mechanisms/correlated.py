@@ -518,21 +518,19 @@ class InverseBandNoiseMechanism(CorrelatedNoiseMechanism):
                 u_flat=u_flat,
             )
         else:
-            z_flat, u_flat = self._regenerate_noise(params, std, generator)
+            z_flat, u_flat = self._regenerate_noise(params, std, generator, before)
+            self._assert_finite_chunks("summed_flat", [p.summed_grad for p in params])
+
+            noise_chunks = u_flat.split([p.numel() for p in params])
+            self._assert_finite_chunks("u_flat", noise_chunks)
+
             if self.max_state_depth:
                 self._replay_history.appendleft((before, std))
-            offset = 0
-            for p in params:
-                noise = u_flat[offset : offset + p.numel()].view_as(p)
-                self._assert_finite(
-                    name="summed_flat", tensor=p.summed_grad, step=self.steps_with_noise
-                )
-                self._assert_finite(
-                    name="u_flat", tensor=noise, step=self.steps_with_noise
-                )
+
+            for p, chunk in zip(params, noise_chunks):
+                noise = chunk.view_as(p)
                 p.grad = (p.summed_grad + noise).to(dtype=p.dtype)
                 mark_as_processed(p.summed_grad)
-                offset += p.numel()
 
         self._layout, self._parameter_ids = layout, identities
         self._live_generator, self._default_generator = generator, default
@@ -544,7 +542,15 @@ class InverseBandNoiseMechanism(CorrelatedNoiseMechanism):
         )
         self.steps_with_noise += 1
 
-    def _regenerate_noise(self, params, std, generator):
+    def _assert_finite_chunks(self, name, chunks):
+        """Combine device flags before one host read; inspect failures lazily."""
+        if torch.stack([torch.isfinite(chunk).all() for chunk in chunks]).all():
+            return
+
+        for chunk in chunks:
+            self._assert_finite(name=name, tensor=chunk, step=self.steps_with_noise)
+
+    def _regenerate_noise(self, params, std, generator, fresh_state):
         """Replay lag-major into one accumulator without full-vector draw copies.
 
         Parameter-shaped calls and their order must match the original stream.
@@ -562,6 +568,8 @@ class InverseBandNoiseMechanism(CorrelatedNoiseMechanism):
 
         z_flat = torch.empty_like(u_flat) if self.record_noise_diagnostics else None
 
+        fresh_flags = []
+
         def accumulate(scale, stream, coefficient, fresh=False):
             offset = 0
             for p in params:
@@ -570,9 +578,7 @@ class InverseBandNoiseMechanism(CorrelatedNoiseMechanism):
                 ).to(dtype=dtype)
 
                 if fresh:
-                    self._assert_finite(
-                        name="z_flat", tensor=block, step=self.steps_with_noise
-                    )
+                    fresh_flags.append(torch.isfinite(block).all())
                     if z_flat is not None:
                         z_flat[offset : offset + p.numel()].copy_(block.reshape(-1))
 
@@ -590,6 +596,23 @@ class InverseBandNoiseMechanism(CorrelatedNoiseMechanism):
                 del block
 
         accumulate(std, generator, self.inverse_coeffs[0], fresh=True)
+        if not torch.stack(fresh_flags).all():
+            # Recover only failing-draw diagnostics without changing the live RNG
+            # or keeping full raw noise just for this exceptional path.
+            probe = torch.Generator(device=params[0].device)
+            probe.set_state(fresh_state)
+
+            for p in params:
+                block = generate_noise(
+                    std=std, reference=p.summed_grad, generator=probe
+                ).to(dtype=dtype)
+
+                self._assert_finite(
+                    name="z_flat", tensor=block, step=self.steps_with_noise
+                )
+
+                # Make sure temporary memory is freed.
+                del block
 
         # Draw fresh once, then restore each historical snapshot privately.
         # A complete parameter traversal per lag preserves RNG consumption.
