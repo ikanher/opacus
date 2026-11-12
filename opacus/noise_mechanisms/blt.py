@@ -18,9 +18,10 @@ release recurrence; accountant guarantees remain outside this file.
 
 from __future__ import annotations
 
-from typing import Any, List, Mapping, Optional
+from typing import Any, Mapping, Optional
 
 import torch
+
 from opacus.accountants.analysis.blt import BLTPairedParams
 
 from ._utils import check_processed_flag, generate_noise, mark_as_processed
@@ -128,58 +129,6 @@ class BufferedToeplitzNoiseMechanism(NoiseMechanism):
             * float(optimizer.accumulated_iterations)
         )
 
-    def _flatten_generated_z(
-        self, optimizer: NoiseMechanismOptimizer, std: float
-    ) -> tuple[List[tuple[torch.Tensor, torch.Size, int]], torch.Tensor]:
-        specs: List[tuple[torch.Tensor, torch.Size, int]] = []
-        chunks: List[torch.Tensor] = []
-
-        for p in optimizer.params:
-            assert p.summed_grad is not None
-            check_processed_flag(p.summed_grad)
-            noise = generate_noise(
-                std=std,
-                reference=p.summed_grad,
-                generator=optimizer.generator,
-                secure_mode=optimizer.secure_mode,
-            )
-            specs.append((p, p.shape, p.numel()))
-            chunks.append(noise.reshape(-1))
-
-        if not chunks:
-            return specs, torch.zeros((0,), dtype=torch.float32)
-
-        return specs, torch.cat(chunks, dim=0)
-
-    def _flatten_summed_grads(
-        self, specs: List[tuple[torch.Tensor, torch.Size, int]]
-    ) -> torch.Tensor:
-        chunks: List[torch.Tensor] = []
-        for p, _, _ in specs:
-            assert p.summed_grad is not None
-            chunks.append(p.summed_grad.reshape(-1))
-
-        if not chunks:
-            return torch.zeros((0,), dtype=torch.float32)
-
-        return torch.cat(chunks, dim=0)
-
-    def _assign_noised_grads(
-        self,
-        specs: List[tuple[torch.Tensor, torch.Size, int]],
-        *,
-        summed_flat: torch.Tensor,
-        u_flat: torch.Tensor,
-    ) -> None:
-        offset = 0
-        for p, shape, numel in specs:
-            next_offset = offset + numel
-            summed_chunk = summed_flat[offset:next_offset].reshape(shape)
-            noise_chunk = u_flat[offset:next_offset].reshape(shape)
-            p.grad = (summed_chunk + noise_chunk).view_as(p)
-            mark_as_processed(p.summed_grad)
-            offset = next_offset
-
     def _ensure_buffer_shape(self, reference: torch.Tensor) -> None:
         """
         Materialize or validate the BLT state buffers for the current flat shape.
@@ -210,40 +159,41 @@ class BufferedToeplitzNoiseMechanism(NoiseMechanism):
         # factor so later steps can update the streamed state in place.
         self._buffers = [torch.zeros_like(reference) for _ in range(self.num_buffers)]
 
-    def _read_state(self) -> torch.Tensor:
-        """Form the current forward-side BLT state contribution `sum_i omega_i b_i`."""
-        assert self._buffers
-        result = self._buffers[0] * self._omega[0]
+    def _advance_inverse_stream(self, u_flat, block_sizes):
+        """Cancel old state before updating any buffer, using block-sized scratch.
 
-        for omega_i, buf_i in zip(self._omega[1:], self._buffers[1:]):
-            result = result + omega_i * buf_i
-
-        return result
-
-    def _apply_inverse_stream(self, z_flat: torch.Tensor) -> torch.Tensor:
+        The owned input starts as iid noise and becomes the correlated release.
+        Multiplication and addition stay separate to preserve their rounding.
         """
-        Advance one BLT streamed recurrence step.
-
-        The current correlated-noise vector is the iid draw minus the buffered
-        state contribution. The buffers are then updated by the forward-side
-        BLT recurrence driven by `theta`.
-        """
-        self._ensure_buffer_shape(z_flat)
-        if self.num_buffers == 0:
-            u_flat = z_flat.detach().clone()
-        else:
-            # The current BLT release is the fresh iid draw minus the buffered
-            # forward-state contribution accumulated from earlier steps.
-            u_flat = z_flat - self._read_state()
-            # Then advance each buffer with the same newly solved `u_t`.
-            self._buffers = [
-                theta_i * buf_i + u_flat
-                for theta_i, buf_i in zip(self._theta, self._buffers)
-            ]
-
+        self._ensure_buffer_shape(u_flat)
         self.last_flat_z = (
-            z_flat.detach().clone() if self.record_noise_diagnostics else None
+            u_flat.detach().clone() if self.record_noise_diagnostics else None
         )
+        if self._buffers:
+            offset = 0
+
+            for size in block_sizes:
+                end = offset + size
+                weighted = self._buffers[0][offset:end] * self._omega[0]
+
+                for omega, buf in zip(self._omega[1:], self._buffers[1:]):
+                    block = omega * buf[offset:end]
+                    weighted.add_(block)
+                    del block
+
+                u_flat[offset:end].sub_(weighted)
+
+                offset = end
+
+                # Make sure temproary memory is freed
+                del weighted
+
+            # Every old buffer has contributed to the complete release above.
+            # Reuse its storage instead of retaining old and replacement sets.
+            for theta, buf in zip(self._theta, self._buffers):
+                buf.mul_(theta)
+                buf.add_(u_flat)
+
         self.last_flat_u = (
             u_flat.detach().clone() if self.record_noise_diagnostics else None
         )
@@ -251,16 +201,51 @@ class BufferedToeplitzNoiseMechanism(NoiseMechanism):
 
         return u_flat
 
+    def _apply_inverse_stream(self, z_flat: torch.Tensor) -> torch.Tensor:
+        """Apply the recurrence without modifying the caller's iid draw."""
+        return self._advance_inverse_stream(z_flat.detach().clone(), [z_flat.numel()])
+
     def add_noise(self, optimizer: NoiseMechanismOptimizer) -> None:
-        """Add one BLT-correlated noise step to the optimizer's clipped gradients."""
-        std = self._pre_scale_noise_std(optimizer)
-        specs, z_flat = self._flatten_generated_z(optimizer, std=std)
-        if not specs:
+        """Add BLT noise with one full release and parameter-sized workspace."""
+        params = list(optimizer.params)
+        if not params:
             return
 
-        summed_flat = self._flatten_summed_grads(specs)
-        u_flat = self._apply_inverse_stream(z_flat)
-        self._assign_noised_grads(specs, summed_flat=summed_flat, u_flat=u_flat)
+        for p in params:
+            assert p.summed_grad is not None
+            check_processed_flag(p.summed_grad)
+
+        dtype = params[0].summed_grad.dtype
+        for p in params[1:]:
+            dtype = torch.promote_types(dtype, p.summed_grad.dtype)
+
+        u_flat = torch.empty(
+            sum(p.numel() for p in params), device=params[0].device, dtype=dtype
+        )
+
+        std = self._pre_scale_noise_std(optimizer)
+        offset = 0
+        for p in params:
+            block = generate_noise(
+                std=std,
+                reference=p.summed_grad,
+                generator=optimizer.generator,
+                secure_mode=optimizer.secure_mode,
+            )
+            u_flat[offset : offset + p.numel()].copy_(block.reshape(-1))
+            offset += p.numel()
+
+            # Make sure temporary memory is freed
+            del block
+
+        self._advance_inverse_stream(u_flat, [p.numel() for p in params])
+        offset = 0
+
+        for p in params:
+            noise = u_flat[offset : offset + p.numel()].view_as(p)
+            p.grad = (p.summed_grad + noise).view_as(p)
+            mark_as_processed(p.summed_grad)
+            offset += p.numel()
 
     def state_dict(self) -> Mapping[str, Any]:
         """
